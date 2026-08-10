@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""A full NIC payload write allocates only in enabled DDIO ways."""
+"""A cold full NIC write is write-through with DDIO disabled."""
 
 from m5.stats.gem5stats import get_simstat
 
@@ -12,11 +12,11 @@ from chi_tlm_test_utils import (
 
 
 ADDRESS = 0x80000000
-WRITTEN = bytes((0x80 + index) & 0xFF for index in range(64))
+WRITTEN = bytes((index * 3 + 1) & 0xFF for index in range(64))
 
 nic_dma_categories = ["rx_payload", ""]
-hnf_alloc_on_writeback = False
-ddio_way_part = 2
+hnf_alloc_on_writeback = True
+ddio_way_part = -1
 
 
 def test_generators(generators):
@@ -39,11 +39,12 @@ def test_generators(generators):
 
 def check(system):
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
-    requests = find_stat(stats, "rxPayloadRequests")
-    allocations = vector_values(find_stat(stats, "rxPayloadAllocWays"))
-    assert requests == 1, requests
-    assert sum(allocations) == 1, allocations
-    assert all(
-        value == 0 for value in allocations[ddio_way_part:]
-    ), allocations
-    print("Enabled DDIO way allocation and data readback passed", allocations)
+    fills = vector_values(find_stat(stats, "ddioWayFill"))
+    assoc = len(fills) // 5
+    payload_fills = fills[:assoc]
+    cpu_accesses = vector_values(find_stat(stats, "ddioWayAccess"))[
+        3 * assoc : 4 * assoc
+    ]
+    assert sum(payload_fills) == 0, payload_fills
+    assert sum(cpu_accesses) == 0, cpu_accesses
+    print("Cold no-DDIO write-through data and retention checks passed")

@@ -89,6 +89,11 @@ parser.add_argument(
     required=True,
     help="The boot type.",
 )
+parser.add_argument(
+    "--memory-size",
+    default="3GiB",
+    help="Guest-visible memory size (up to 8GiB).",
+)
 
 parser.add_argument(
     "-t",
@@ -157,12 +162,11 @@ else:
 
 assert cache_hierarchy != None
 
-# Setup the system memory.
-# Warning: This must be kept at 3GiB for now. X86Motherboard does not support
-# anything else right now!
+# Setup the system memory. X86Board splits sizes above 3GiB around the PCI
+# hole, with high memory beginning at 4GiB.
 python_module = "gem5.components.memory"
 memory_class = getattr(importlib.import_module(python_module), args.dram_class)
-memory = memory_class(size="3GiB")
+memory = memory_class(size=args.memory_size)
 
 # Setup a Processor.
 processor = SimpleProcessor(
@@ -200,6 +204,7 @@ print(
 )
 print()
 
+print(f"Guest memory size: {args.memory_size}")
 print("Beginning simulation!")
 simulator = Simulator(board=motherboard)
 

@@ -80,9 +80,11 @@ DebugFlag('DistEthernetCmd')
 
 # Ethernet controllers
 Source('i8254xGBe.cc')
+GTest('i8254xGBe.test', 'i8254xGBe.test.cc')
 Source('ns_gige.cc')
 Source('sinic.cc')
 Source('load_generator.cc')
+GTest('load_generator_mac.test', 'load_generator_mac.test.cc')
 
 
 # LOADGEN

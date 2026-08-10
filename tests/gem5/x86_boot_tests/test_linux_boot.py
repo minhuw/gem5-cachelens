@@ -43,12 +43,20 @@ def test_boot(
     length: str,
     boot_type: str = "init",
     to_tick: Optional[int] = None,
+    memory_size: str = "3GiB",
 ):
-    name = "{}-cpu_{}-cores_{}_{}_{}_x86-boot-test".format(
-        cpu, str(num_cpus), mem_system, memory_class, boot_type
+    name = "{}-cpu_{}-cores_{}_{}_{}_{}_x86-boot-test".format(
+        cpu,
+        str(num_cpus),
+        mem_system,
+        memory_class,
+        memory_size,
+        boot_type,
     )
-    verifiers = []
-    additional_config_args = []
+    verifiers = [
+        verifier.MatchRegex(re.compile(f"Guest memory size: {memory_size}"))
+    ]
+    additional_config_args = ["--memory-size", memory_size]
 
     if to_tick != None:
         name += "_to-tick"
@@ -139,6 +147,16 @@ test_boot(
     length=constants.quick_tag,
 )
 
+test_boot(
+    cpu="atomic",
+    num_cpus=1,
+    mem_system="classic",
+    memory_class="DualChannelDDR4_2400",
+    memory_size="8GiB",
+    to_tick=10000000000,
+    length=constants.quick_tag,
+)
+
 #### The long (Nightly) tests ####
 
 
@@ -157,6 +175,16 @@ test_boot(
     mem_system="classic",
     memory_class="DualChannelDDR4_2400",
     boot_type="systemd",
+    length=constants.long_tag,
+)
+
+test_boot(
+    cpu="atomic",
+    num_cpus=1,
+    mem_system="classic",
+    memory_class="DualChannelDDR4_2400",
+    memory_size="8GiB",
+    boot_type="init",
     length=constants.long_tag,
 )
 

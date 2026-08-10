@@ -5,7 +5,10 @@
 
 import unittest
 
-from m5.objects import AddrRange
+from m5.objects import (
+    AddrRange,
+    NoncoherentXBar,
+)
 from m5.util.convert import toMemorySize
 
 from gem5.components.memory import (
@@ -47,6 +50,7 @@ class ChanneledMemoryRangeTestSuite(unittest.TestCase):
         self.assertEqual(0, int(bus.response_latency))
         self.assertEqual(0, int(bus.header_latency))
         self.assertEqual(64, int(bus.width))
+        self.assertTrue(bool(bus.timing_transparent))
         self.assertEqual(2, len(memory._range_mappers))
         self.assertEqual(
             ranges, [m.original_ranges[0] for m in memory._range_mappers]
@@ -146,6 +150,16 @@ class ChanneledMemoryRangeTestSuite(unittest.TestCase):
         memory = DualChannelDDR4_2400(size="1GiB")
         memory.set_memory_range([AddrRange("1GiB")])
         self.assertEqual(2, len(memory.get_mem_ports()))
+        self.assertEqual([], memory._range_mapper_buses)
+
+    def test_noncoherent_xbar_default_is_not_transparent(self) -> None:
+        bus = NoncoherentXBar(
+            frontend_latency=0,
+            forward_latency=0,
+            response_latency=0,
+            width=64,
+        )
+        self.assertFalse(bool(bus.timing_transparent))
 
 
 if __name__ == "__main__":
