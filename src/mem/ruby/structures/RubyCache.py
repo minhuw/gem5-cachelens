@@ -55,9 +55,14 @@ class RubyCache(SimObject):
     tagAccessLatency = Param.Cycles(1, "cycles for a tag array access")
     resourceStalls = Param.Bool(False, "stall if there is a resource failure")
 
-    # DDIO way partitioning: when > 0, NIC RX data fills (lines whose original
-    # DMA write request carries NIC_RX_PAYLOAD_WRITE or NIC_RX_HEADER_WRITE)
-    # are only allocated in ways [0, ddio_way_part).  -1 disables.
+    # Apply a SplitMix64 avalanche to the full line address, then mask it into
+    # the set index (instead of using the plain index-bit slice).
+    addr_hash = Param.Bool(False, "SplitMix64-avalanched set-index hash")
+
+    # DDIO way partitioning: when > 0, all NIC-originated DMA writes
+    # (payload, headers, and descriptor writebacks) are allocated only in
+    # ways [0, ddio_way_part). -1 is a true NIC-write no-retention mode.
+    # NIC-read allocation is controlled by the CHI HNF controller/profile.
     ddio_way_part = Param.Int(
         -1, "number of NIC DDIO allocation ways [0, D); -1 disables"
     )

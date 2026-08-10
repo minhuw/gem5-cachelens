@@ -44,6 +44,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "base/statistics.hh"
@@ -78,6 +79,7 @@ class CacheMemory : public SimObject
     ~CacheMemory();
 
     void init();
+    void resetStats() override;
 
     // Public Methods
     // perform a cache access and see if we hit or not.  Return true on a hit.
@@ -206,6 +208,9 @@ class CacheMemory : public SimObject
     /** Number of NIC DDIO allocation ways [0, D); -1 is no allocation. */
     int m_ddio_way_part;
 
+    /** Avalanche the full line address into the set index when true. */
+    bool m_addr_hash;
+
     BankedArray dataArray;
     BankedArray tagArray;
     ALUFreeListArray atomicALUArray;
@@ -296,7 +301,39 @@ class CacheMemory : public SimObject
           statistics::Scalar txPayloadHits;
           statistics::Scalar txPayloadMisses;
           statistics::Formula txPayloadHitRate;
+
+          // Per-way, per-source accounting to understand eviction
+          // pressure on the DDIO ways.  Source classes:
+          //   0 = NIC RX payload write, 1 = NIC TX payload read,
+          //   2 = NIC descriptor DMA, 3 = CPU/other, 4 = NIC RX header.
+          // Each vector is [src][way] flattened (src*assoc + way).
+          statistics::Vector ddioWayAccess;
+          statistics::Vector ddioWayFill;
+          statistics::Vector wayDeallocations;
+
+          // CPU/general transactions to addresses previously written as RX
+          // payload. These parameterize the processor-touch phase of the
+          // RX-only DDIO residency model without using RX hit outcomes.
+          statistics::Vector rxPayloadCpuAccessWays;
+          statistics::Vector rxPayloadCpuFillWays;
+          statistics::Scalar rxPayloadCpuUniqueLines;
+
+          // Per-set payload access counters (set-index imbalance of the
+          // payload stream on the DDIO ways).
+          statistics::Vector rxPayloadSetHits;
+          statistics::Vector rxPayloadSetMisses;
+
+          // Unique payload line addresses seen in the current stats window.
+          statistics::Scalar rxPayloadUniqueLines;
+          statistics::Scalar txPayloadUniqueLines;
       } cacheMemoryStats;
+
+      std::unordered_set<Addr> rxPayloadUniqueAddrs;
+      std::unordered_set<Addr> txPayloadUniqueAddrs;
+      std::unordered_set<Addr> rxPayloadCpuUniqueAddrs;
+      // Unlike the per-window uniqueness set, retain this set across a stats
+      // reset so post-reset CPU touches to warmed payload buffers are visible.
+      std::unordered_set<Addr> rxPayloadEverAddrs;
 
     public:
       // These function increment the number of demand hits/misses by one
@@ -307,12 +344,43 @@ class CacheMemory : public SimObject
       void profilePrefetchMiss();
 
       // DDIO accounting hooks (called from the CHI home node).
-      // profileRxPayload counts one RX data write line transaction and
-      // records whether the line was present at acceptance; the allocation way
-      // is recorded separately by allocateInWays().
+      // profileRxPayload/profileRxHeader count one line transaction and record
+      // whether the line was present at acceptance. Allocation ways are
+      // recorded by profileDdioWayFill().
       void profileRxPayload(Addr address);
       void profileRxHeader(Addr address);
       void profileTxPayload(Addr address);
+
+      // Per-way, per-source accounting hooks (see CacheMemoryStats for
+      // the source classes).
+      void profileDdioWayAccess(int src, int way, Addr address)
+      {
+          if (way >= 0) {
+              cacheMemoryStats.ddioWayAccess[src * m_cache_assoc + way]++;
+              if (src == 3 && rxPayloadEverAddrs.count(address)) {
+                  cacheMemoryStats.rxPayloadCpuAccessWays[way]++;
+                  if (rxPayloadCpuUniqueAddrs.insert(address).second)
+                      cacheMemoryStats.rxPayloadCpuUniqueLines++;
+              }
+          }
+      }
+      void profileDdioWayFill(int src, int way, Addr address)
+      {
+          if (way >= 0) {
+              cacheMemoryStats.ddioWayFill[src * m_cache_assoc + way]++;
+              if (m_ddio_way_part > 0 && way < m_ddio_way_part &&
+                  (src == 0 || src == 2 || src == 4)) {
+                  cacheMemoryStats.ddioAllocWays[way]++;
+                  if (src == 0)
+                      cacheMemoryStats.rxPayloadAllocWays[way]++;
+              }
+              if (src == 3 && rxPayloadEverAddrs.count(address)) {
+                  cacheMemoryStats.rxPayloadCpuFillWays[way]++;
+                  if (rxPayloadCpuUniqueAddrs.insert(address).second)
+                      cacheMemoryStats.rxPayloadCpuUniqueLines++;
+              }
+          }
+      }
 
       // NIC DMA classification helpers (SLICC-visible; the gem5 Request
       // carries the NIC category flags end-to-end as seqReq).
@@ -344,6 +412,10 @@ class CacheMemory : public SimObject
       bool ddioWriteNeedsRead(bool partial, bool data_valid) const
       {
           return partial && !data_valid;
+      }
+      bool isNicDescDmaReq(const RequestPtr &req) const
+      {
+          return req && req->isNicDescDma();
       }
 };
 

@@ -94,6 +94,7 @@ CacheMemory::CacheMemory(const Params &p)
                  m_replacementPolicy_ptr),
              "DDIO way partition requires the subset-safe LRU replacement "
              "policy");
+    m_addr_hash = p.addr_hash;
 }
 
 void
@@ -131,6 +132,46 @@ CacheMemory::init()
         statistics::nozero | statistics::total);
     cacheMemoryStats.rxPayloadAllocWays.init(m_cache_assoc).flags(
         statistics::nozero | statistics::total);
+    cacheMemoryStats.ddioAllocWays.init(m_cache_assoc).flags(
+        statistics::nozero | statistics::total);
+
+    // Per-way, per-source accounting vectors ([src][way] flattened)
+    static const char *ddio_src_names[5] = {
+        "nic_rx_payload", "nic_tx_payload", "nic_desc", "cpu_other",
+        "nic_rx_header"};
+    cacheMemoryStats.ddioWayAccess.init(5 * m_cache_assoc).flags(
+        statistics::nozero | statistics::total);
+    cacheMemoryStats.ddioWayFill.init(5 * m_cache_assoc).flags(
+        statistics::nozero | statistics::total);
+    cacheMemoryStats.wayDeallocations.init(m_cache_assoc).flags(
+        statistics::nozero | statistics::total);
+    cacheMemoryStats.rxPayloadCpuAccessWays.init(m_cache_assoc).flags(
+        statistics::nozero | statistics::total);
+    cacheMemoryStats.rxPayloadCpuFillWays.init(m_cache_assoc).flags(
+        statistics::nozero | statistics::total);
+    for (int s = 0; s < 5; s++) {
+        for (int w = 0; w < m_cache_assoc; w++) {
+            cacheMemoryStats.ddioWayAccess.subname(
+                s * m_cache_assoc + w,
+                csprintf("%s_way%d", ddio_src_names[s], w));
+            cacheMemoryStats.ddioWayFill.subname(
+                s * m_cache_assoc + w,
+                csprintf("%s_way%d", ddio_src_names[s], w));
+        }
+    }
+    for (int w = 0; w < m_cache_assoc; w++) {
+        cacheMemoryStats.wayDeallocations.subname(w, csprintf("way%d", w));
+        cacheMemoryStats.rxPayloadCpuAccessWays.subname(
+            w, csprintf("way%d", w));
+        cacheMemoryStats.rxPayloadCpuFillWays.subname(
+            w, csprintf("way%d", w));
+    }
+
+    // Per-set payload access counters
+    cacheMemoryStats.rxPayloadSetHits.init(m_cache_num_sets).flags(
+        statistics::nozero | statistics::total);
+    cacheMemoryStats.rxPayloadSetMisses.init(m_cache_num_sets).flags(
+        statistics::nozero | statistics::total);
     // instantiate all the replacement_data here
     for (int i = 0; i < m_cache_num_sets; i++) {
         for ( int j = 0; j < m_cache_assoc; j++) {
@@ -151,13 +192,34 @@ CacheMemory::~CacheMemory()
     }
 }
 
+void
+CacheMemory::resetStats()
+{
+    SimObject::resetStats();
+    rxPayloadUniqueAddrs.clear();
+    txPayloadUniqueAddrs.clear();
+    rxPayloadCpuUniqueAddrs.clear();
+}
+
 // convert a Address to its location in the cache
 int64_t
 CacheMemory::addressToCacheSet(Addr address) const
 {
     assert(address == makeLineAddress(address));
-    return bitSelect(address, m_start_index_bit,
-                     m_start_index_bit + m_cache_num_set_bits - 1);
+    Addr idx = bitSelect(address, m_start_index_bit,
+                         m_start_index_bit + m_cache_num_set_bits - 1);
+    if (m_addr_hash) {
+        // SplitMix64's finalizer avalanches every input bit into the set
+        // index. This decorrelates contiguous lines as well as allocator and
+        // ring strides whose low or high address bits repeat periodically.
+        uint64_t line = address >> m_start_index_bit;
+        line += 0x9e3779b97f4a7c15ULL;
+        line = (line ^ (line >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        line = (line ^ (line >> 27)) * 0x94d049bb133111ebULL;
+        line ^= line >> 31;
+        idx = line & (m_cache_num_sets - 1);
+    }
+    return idx;
 }
 
 // Given a cache index: returns the index of the tag in a set.
@@ -380,10 +442,17 @@ CacheMemory::allocateInWays(Addr address, AbstractCacheEntry *entry,
             fatal_if(set[i]->m_Permission != AccessPermission_NotPresent,
                      "Cannot allocate already-present address %#x in DDIO "
                      "ways [0, %d)", address, ways);
-            fatal_if(i >= ways,
-                     "NotPresent placeholder for address %#x is in way %d "
-                     "outside DDIO subset [0, %d)", address, i, ways);
-            way = i;
+            if (i < ways) {
+                way = i;
+            } else {
+                auto old = m_tag_index.find(address);
+                if (old != m_tag_index.end() && old->second == i)
+                    m_tag_index.erase(old);
+                m_replacementPolicy_ptr->invalidate(
+                    replacement_data[cacheSet][i]);
+                delete set[i];
+                set[i] = nullptr;
+            }
         }
     }
 
@@ -426,6 +495,10 @@ CacheMemory::allocateInWays(Addr address, AbstractCacheEntry *entry,
             if (old != m_tag_index.end() && old->second == i) {
                 m_tag_index.erase(old);
             }
+        }
+        if (set[i] && set[i] != entry) {
+            m_replacementPolicy_ptr->invalidate(replacement_data[cacheSet][i]);
+            delete set[i];
         }
         set[i] = entry;  // Init entry
         set[i]->m_Address = address;
@@ -576,6 +649,7 @@ CacheMemory::deallocate(Addr address)
     m_replacementPolicy_ptr->invalidate(entry->replacementData);
     uint32_t cache_set = entry->getSet();
     uint32_t way = entry->getWay();
+    cacheMemoryStats.wayDeallocations[way]++;
     delete entry;
     m_cache[cache_set][way] = NULL;
     m_tag_index.erase(address);
@@ -831,7 +905,23 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(txPayloadMisses,
                "Number of NIC TX payload DMA reads missing"),
       ADD_STAT(txPayloadHitRate, "NIC TX payload DMA read hit rate",
-               txPayloadHits / (txPayloadHits + txPayloadMisses))
+               txPayloadHits / (txPayloadHits + txPayloadMisses)),
+      ADD_STAT(ddioWayAccess,
+               "Accesses per way by requester class (src x way)"),
+      ADD_STAT(ddioWayFill,
+               "Allocations per way by requester class (src x way)"),
+      ADD_STAT(wayDeallocations,
+               "Cache-entry deallocations per way (all causes)"),
+      ADD_STAT(rxPayloadCpuAccessWays,
+               "CPU/general hits to prior RX payload addresses by way"),
+      ADD_STAT(rxPayloadCpuFillWays,
+               "CPU/general fills of prior RX payload addresses by way"),
+      ADD_STAT(rxPayloadCpuUniqueLines,
+               "Prior RX payload lines touched by CPU/general requests"),
+      ADD_STAT(rxPayloadSetHits, "RX payload hits per cache set"),
+      ADD_STAT(rxPayloadSetMisses, "RX payload misses per cache set"),
+      ADD_STAT(rxPayloadUniqueLines, "Unique RX payload line addresses"),
+      ADD_STAT(txPayloadUniqueLines, "Unique TX payload line addresses")
 {
     rxPayloadHitRate.flags(statistics::nonan);
     txPayloadHitRate.flags(statistics::nonan);
@@ -911,6 +1001,8 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
     txPayloadRequests.flags(statistics::nozero);
     txPayloadHits.flags(statistics::nozero);
     txPayloadMisses.flags(statistics::nozero);
+    rxPayloadUniqueLines.flags(statistics::nozero);
+    txPayloadUniqueLines.flags(statistics::nozero);
 }
 
 // assumption: SLICC generated files will only call this function
@@ -1090,9 +1182,14 @@ CacheMemory::profileRxPayload(Addr address)
     if (loc >= 0) {
         cacheMemoryStats.rxPayloadHits++;
         cacheMemoryStats.rxPayloadHitWays[loc]++;
+        cacheMemoryStats.rxPayloadSetHits[cacheSet]++;
     } else {
         cacheMemoryStats.rxPayloadMisses++;
+        cacheMemoryStats.rxPayloadSetMisses[cacheSet]++;
     }
+    if (rxPayloadUniqueAddrs.insert(address).second)
+        cacheMemoryStats.rxPayloadUniqueLines++;
+    rxPayloadEverAddrs.insert(address);
 }
 
 void
@@ -1116,6 +1213,8 @@ CacheMemory::profileTxPayload(Addr address)
     } else {
         cacheMemoryStats.txPayloadMisses++;
     }
+    if (txPayloadUniqueAddrs.insert(address).second)
+        cacheMemoryStats.txPayloadUniqueLines++;
 }
 
 void
