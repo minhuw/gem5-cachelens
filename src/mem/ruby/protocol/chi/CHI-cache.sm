@@ -683,7 +683,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     // original DMA request is a NIC RX payload write / TX payload read.
     bool is_ddio_payload,   default="false",   desc="NIC RX payload DMA write (DDIO)";
     bool is_tx_payload,     default="false",   desc="NIC TX payload DMA read";
-    bool ddio_profiled,     default="false",   desc="DDIO stats already recorded";
+    bool stale_wb_path,     default="false",   desc="Writeback handled via stale-copyback path";
 
     // Transaction state information
     State state,    desc="SLICC line state";

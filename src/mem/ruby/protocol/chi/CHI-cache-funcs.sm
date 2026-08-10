@@ -459,7 +459,16 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
       cache.isNicRxPayloadWriteReq(in_msg.seqReq);
   tbe.is_tx_payload := is_HN && in_msg.isSeqReqValid &&
       cache.isNicTxPayloadReadReq(in_msg.seqReq);
-  tbe.ddio_profiled := false;
+  // Profile at request acceptance, before any protocol action can change the
+  // tag state. This counts both hit and miss paths exactly once.
+  if (tbe.is_ddio_payload) {
+    cache.profileRxPayload(addr);
+  } else if (tbe.is_ddio_header) {
+    cache.profileRxHeader(addr);
+  } else if (tbe.is_tx_payload) {
+    cache.profileTxPayload(addr);
+  }
+  tbe.stale_wb_path := false;
 
   tbe.atomic_op.clear();
   tbe.atomic_op.orMask(in_msg.atomic_op);

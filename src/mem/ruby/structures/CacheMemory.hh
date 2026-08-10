@@ -271,8 +271,8 @@ class CacheMemory : public SimObject
           statistics::Vector m_accessModeType;
 
           // DDIO (NIC RX payload DMA write) accounting.  A request is a
-          // payload write seen by this cache; a hit means the line was
-          // already present; a miss means it was (DDIO-way) allocated.
+          // payload line transaction seen by this cache; a hit means the line
+          // was already present at acceptance.
           statistics::Scalar rxPayloadRequests;
           statistics::Scalar rxPayloadHits;
           statistics::Scalar rxPayloadMisses;
@@ -287,7 +287,7 @@ class CacheMemory : public SimObject
           statistics::Scalar rxHeaderMisses;
           statistics::Formula rxHeaderHitRate;
 
-          // NIC TX payload DMA read accounting
+          // NIC TX payload DMA read line-transaction accounting
           statistics::Scalar txPayloadRequests;
           statistics::Scalar txPayloadHits;
           statistics::Scalar txPayloadMisses;
@@ -303,9 +303,9 @@ class CacheMemory : public SimObject
       void profilePrefetchMiss();
 
       // DDIO accounting hooks (called from the CHI home node).
-      // profileRxPayload counts one RX payload write request and records
-      // whether the line was present (hit) or not (miss); the allocation
-      // way is recorded separately by allocateInWays().
+      // profileRxPayload counts one RX payload write line transaction and
+      // records whether the line was present at acceptance; the allocation way
+      // is recorded separately by allocateInWays().
       void profileRxPayload(Addr address);
       void profileRxHeader(Addr address);
       void profileTxPayload(Addr address);
