@@ -299,6 +299,12 @@ PySource('gem5.components.processors',
 PySource('gem5.components.processors',
     'gem5/components/processors/traffic_generator.py')
 PySource('gem5.prebuilt', 'gem5/prebuilt/__init__.py')
+PySource('gem5.prebuilt.cachelens',
+    'gem5/prebuilt/cachelens/__init__.py')
+PySource('gem5.prebuilt.cachelens',
+    'gem5/prebuilt/cachelens/cache_hierarchy.py')
+PySource('gem5.prebuilt.cachelens',
+    'gem5/prebuilt/cachelens/topology.py')
 PySource('gem5.prebuilt.demo', 'gem5/prebuilt/demo/__init__.py')
 PySource('gem5.prebuilt.demo', 'gem5/prebuilt/demo/x86_demo_board.py')
 PySource('gem5.prebuilt.demo', 'gem5/prebuilt/demo/riscv_demo_board.py')

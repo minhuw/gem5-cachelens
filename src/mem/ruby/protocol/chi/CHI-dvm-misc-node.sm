@@ -329,7 +329,8 @@ machine(MachineType:MiscNode, "CHI Misc Node for handling and distrbuting DVM op
   // Definitions of the TBE tables
 
   // TBE table for DVM requests
-  MN_TBETable dvmTBEs, constructor="m_number_of_DVM_TBEs";
+  MN_TBETable dvmTBEs,
+      constructor="m_number_of_DVM_TBEs, m_ruby_system->getBlockSizeBytes()";
   TBEStorage nonSyncTBEs, constructor="this, m_number_of_non_sync_TBEs";
   TBEStorage genericTBEs, constructor="this, (m_number_of_DVM_TBEs - m_number_of_non_sync_TBEs)";
   MN_TBEStorage storDvmTBEs, template="<MiscNode_RetryQueueEntry>", constructor="this, {m_genericTBEs_ptr, m_nonSyncTBEs_ptr}";
