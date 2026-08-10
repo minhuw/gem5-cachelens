@@ -90,12 +90,8 @@ class CacheRecorder
     uint64_t getNumRecords() const;
 
     /*!
-     * Function for flushing the memory contents of the caches to the
-     * main memory. It goes through the recorded contents of the caches,
-     * and issues flush requests. Except for the first one, a flush request
-     * is issued only after the previous one has completed. This currently
-     * requires use of MOESI Hammer protocol since only that protocol
-     * supports flush requests.
+     * Publish authoritative dirty cache records to backing memory through
+     * Ruby's protocol-independent functional path before checkpointing.
      */
     void enqueueNextFlushRequest();
 

@@ -181,6 +181,12 @@ class RubyPort : public ClockedObject
 
     virtual int functionalWrite(Packet *func_pkt);
 
+    /**
+     * Write through Ruby's functional path using this port's controller to
+     * select the correct Ruby network.
+     */
+    bool functionalWriteToRubySystem(Packet *func_pkt);
+
     // Helper methods for commonly used functions called in common/address.hh
     Addr getOffset(Addr addr) const;
     Addr makeLineAddress(Addr addr) const;

@@ -749,6 +749,14 @@ RubyPort::functionalWrite(Packet *func_pkt)
     return num_written;
 }
 
+bool
+RubyPort::functionalWriteToRubySystem(Packet *func_pkt)
+{
+    assert(m_controller);
+    func_pkt->req->requestorId(m_controller->getRequestorId());
+    return m_ruby_system->functionalWrite(func_pkt);
+}
+
 Addr
 RubyPort::getOffset(Addr addr) const
 {
