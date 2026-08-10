@@ -210,6 +210,17 @@ structure (DirectoryMemory, external = "yes") {
 structure (CacheMemory, external = "yes") {
   bool cacheAvail(Addr);
   Addr cacheProbe(Addr);
+
+  // DDIO way-partitioned allocation + NIC DMA classification/profiling
+  bool cacheAvailInWays(Addr, int);
+  Addr cacheProbeInWays(Addr, int);
+  AbstractCacheEntry allocateInWays(Addr, AbstractCacheEntry, int);
+  int getDDIOWayPart();
+  void profileRxPayload(Addr);
+  void profileRxHeader(Addr);
+  void profileTxPayload(Addr);
+  bool isNicRxPayloadWriteReq(RequestPtr);
+  bool isNicTxPayloadReadReq(RequestPtr);
   AbstractCacheEntry getNullEntry();
   AbstractCacheEntry allocate(Addr, AbstractCacheEntry);
   AbstractCacheEntry allocate(Addr, AbstractCacheEntry, bool);

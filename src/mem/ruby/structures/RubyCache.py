@@ -54,3 +54,10 @@ class RubyCache(SimObject):
     dataAccessLatency = Param.Cycles(1, "cycles for a data array access")
     tagAccessLatency = Param.Cycles(1, "cycles for a tag array access")
     resourceStalls = Param.Bool(False, "stall if there is a resource failure")
+
+    # DDIO way partitioning: when > 0, NIC RX payload fills (lines whose
+    # original DMA write request carries Request::NIC_RX_PAYLOAD_WRITE)
+    # are only allocated in ways [0, ddio_way_part).  -1 disables.
+    ddio_way_part = Param.Int(
+        -1, "number of NIC DDIO allocation ways [0, D); -1 disables"
+    )

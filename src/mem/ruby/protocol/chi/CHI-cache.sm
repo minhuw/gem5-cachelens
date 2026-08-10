@@ -679,6 +679,12 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     RequestPtr seqReq,      default="nullptr", desc="Pointer to original request from CPU/sequencer";
     bool isSeqReqValid,     default="false",   desc="Set if seqReq is valid (not nullptr)";
 
+    // DDIO classification of the transaction (home node only): set when the
+    // original DMA request is a NIC RX payload write / TX payload read.
+    bool is_ddio_payload,   default="false",   desc="NIC RX payload DMA write (DDIO)";
+    bool is_tx_payload,     default="false",   desc="NIC TX payload DMA read";
+    bool ddio_profiled,     default="false",   desc="DDIO stats already recorded";
+
     // Transaction state information
     State state,    desc="SLICC line state";
 

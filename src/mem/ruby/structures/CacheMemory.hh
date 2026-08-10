@@ -94,6 +94,18 @@ class CacheMemory : public SimObject
     //   b) an unused line in the same cache "way"
     bool cacheAvail(Addr address) const;
 
+    // DDIO way-partitioned variants: like cacheAvail/allocate/cacheProbe,
+    // but only consider ways [0, ways).  Used for NIC RX payload fills so
+    // payload lines are confined to the DDIO way subset.
+    bool cacheAvailInWays(Addr address, int ways) const;
+    AbstractCacheEntry* allocateInWays(Addr address,
+                                       AbstractCacheEntry* new_entry,
+                                       int ways);
+    Addr cacheProbeInWays(Addr address, int ways) const;
+
+    // Number of NIC DDIO allocation ways (-1 = NIC-write no allocation).
+    int getDDIOWayPart() const { return m_ddio_way_part; }
+
     // Returns a NULL entry that acts as a placeholder for invalid lines
     AbstractCacheEntry*
     getNullEntry() const
@@ -187,6 +199,9 @@ class CacheMemory : public SimObject
     /** We use the replacement policies from the Classic memory system. */
     replacement_policy::Base *m_replacementPolicy_ptr;
 
+    /** Number of NIC DDIO allocation ways [0, D); -1 is no allocation. */
+    int m_ddio_way_part;
+
     BankedArray dataArray;
     BankedArray tagArray;
     ALUFreeListArray atomicALUArray;
@@ -254,6 +269,29 @@ class CacheMemory : public SimObject
           statistics::Formula m_prefetch_accesses;
 
           statistics::Vector m_accessModeType;
+
+          // DDIO (NIC RX payload DMA write) accounting.  A request is a
+          // payload write seen by this cache; a hit means the line was
+          // already present; a miss means it was (DDIO-way) allocated.
+          statistics::Scalar rxPayloadRequests;
+          statistics::Scalar rxPayloadHits;
+          statistics::Scalar rxPayloadMisses;
+          statistics::Formula rxPayloadHitRate;
+          statistics::Vector rxPayloadHitWays;
+          statistics::Vector rxPayloadAllocWays;
+          statistics::Vector ddioAllocWays;
+
+          // RX header writes retain separate request/hit/miss telemetry.
+          statistics::Scalar rxHeaderRequests;
+          statistics::Scalar rxHeaderHits;
+          statistics::Scalar rxHeaderMisses;
+          statistics::Formula rxHeaderHitRate;
+
+          // NIC TX payload DMA read accounting
+          statistics::Scalar txPayloadRequests;
+          statistics::Scalar txPayloadHits;
+          statistics::Scalar txPayloadMisses;
+          statistics::Formula txPayloadHitRate;
       } cacheMemoryStats;
 
     public:
@@ -263,6 +301,41 @@ class CacheMemory : public SimObject
       void profileDemandMiss();
       void profilePrefetchHit();
       void profilePrefetchMiss();
+
+      // DDIO accounting hooks (called from the CHI home node).
+      // profileRxPayload counts one RX payload write request and records
+      // whether the line was present (hit) or not (miss); the allocation
+      // way is recorded separately by allocateInWays().
+      void profileRxPayload(Addr address);
+      void profileRxHeader(Addr address);
+      void profileTxPayload(Addr address);
+
+      // NIC DMA classification helpers (SLICC-visible; the gem5 Request
+      // carries the NIC category flags end-to-end as seqReq).
+      bool isNicRxPayloadWriteReq(const RequestPtr &req) const
+      {
+          return req && req->isNicRxPayloadWrite();
+      }
+      bool isNicDdioWriteReq(const RequestPtr &req) const
+      {
+          return req && req->isNicDmaWrite();
+      }
+      bool isNicRxPayloadWriteReq(const RequestPtr &req) const
+      {
+          return req && req->isNicRxPayloadWrite();
+      }
+      bool isNicRxHeaderWriteReq(const RequestPtr &req) const
+      {
+          return req && req->isNicRxHeaderWrite();
+      }
+      bool isNicDdioReadReq(const RequestPtr &req) const
+      {
+          return req && req->isNicDmaRead();
+      }
+      bool isNicTxPayloadReadReq(const RequestPtr &req) const
+      {
+          return req && req->isNicTxPayloadRead();
+      }
 };
 
 std::ostream& operator<<(std::ostream& out, const CacheMemory& obj);

@@ -450,6 +450,17 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   tbe.is_local_pf := in_msg.is_local_pf;
   tbe.is_remote_pf := in_msg.is_remote_pf;
 
+  // NIC classification: the original gem5 request (from the NIC's DMA
+  // port) carries the category flags end-to-end. All NIC writes use the same
+  // allocation policy; payload/header telemetry remains category-specific.
+  tbe.is_ddio_write := is_HN && in_msg.isSeqReqValid &&
+      cache.isNicDdioWriteReq(in_msg.seqReq);
+  tbe.is_ddio_payload := is_HN && in_msg.isSeqReqValid &&
+      cache.isNicRxPayloadWriteReq(in_msg.seqReq);
+  tbe.is_tx_payload := is_HN && in_msg.isSeqReqValid &&
+      cache.isNicTxPayloadReadReq(in_msg.seqReq);
+  tbe.ddio_profiled := false;
+
   tbe.atomic_op.clear();
   tbe.atomic_op.orMask(in_msg.atomic_op);
   tbe.atomic_to_be_done := false;

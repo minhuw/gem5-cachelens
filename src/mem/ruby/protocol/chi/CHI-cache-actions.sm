@@ -3429,12 +3429,33 @@ action(CheckCacheFill, desc="") {
   bool need_fill := tbe.dataValid && (tbe.dataToBeInvalid == false) && tbe.doCacheFill;
   bool execute_next := true;
 
+  // DDIO (home node only): confine NIC RX payload fills to the DDIO way
+  // subset [0, ddio_way_part) and record hit/miss statistics exactly once
+  // per transaction.
+  int ddio_ways := cache.getDDIOWayPart();
+  bool ddio_fill := is_HN && tbe.is_ddio_write && ddio_ways > 0;
+
+  if (is_HN && tbe.is_ddio_payload && !tbe.ddio_profiled && tbe.dataValid) {
+    tbe.ddio_profiled := true;
+    cache.profileRxPayload(address);
+  }
+  if (is_HN && tbe.is_tx_payload && !tbe.ddio_profiled && tbe.dataValid) {
+    tbe.ddio_profiled := true;
+    cache.profileTxPayload(address);
+  }
+
   if (need_fill && is_valid(cache_entry)) {
     // can write
     tbe.actions.pushFront(Event:DataArrayWrite);
     tbe.actions.pushFront(Event:FillPipe);
 
-  } else if (need_fill && cache.cacheAvail(address)) {
+  } else if (need_fill && ddio_fill && cache.cacheAvailInWays(address, ddio_ways)) {
+    // NIC DDIO fill: allocate inside the DDIO way subset only.
+    set_cache_entry(cache.allocateInWays(address, new CacheEntry, ddio_ways));
+    tbe.actions.pushFront(Event:DataArrayWriteOnFill);
+    tbe.actions.pushFront(Event:FillPipe);
+
+  } else if (need_fill && !ddio_fill && cache.cacheAvail(address)) {
     // don't have a cache block, but there is space to allocate one
     set_cache_entry(cache.allocate(address, new CacheEntry));
     tbe.actions.pushFront(Event:DataArrayWriteOnFill);
@@ -3445,8 +3466,14 @@ action(CheckCacheFill, desc="") {
     // after the replacement
     execute_next := false;
 
-    // pick a victim to deallocate
-    Addr victim_addr := cache.cacheProbe(address);
+    // pick a victim to deallocate; DDIO payload fills only victimize the
+    // DDIO way subset
+    Addr victim_addr;
+    if (ddio_fill) {
+      victim_addr := cache.cacheProbeInWays(address, ddio_ways);
+    } else {
+      victim_addr := cache.cacheProbe(address);
+    }
     CacheEntry victim_entry := getCacheEntry(victim_addr);
     assert(is_valid(victim_entry));
     TBE victim_tbe := getCurrentActiveTBE(victim_addr);
