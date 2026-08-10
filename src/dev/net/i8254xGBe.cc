@@ -921,9 +921,10 @@ IGbE::DescCache<T>::writeback1()
 
 
     assert(wbOut);
-    igbe->dmaWrite(pciToDma(descBase() + descHead() * sizeof(T)),
-                   wbOut * sizeof(T), &wbEvent, (uint8_t *)wbBuf,
-                   igbe->wbCompDelay);
+    igbe->dmaWriteCategorized(pciToDma(descBase() + descHead() * sizeof(T)),
+                              wbOut * sizeof(T), &wbEvent,
+                              (uint8_t *)wbBuf, igbe->wbCompDelay,
+                              descWritebackCategory());
 }
 
 template<class T>
@@ -980,9 +981,10 @@ IGbE::DescCache<T>::fetchDescriptors1()
             pciToDma(descBase() + cachePnt * sizeof(T)),
             curFetching * sizeof(T));
     assert(curFetching);
-    igbe->dmaRead(pciToDma(descBase() + cachePnt * sizeof(T)),
-                  curFetching * sizeof(T), &fetchEvent, (uint8_t *)fetchBuf,
-                  igbe->fetchCompDelay);
+    igbe->dmaReadCategorized(pciToDma(descBase() + cachePnt * sizeof(T)),
+                             curFetching * sizeof(T), &fetchEvent,
+                             (uint8_t *)fetchBuf, igbe->fetchCompDelay,
+                             descFetchCategory());
 }
 
 template<class T>
@@ -1195,9 +1197,8 @@ IGbE::RxDescCache::writePacket(EthPacketPtr packet, int pkt_offset)
         DPRINTF(EthernetDesc, "Packet Length: %d Desc Size: %d\n",
                 packet->length, igbe->regs.rctl.descSize());
         assert(packet->length < igbe->regs.rctl.descSize());
-        igbe->dmaWrite(pciToDma(desc->legacy.buf),
-                       packet->length, &pktEvent, packet->data,
-                       igbe->rxWriteDelay);
+        igbe->rxPayloadWrite(pciToDma(desc->legacy.buf), packet->length,
+                             &pktEvent, packet->data, igbe->rxWriteDelay);
         break;
       case RXDT_ADV_ONEBUF:
         assert(pkt_offset == 0);
@@ -1207,9 +1208,8 @@ IGbE::RxDescCache::writePacket(EthPacketPtr packet, int pkt_offset)
         DPRINTF(EthernetDesc, "Packet Length: %d srrctl: %#x Desc Size: %d\n",
                 packet->length, igbe->regs.srrctl(), buf_len);
         assert(packet->length < buf_len);
-        igbe->dmaWrite(pciToDma(desc->adv_read.pkt),
-                       packet->length, &pktEvent, packet->data,
-                       igbe->rxWriteDelay);
+        igbe->rxPayloadWrite(pciToDma(desc->adv_read.pkt), packet->length,
+                             &pktEvent, packet->data, igbe->rxWriteDelay);
         desc->adv_wb.header_len = htole(0);
         desc->adv_wb.sph = htole(0);
         desc->adv_wb.pkt_len = htole((uint16_t)(pktPtr->length));
@@ -1233,9 +1233,9 @@ IGbE::RxDescCache::writePacket(EthPacketPtr packet, int pkt_offset)
             bytesCopied = packet->length;
             assert(pkt_offset == 0);
             DPRINTF(EthernetDesc, "Hdr split: Entire packet in header\n");
-            igbe->dmaWrite(pciToDma(desc->adv_read.hdr),
-                           packet->length, &pktEvent, packet->data,
-                           igbe->rxWriteDelay);
+            igbe->rxHeaderWrite(pciToDma(desc->adv_read.hdr), packet->length,
+                                &pktEvent, packet->data,
+                                igbe->rxWriteDelay);
             desc->adv_wb.header_len = htole((uint16_t)packet->length);
             desc->adv_wb.sph = htole(0);
             desc->adv_wb.pkt_len = htole(0);
@@ -1248,9 +1248,10 @@ IGbE::RxDescCache::writePacket(EthPacketPtr packet, int pkt_offset)
                 bytesCopied += max_to_copy;
                 DPRINTF(EthernetDesc,
                         "Hdr split: Continuing data buffer copy\n");
-                igbe->dmaWrite(pciToDma(desc->adv_read.pkt),
-                               max_to_copy, &pktEvent,
-                               packet->data + pkt_offset, igbe->rxWriteDelay);
+                igbe->rxPayloadWrite(pciToDma(desc->adv_read.pkt),
+                                     max_to_copy, &pktEvent,
+                                     packet->data + pkt_offset,
+                                     igbe->rxWriteDelay);
                 desc->adv_wb.header_len = htole(0);
                 desc->adv_wb.pkt_len = htole((uint16_t)max_to_copy);
                 desc->adv_wb.sph = htole(0);
@@ -1261,12 +1262,13 @@ IGbE::RxDescCache::writePacket(EthPacketPtr packet, int pkt_offset)
 
                 DPRINTF(EthernetDesc, "Hdr split: splitting at %d\n",
                         split_point);
-                igbe->dmaWrite(pciToDma(desc->adv_read.hdr),
-                               split_point, &pktHdrEvent,
-                               packet->data, igbe->rxWriteDelay);
-                igbe->dmaWrite(pciToDma(desc->adv_read.pkt),
-                               max_to_copy, &pktDataEvent,
-                               packet->data + split_point, igbe->rxWriteDelay);
+                igbe->rxHeaderWrite(pciToDma(desc->adv_read.hdr),
+                                    split_point, &pktHdrEvent, packet->data,
+                                    igbe->rxWriteDelay);
+                igbe->rxPayloadWrite(pciToDma(desc->adv_read.pkt),
+                                     max_to_copy, &pktDataEvent,
+                                     packet->data + split_point,
+                                     igbe->rxWriteDelay);
                 desc->adv_wb.header_len = htole(split_point);
                 desc->adv_wb.sph = 1;
                 desc->adv_wb.pkt_len = htole((uint16_t)(max_to_copy));
@@ -1585,8 +1587,8 @@ IGbE::TxDescCache::processContextDesc()
         assert(txd_op::isData(desc) && txd_op::getLen(desc) >= tsoHeaderLen);
         pktWaiting = true;
         assert(tsoHeaderLen <= 256);
-        igbe->dmaRead(pciToDma(txd_op::getBuf(desc)),
-                      tsoHeaderLen, &headerEvent, tsoHeader, 0);
+        igbe->txPayloadRead(pciToDma(txd_op::getBuf(desc)), tsoHeaderLen,
+                            &headerEvent, tsoHeader, 0);
     }
 }
 
@@ -1690,16 +1692,15 @@ IGbE::TxDescCache::getPacketData(EthPacketPtr p)
         DPRINTF(EthernetDesc,
                 "Starting DMA of packet at offset %d length: %d\n",
                 p->length, tsoCopyBytes);
-        igbe->dmaRead(pciToDma(txd_op::getBuf(desc))
-                      + tsoDescBytesUsed,
-                      tsoCopyBytes, &pktEvent, p->data + p->length,
-                      igbe->txReadDelay);
+        igbe->txPayloadRead(pciToDma(txd_op::getBuf(desc)) +
+                            tsoDescBytesUsed, tsoCopyBytes, &pktEvent,
+                            p->data + p->length, igbe->txReadDelay);
         tsoDescBytesUsed += tsoCopyBytes;
         assert(tsoDescBytesUsed <= txd_op::getLen(desc));
     } else {
-        igbe->dmaRead(pciToDma(txd_op::getBuf(desc)),
-                      txd_op::getLen(desc), &pktEvent, p->data + p->length,
-                      igbe->txReadDelay);
+        igbe->txPayloadRead(pciToDma(txd_op::getBuf(desc)),
+                            txd_op::getLen(desc), &pktEvent,
+                            p->data + p->length, igbe->txReadDelay);
     }
 }
 
@@ -1909,8 +1910,10 @@ IGbE::TxDescCache::actionAfterWb()
         DPRINTF(EthernetDesc,
                 "Completion writing back value: %d to addr: %#x\n", descEnd,
                 completionAddress);
-        igbe->dmaWrite(pciToDma(mbits(completionAddress, 63, 2)),
-                       sizeof(descEnd), &nullEvent, (uint8_t *)&descEnd, 0);
+        igbe->dmaWriteCategorized(
+            pciToDma(mbits(completionAddress, 63, 2)), sizeof(descEnd),
+            &nullEvent, (uint8_t *)&descEnd, 0,
+            Request::NIC_TX_DESC_WRITEBACK);
     }
 }
 
