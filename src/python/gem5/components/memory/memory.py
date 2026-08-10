@@ -41,7 +41,9 @@ from m5.objects import (
     AddrRange,
     DRAMInterface,
     MemCtrl,
+    NoncoherentXBar,
     Port,
+    RangeAddrMapper,
 )
 from m5.util.convert import toMemorySize
 
@@ -123,16 +125,24 @@ class ChanneledMemory(AbstractMemorySystem):
             self._size = self._get_dram_size(num_channels, self._dram_class)
 
         self._create_mem_interfaces_controller()
+        # These are populated only when a disjoint guest address map is
+        # requested. Each guest range has one mapper; a common xbar routes the
+        # packed addresses across the physical memory channels.
+        self._range_mappers = []
+        self._range_mapper_buses = []
+        # Public vectors are created on demand below so these dynamically
+        # created SimObjects remain reachable from the memory system tree.
 
-    def _create_mem_interfaces_controller(self):
-        self._dram = [
+    def _create_controller_group(self):
+        dram = [
             self._dram_class(addr_mapping=self._addr_mapping)
             for _ in range(self._num_channels)
         ]
+        controllers = [MemCtrl(dram=interface) for interface in dram]
+        return dram, controllers
 
-        self.mem_ctrl = [
-            MemCtrl(dram=self._dram[i]) for i in range(self._num_channels)
-        ]
+    def _create_mem_interfaces_controller(self):
+        self._dram, self.mem_ctrl = self._create_controller_group()
 
     def _get_dram_size(self, num_channels: int, dram: DRAMInterface) -> int:
         return num_channels * (
@@ -141,7 +151,7 @@ class ChanneledMemory(AbstractMemorySystem):
             * dram.ranks_per_channel.value
         )
 
-    def _interleave_addresses(self):
+    def _interleaved_range(self, memory_range, intlv_match):
         if self._addr_mapping == "RoRaBaChCo":
             rowbuffer_size = (
                 self._dram_class.device_rowbuffer_size.value
@@ -157,15 +167,21 @@ class ChanneledMemory(AbstractMemorySystem):
             )
 
         intlv_bits = log(self._num_channels, 2)
-        for i, ctrl in enumerate(self.mem_ctrl):
-            ctrl.dram.range = AddrRange(
-                start=self._mem_range.start,
-                size=self._mem_range.size(),
-                intlvHighBit=intlv_low_bit + intlv_bits - 1,
-                xorHighBit=0,
-                intlvBits=intlv_bits,
-                intlvMatch=i,
-            )
+        return AddrRange(
+            start=memory_range.start,
+            size=memory_range.size(),
+            intlvHighBit=intlv_low_bit + intlv_bits - 1,
+            xorHighBit=0,
+            intlvBits=intlv_bits,
+            intlvMatch=intlv_match,
+        )
+
+    def _interleave_range(self, memory_range, controllers):
+        for i, ctrl in enumerate(controllers):
+            ctrl.dram.range = self._interleaved_range(memory_range, i)
+
+    def _interleave_addresses(self):
+        self._interleave_range(self._mem_range, self.mem_ctrl)
 
     @overrides(AbstractMemorySystem)
     def incorporate_memory(self, board: AbstractBoard) -> None:
@@ -177,17 +193,34 @@ class ChanneledMemory(AbstractMemorySystem):
                 f"size: {self._intlv_size}"
             )
 
+    def _get_all_controllers(self) -> List[MemCtrl]:
+        return list(self.mem_ctrl) + list(getattr(self, "extra_mem_ctrl", []))
+
     @overrides(AbstractMemorySystem)
     def get_mem_ports(self) -> Sequence[Tuple[AddrRange, Port]]:
-        return [(ctrl.dram.range, ctrl.port) for ctrl in self.mem_ctrl]
+        if self._range_mappers:
+            # Each mapper advertises exactly one disjoint guest range. The
+            # shared downstream xbar performs channel selection after the
+            # guest address has been packed around holes in the address map.
+            return [
+                (guest_range, mapper.cpu_side_port)
+                for guest_range, mapper in zip(
+                    self._mem_ranges, self._range_mappers
+                )
+            ]
+
+        return [
+            (ctrl.dram.range, ctrl.port)
+            for ctrl in self._get_all_controllers()
+        ]
 
     @overrides(AbstractMemorySystem)
     def get_memory_controllers(self) -> List[MemCtrl]:
-        return [ctrl for ctrl in self.mem_ctrl]
+        return self._get_all_controllers()
 
     @overrides(AbstractMemorySystem)
     def get_mem_interfaces(self) -> List[DRAMInterface]:
-        return self._dram
+        return [ctrl.dram for ctrl in self._get_all_controllers()]
 
     @overrides(AbstractMemorySystem)
     def get_size(self) -> int:
@@ -195,19 +228,116 @@ class ChanneledMemory(AbstractMemorySystem):
 
     @overrides(AbstractMemorySystem)
     def set_memory_range(self, ranges: List[AddrRange]) -> None:
-        """Need to add support for non-contiguous non overlapping ranges in
-        the future.
+        """Set the guest-visible ranges served by this memory system.
+
+        Disjoint ranges are packed into one physical address space.  The
+        channel controllers therefore remain one group, while one mapper per
+        guest range presents the original address map to the cache hierarchy.
+        This is important for x86's PCI hole: making a
+        second controller group would incorrectly double the timing queues
+        and bandwidth.
         """
-        if len(ranges) != 1 or ranges[0].size() != self._size:
-            raise Exception(
-                "Multi channel memory controller requires a single range "
-                "which matches the memory's size.\n"
-                f"The range size: {ranges[0].size()}\n"
-                f"This memory's size: {self._size}"
+        if not ranges:
+            raise ValueError("At least one memory range must be provided.")
+
+        total_size = 0
+        previous_start = None
+        previous_end = None
+        for memory_range in ranges:
+            start = int(memory_range.start)
+            size = int(memory_range.size())
+            end = start + size
+
+            if size <= 0:
+                raise ValueError("Memory ranges must not be empty.")
+            if previous_start is not None and start < previous_start:
+                raise ValueError("Memory ranges must be sorted by address.")
+            if previous_end is not None and start < previous_end:
+                raise ValueError("Memory ranges must not overlap.")
+
+            total_size += size
+            previous_start = start
+            previous_end = end
+
+        if total_size != self._size:
+            raise ValueError(
+                "The summed memory range size must match the memory system "
+                f"size ({total_size} != {self._size})."
             )
-        self._mem_range = ranges[0]
-        self._interleave_addresses()
+
+        # Always tear down the Python-side routing state first.  In
+        # particular, a caller may configure a split range and then return
+        # to a conventional single range before the board is instantiated.
+        self._range_mappers = []
+        self._range_mapper_buses = []
+        for child_name in ("range_mappers", "range_mapper_buses"):
+            if child_name in self._children:
+                self.clear_child(child_name)
+        if len(ranges) == 1:
+            self._mem_ranges = list(ranges)
+            self._mem_range = ranges[0]
+            self._interleave_addresses()
+            return
+
+        unsupported_overrides = (
+            type(self)._create_mem_interfaces_controller
+            is not ChanneledMemory._create_mem_interfaces_controller
+            or type(self)._interleave_addresses
+            is not ChanneledMemory._interleave_addresses
+            or type(self).get_mem_ports is not ChanneledMemory.get_mem_ports
+        )
+        if unsupported_overrides:
+            raise ValueError(
+                f"{type(self).__name__} does not support multiple memory "
+                "ranges."
+            )
+
+        self._mem_ranges = list(ranges)
+
+        # Interleave the packed physical space across the original channel
+        # controllers.  RangeAddrMapper only changes the address offset; the
+        # controller's interleaved range consequently still selects channels
+        # exactly as it does for a contiguous memory system.
+        packed_range = AddrRange(self._size)
+        self._mem_range = packed_range
+        self._interleave_range(packed_range, self.mem_ctrl)
+
+        packed_start = 0
+        packed_ranges = []
+        for guest_range in self._mem_ranges:
+            packed_ranges.append(
+                AddrRange(start=packed_start, size=guest_range.size())
+            )
+            packed_start += int(guest_range.size())
+
+        # One common xbar merges the disjoint mapped ranges and routes each
+        # packed address to its interleaved physical channel. Keeping channel
+        # selection downstream of the mappers gives every guest range one
+        # non-overlapping responder, which works for both Ruby/CHI and classic
+        # NoCache configurations.
+        range_xbar = NoncoherentXBar(
+            frontend_latency=0,
+            forward_latency=0,
+            response_latency=0,
+            header_latency=0,
+            width=self._intlv_size,
+            timing_transparent=True,
+        )
+        for ctrl in self.mem_ctrl:
+            range_xbar.mem_side_ports = ctrl.port
+        self._range_mapper_buses.append(range_xbar)
+
+        for guest_range, packed in zip(self._mem_ranges, packed_ranges):
+            mapper = RangeAddrMapper(
+                original_ranges=[guest_range],
+                remapped_ranges=[packed],
+            )
+            mapper.mem_side_port = range_xbar.cpu_side_ports
+            self._range_mappers.append(mapper)
+
+        self.range_mappers = self._range_mappers
+        self.range_mapper_buses = self._range_mapper_buses
 
     @overrides(AbstractMemorySystem)
     def get_uninterleaved_range(self) -> List[AddrRange]:
-        return [self._mem_range]
+        return list(self._mem_ranges)

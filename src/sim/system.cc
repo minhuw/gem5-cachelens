@@ -287,6 +287,13 @@ System::memSize() const
 bool
 System::isMemAddr(Addr addr) const
 {
+    const auto &main_mem_ranges = params().main_mem_ranges;
+    if (!main_mem_ranges.empty()) {
+        return std::any_of(
+            main_mem_ranges.begin(), main_mem_ranges.end(),
+            [addr](const AddrRange &range) { return range.contains(addr); });
+    }
+
     return physmem.isMemAddr(addr);
 }
 

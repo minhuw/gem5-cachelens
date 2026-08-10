@@ -72,7 +72,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
     A board capable of full system simulation for X86.
 
     **Limitations**
-    * Currently, this board's memory is hardcoded to 3GiB.
+    * Memory is limited to 8 GiB and split around the 3-4 GiB PCI hole.
     * Much of the I/O subsystem is hard coded.
     """
 
@@ -168,11 +168,14 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
         # Add in a Bios information structure.
         self.workload.smbios_table.structures = [X86SMBiosBiosInformation()]
 
-        # Set up the Intel MP table
+        # Set up the Intel MP table. Keep the entry lists on the board so
+        # specialized boards may register additional PCI INTx routes.
         base_entries = []
         ext_entries = []
         # Updated the X86 board with MADT entries.
         madt_entries = []
+        self._mp_base_entries = base_entries
+        self._madt_entries = madt_entries
         for i in range(self.get_processor().get_num_cores()):
             bp = X86IntelMPProcessor(
                 local_apic_id=i,
@@ -192,6 +195,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
         )
 
         self.pc.south_bridge.io_apic.apic_id = io_apic.id
+        self._io_apic = io_apic
         base_entries.append(io_apic)
         madt_entries.append(
             X86ACPIMadtIOAPIC(
@@ -208,24 +212,13 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
         )
         ext_entries.append(connect_busses)
 
-        pci_dev4_inta = X86IntelMPIOIntAssignment(
-            interrupt_type="INT",
-            polarity="ConformPolarity",
-            trigger="ConformTrigger",
-            source_bus_id=0,
-            source_bus_irq=0 + (4 << 2),
-            dest_io_apic_id=io_apic.id,
-            dest_io_apic_intin=16,
-        )
-
-        base_entries.append(pci_dev4_inta)
-        pci_dev4_inta_madt = X86ACPIMadtIntSourceOverride(
-            bus_source=pci_dev4_inta.source_bus_id,
-            irq_source=pci_dev4_inta.source_bus_irq,
-            sys_int=pci_dev4_inta.dest_io_apic_intin,
-            flags=0,
-        )
-        madt_entries.append(pci_dev4_inta_madt)
+        # Linux must consume this legacy MP-table route.  PCI INTx device
+        # routing is not an ACPI MADT interrupt-source override, and this
+        # branch has no AML/_PRT generator.  Keep the PCI InterruptLine in
+        # agreement with the MP destination and use pci=noacpi below so
+        # Linux selects the MP route instead of looking for _PRT.
+        self.pc.south_bridge.ide.InterruptLine = 16
+        self._add_pci_intx_route(pci_device=4, int_pin=0, io_apic_intin=16)
 
         def assignISAInt(irq, apicPin):
             assign_8259_to_apic = X86IntelMPIOIntAssignment(
@@ -276,20 +269,59 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
             # Mark the first megabyte of memory as reserved
             X86E820Entry(addr=0, size="639KiB", range_type=1),
             X86E820Entry(addr=0x9FC00, size="385KiB", range_type=2),
-            # Mark the rest of physical memory as available
+            # Mark the rest of low physical memory as available
             X86E820Entry(
                 addr=0x100000,
-                size=f"{self.mem_ranges[0].size() - 0x100000:d}B",
+                size=f"{self._ram_ranges[0].size() - 0x100000:d}B",
                 range_type=1,
             ),
         ]
 
-        # Reserve the last 16KiB of the 32-bit address space for m5ops
+        if len(self._ram_ranges) == 1:
+            low_end = self._ram_ranges[0].start + self._ram_ranges[0].size()
+            if low_end < toMemorySize("3GiB"):
+                entries.append(
+                    X86E820Entry(
+                        addr=low_end,
+                        size=f"{toMemorySize('3GiB') - low_end:d}B",
+                        range_type=2,
+                    )
+                )
+        else:
+            entries.append(
+                X86E820Entry(
+                    addr=self._ram_ranges[1].start,
+                    size=f"{self._ram_ranges[1].size():d}B",
+                    range_type=1,
+                )
+            )
+
+        # Reserve the last 64 KiB of the 32-bit address space for m5ops.
         entries.append(
             X86E820Entry(addr=0xFFFF0000, size="64KiB", range_type=2)
         )
 
         self.workload.e820_table.entries = entries
+
+    def _add_pci_intx_route(
+        self, pci_device: int, int_pin: int, io_apic_intin: int
+    ) -> None:
+        """Register a legacy PCI INTx route in the MP table.
+
+        MADT Interrupt Source Override records describe legacy ISA source
+        overrides, not PCI device/pin routing.  There is deliberately no
+        ACPI record here: this board uses its MP table for PCI INTx routes.
+        """
+        assignment = X86IntelMPIOIntAssignment(
+            interrupt_type="INT",
+            polarity="ConformPolarity",
+            trigger="ConformTrigger",
+            source_bus_id=0,
+            source_bus_irq=int_pin + (pci_device << 2),
+            dest_io_apic_id=self._io_apic.id,
+            dest_io_apic_intin=io_apic_intin,
+        )
+        self._mp_base_entries.append(assignment)
 
     @overrides(AbstractSystemBoard)
     def has_io_bus(self) -> bool:
@@ -337,19 +369,29 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
     @overrides(AbstractSystemBoard)
     def _setup_memory_ranges(self):
         memory = self.get_memory()
+        memory_size = memory.get_size()
+        three_gib = toMemorySize("3GiB")
+        four_gib = toMemorySize("4GiB")
 
-        if memory.get_size() > toMemorySize("3GiB"):
-            raise Exception(
-                "X86Board currently only supports memory sizes up "
-                "to 3GiB because of the I/O hole."
+        if memory_size > toMemorySize("8GiB"):
+            raise ValueError(
+                "X86Board currently supports memory sizes up to 8GiB."
             )
-        data_range = AddrRange(memory.get_size())
-        memory.set_memory_range([data_range])
 
-        # Add the address range for the IO
-        self.mem_ranges = [
-            data_range,  # All data
-            AddrRange(0xC0000000, size=0x100000),  # For I/0
+        if memory_size <= three_gib:
+            self._ram_ranges = [AddrRange(memory_size)]
+        else:
+            self._ram_ranges = [
+                AddrRange(three_gib),
+                AddrRange(four_gib, size=memory_size - three_gib),
+            ]
+
+        memory.set_memory_range(self._ram_ranges)
+
+        # Add the address range required for x86 I/O without exposing the
+        # 3-4 GiB PCI hole as RAM.
+        self.mem_ranges = self._ram_ranges + [
+            AddrRange(0xC0000000, size=0x100000),
         ]
 
     @overrides(KernelDiskWorkload)

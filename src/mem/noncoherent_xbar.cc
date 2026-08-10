@@ -49,12 +49,14 @@
 #include "base/trace.hh"
 #include "debug/NoncoherentXBar.hh"
 #include "debug/XBar.hh"
+#include "mem/xbar_response.hh"
+#include "mem/xbar_timing.hh"
 
 namespace gem5
 {
 
 NoncoherentXBar::NoncoherentXBar(const NoncoherentXBarParams &p)
-    : BaseXBar(p)
+    : BaseXBar(p), timingTransparent(p.timing_transparent)
 {
     // create the ports based on the size of the memory-side port and
     // CPU-side port vector ports, and the presence of the default port,
@@ -98,6 +100,20 @@ NoncoherentXBar::~NoncoherentXBar()
         delete l;
 }
 
+Tick
+NoncoherentXBar::layerReleaseTick(Tick packet_finish_time) const
+{
+    return XBarTiming::layerReleaseTick(
+        timingTransparent, curTick(), packet_finish_time);
+}
+
+Tick
+NoncoherentXBar::retryLayerReleaseTick() const
+{
+    return timingTransparent ? curTick() + 1 :
+        BaseXBar::retryLayerReleaseTick();
+}
+
 bool
 NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
 {
@@ -129,14 +145,15 @@ NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
     // store the old header delay so we can restore it if needed
     Tick old_header_delay = pkt->headerDelay;
 
-    // a request sees the frontend and forward latency
+    // Transparent routing must not annotate packet timing. Otherwise a
+    // request sees the configured frontend and forward latency and the layer
+    // is occupied according to the packet serialization time.
     Tick xbar_delay = (frontendLatency + forwardLatency) * clockPeriod();
-
-    // set the packet header and payload delay
-    calcPacketTiming(pkt, xbar_delay);
-
-    // determine how long to be crossbar layer is busy
-    Tick packetFinishTime = clockEdge(Cycles(1)) + pkt->payloadDelay;
+    calcPacketTiming(pkt, xbar_delay, timingTransparent);
+    Tick packetFinishTime = curTick() + 1;
+    if (!timingTransparent) {
+        packetFinishTime = clockEdge(Cycles(1)) + pkt->payloadDelay;
+    }
 
     // before forwarding the packet (and possibly altering it),
     // remember if we are expecting a response
@@ -153,9 +170,10 @@ NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
         // restore the header delay as it is additive
         pkt->headerDelay = old_header_delay;
 
-        // occupy until the header is sent
+        // Occupy the arbitration layer for either one clocked header or the
+        // minimum simulator bookkeeping interval.
         reqLayers[mem_side_port_id]->failedTiming(src_port,
-                                                clockEdge(Cycles(1)));
+            layerReleaseTick(clockEdge(Cycles(1))));
 
         return false;
     }
@@ -166,7 +184,8 @@ NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
         routeTo[pkt->req] = cpu_side_port_id;
     }
 
-    reqLayers[mem_side_port_id]->succeededTiming(packetFinishTime);
+    reqLayers[mem_side_port_id]->succeededTiming(
+        layerReleaseTick(packetFinishTime));
 
     // stats updates
     pktCount[cpu_side_port_id][mem_side_port_id]++;
@@ -182,10 +201,15 @@ NoncoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
     // determine the source port based on the id
     RequestPort *src_port = memSidePorts[mem_side_port_id];
 
-    // determine the destination
-    const auto route_lookup = routeTo.find(pkt->req);
-    assert(route_lookup != routeTo.end());
-    const PortID cpu_side_port_id = route_lookup->second;
+    // Save the route independently of the map entry. A transparent response
+    // callback may synchronously issue another request and mutate routeTo.
+    const RequestPtr route_key = pkt->req;
+    PortID cpu_side_port_id;
+    {
+        const auto route_lookup = routeTo.find(route_key);
+        assert(route_lookup != routeTo.end());
+        cpu_side_port_id = route_lookup->second;
+    }
     assert(cpu_side_port_id != InvalidPortID);
     assert(cpu_side_port_id < respLayers.size());
 
@@ -205,26 +229,44 @@ NoncoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
     unsigned int pkt_size = pkt->hasData() ? pkt->getSize() : 0;
     unsigned int pkt_cmd = pkt->cmdToIndex();
 
-    // a response sees the response latency
     Tick xbar_delay = responseLatency * clockPeriod();
+    calcPacketTiming(pkt, xbar_delay, timingTransparent);
 
-    // set the packet header and payload delay
-    calcPacketTiming(pkt, xbar_delay);
+    Tick packetFinishTime = curTick() + 1;
+    if (timingTransparent) {
+        // Erase the completed route before calling the requestor. The
+        // callback can synchronously reuse this Request or otherwise rehash
+        // the routing table. Restore the old route only if it rejects the
+        // response and the responder must retry it.
+        const bool success = XBarResponseRoute::forward(
+            routeTo, route_key, cpu_side_port_id,
+            [this, cpu_side_port_id, pkt] {
+                return cpuSidePorts[cpu_side_port_id]->sendTimingResp(pkt);
+            });
+        if (!success) {
+            respLayers[cpu_side_port_id]->failedTiming(
+                src_port, layerReleaseTick(packetFinishTime));
+            return false;
+        }
+    } else {
+        // A normal response sees the configured response latency and payload
+        // serialization before being queued for the destination requestor.
+        packetFinishTime = clockEdge(Cycles(1)) + pkt->payloadDelay;
 
-    // determine how long to be crossbar layer is busy
-    Tick packetFinishTime = clockEdge(Cycles(1)) + pkt->payloadDelay;
+        Tick latency = pkt->headerDelay;
+        pkt->headerDelay = 0;
+        cpuSidePorts[cpu_side_port_id]->schedTimingResp(
+            pkt, curTick() + latency);
+    }
 
-    // send the packet through the destination CPU-side port, and pay for
-    // any outstanding latency
-    Tick latency = pkt->headerDelay;
-    pkt->headerDelay = 0;
-    cpuSidePorts[cpu_side_port_id]->schedTimingResp(pkt,
-                                        curTick() + latency);
+    // Queued responses cannot re-enter here, so remove their completed route
+    // after scheduling. Transparent responses removed or restored it before
+    // returning from the synchronous callback above.
+    if (!timingTransparent)
+        routeTo.erase(route_key);
 
-    // remove the request from the routing table
-    routeTo.erase(route_lookup);
-
-    respLayers[cpu_side_port_id]->succeededTiming(packetFinishTime);
+    respLayers[cpu_side_port_id]->succeededTiming(
+        layerReleaseTick(packetFinishTime));
 
     // stats updates
     pktCount[cpu_side_port_id][mem_side_port_id]++;
@@ -241,6 +283,13 @@ NoncoherentXBar::recvReqRetry(PortID mem_side_port_id)
     // always be coming from a port to which we tried to forward a
     // request
     reqLayers[mem_side_port_id]->recvRetry();
+}
+
+void
+NoncoherentXBar::recvRespRetry(PortID cpu_side_port_id)
+{
+    assert(timingTransparent);
+    respLayers[cpu_side_port_id]->recvRetry();
 }
 
 Tick

@@ -83,7 +83,12 @@ class System(SimObject):
     # such that these can be passed from the I/O subsystem through an
     # I/O bridge or cache
     mem_ranges = VectorParam.AddrRange(
-        [], "Ranges that constitute main memory"
+        [], "Ranges visible to the system and cache hierarchy"
+    )
+    main_mem_ranges = VectorParam.AddrRange(
+        [],
+        "RAM-only ranges used for physical-memory address classification. "
+        "If empty, infer RAM from AbstractMemory objects.",
     )
 
     # The ranges backed by a shadowed ROM
