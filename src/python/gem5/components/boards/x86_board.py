@@ -219,6 +219,16 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
         # Linux selects the MP route instead of looking for _PRT.
         self.pc.south_bridge.ide.InterruptLine = 16
         self._add_pci_intx_route(pci_device=4, int_pin=0, io_apic_intin=16)
+        for (
+            pci_device,
+            int_pin,
+            io_apic_intin,
+        ) in self._get_additional_pci_intx_routes():
+            self._add_pci_intx_route(
+                pci_device=pci_device,
+                int_pin=int_pin,
+                io_apic_intin=io_apic_intin,
+            )
 
         def assignISAInt(irq, apicPin):
             assign_8259_to_apic = X86IntelMPIOIntAssignment(
@@ -302,6 +312,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
         )
 
         self.workload.e820_table.entries = entries
+
+    def _get_additional_pci_intx_routes(self):
+        """Return extra ``(device, pin, IO-APIC input)`` PCI routes."""
+        return []
 
     def _add_pci_intx_route(
         self, pci_device: int, int_pin: int, io_apic_intin: int
@@ -388,11 +402,13 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
 
         memory.set_memory_range(self._ram_ranges)
 
-        # Add the address range required for x86 I/O without exposing the
-        # 3-4 GiB PCI hole as RAM.
-        self.mem_ranges = self._ram_ranges + [
-            AddrRange(0xC0000000, size=0x100000),
-        ]
+        self.mem_ranges = list(self._ram_ranges)
+        if self.get_cache_hierarchy().is_ruby():
+            # Ruby needs an explicit sequencer-visible range for PCI MMIO.
+            # Classic hierarchies already route this range through the x86
+            # bridge; adding it here would overlap PCI device responders on
+            # the I/O bus.
+            self.mem_ranges.append(AddrRange(0xC0000000, size=0x100000))
 
     @overrides(KernelDiskWorkload)
     def get_disk_device(self):
@@ -416,6 +432,9 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
             "earlyprintk=ttyS0",
             "console=ttyS0",
             "lpj=7999923",
+            # This branch has no ACPI AML _PRT generator.  Disable ACPI
+            # PCI IRQ routing so Linux uses the explicit MP-table route.
+            "pci=noacpi",
             "root={root_value}",
             "disk_device={disk_device}",
         ]
