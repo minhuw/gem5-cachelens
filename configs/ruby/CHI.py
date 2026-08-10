@@ -102,8 +102,9 @@ def create_system(
     CHI_RNI_DMA = chi_defs.CHI_RNI_DMA
     CHI_RNI_IO = chi_defs.CHI_RNI_IO
 
-    if options.ddio_way_part != -1 and not (
-        1 <= options.ddio_way_part <= options.l3_assoc
+    configured_ddio_ways = getattr(options, "ddio_way_part", -1)
+    if configured_ddio_ways != -1 and not (
+        1 <= configured_ddio_ways <= options.l3_assoc
     ):
         raise ValueError(
             "--ddio-way-part must be -1 or between 1 and --l3_assoc "
@@ -115,8 +116,8 @@ def create_system(
         tagAccessLatency = 2
         size = options.l3_size
         assoc = options.l3_assoc
-        ddio_way_part = options.ddio_way_part
-        if options.ddio_way_part > 0:
+        ddio_way_part = configured_ddio_ways
+        if configured_ddio_ways > 0:
             # DDIO subset victim selection requires a policy that accepts
             # arbitrary candidate subsets. Preserve the upstream policy when
             # DDIO is disabled.

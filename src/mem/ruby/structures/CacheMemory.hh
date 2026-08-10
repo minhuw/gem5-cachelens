@@ -69,6 +69,8 @@ namespace ruby
 
 class CacheMemory : public SimObject
 {
+    friend class CacheMemoryTest;
+
   public:
     typedef RubyCacheParams Params;
     typedef std::shared_ptr<replacement_policy::ReplacementData> ReplData;
@@ -95,8 +97,8 @@ class CacheMemory : public SimObject
     bool cacheAvail(Addr address) const;
 
     // DDIO way-partitioned variants: like cacheAvail/allocate/cacheProbe,
-    // but only consider ways [0, ways).  Used for NIC RX payload fills so
-    // payload lines are confined to the DDIO way subset.
+    // but only consider ways [0, ways). Used for NIC RX data fills so packet
+    // lines, including split headers, are confined to the DDIO way subset.
     bool cacheAvailInWays(Addr address, int ways) const;
     AbstractCacheEntry* allocateInWays(Addr address,
                                        AbstractCacheEntry* new_entry,
@@ -195,6 +197,8 @@ class CacheMemory : public SimObject
     // The second index is the the amount associativity.
     std::unordered_map<Addr, int> m_tag_index;
     std::vector<std::vector<AbstractCacheEntry*> > m_cache;
+    /** Next way considered when selecting among equally invalid slots. */
+    std::vector<int> m_next_invalid_way;
 
     /** We use the replacement policies from the Classic memory system. */
     replacement_policy::Base *m_replacementPolicy_ptr;
@@ -270,8 +274,8 @@ class CacheMemory : public SimObject
 
           statistics::Vector m_accessModeType;
 
-          // DDIO (NIC RX payload DMA write) accounting.  A request is a
-          // payload line transaction seen by this cache; a hit means the line
+          // DDIO (NIC RX data DMA write) accounting. A request is a packet
+          // data line transaction seen by this cache; a hit means the line
           // was already present at acceptance.
           statistics::Scalar rxPayloadRequests;
           statistics::Scalar rxPayloadHits;
@@ -303,7 +307,7 @@ class CacheMemory : public SimObject
       void profilePrefetchMiss();
 
       // DDIO accounting hooks (called from the CHI home node).
-      // profileRxPayload counts one RX payload write line transaction and
+      // profileRxPayload counts one RX data write line transaction and
       // records whether the line was present at acceptance; the allocation way
       // is recorded separately by allocateInWays().
       void profileRxPayload(Addr address);
@@ -312,9 +316,10 @@ class CacheMemory : public SimObject
 
       // NIC DMA classification helpers (SLICC-visible; the gem5 Request
       // carries the NIC category flags end-to-end as seqReq).
-      bool isNicRxPayloadWriteReq(const RequestPtr &req) const
+      bool isNicRxWriteReq(const RequestPtr &req) const
       {
-          return req && req->isNicRxPayloadWrite();
+          return req &&
+              (req->isNicRxPayloadWrite() || req->isNicRxHeaderWrite());
       }
       bool isNicDdioWriteReq(const RequestPtr &req) const
       {
@@ -335,6 +340,10 @@ class CacheMemory : public SimObject
       bool isNicTxPayloadReadReq(const RequestPtr &req) const
       {
           return req && req->isNicTxPayloadRead();
+      }
+      bool ddioWriteNeedsRead(bool partial, bool data_valid) const
+      {
+          return partial && !data_valid;
       }
 };
 

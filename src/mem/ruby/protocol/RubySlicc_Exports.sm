@@ -71,6 +71,7 @@ structure(WriteMask, external="yes", desc="...") {
   int firstBitSet(bool,int);
   int count();
   int count(int);
+  int countChunks(int);
   bool test(int);
   int getBlockSize();
   void setBlockSize(int);

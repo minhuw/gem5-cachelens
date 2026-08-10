@@ -201,9 +201,10 @@ def addNoISAOptions(parser):
         "--ddio-way-part",
         type=int,
         default=-1,
-        help="Number of LLC ways [0, D) reserved for NIC RX payload (DDIO) "
-        "allocations in the CHI home node cache; -1 disables; enabled values "
-        "must be between 1 and --l3_assoc",
+        help="Number of LLC ways [0, D) eligible for NIC RX data (DDIO) "
+        "allocations in the CHI home node cache; CPU traffic may also use "
+        "these ways; -1 disables; enabled values must be between 1 and "
+        "--l3_assoc",
     )
 
     # Enable Ruby

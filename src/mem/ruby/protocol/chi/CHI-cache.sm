@@ -131,6 +131,10 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // possible.
   bool enable_DCT;
 
+  // Prevent classified NIC reads from allocating an HNF line on a miss.
+  // This is a model/profile choice, not an unconditional CHI rule.
+  bool nic_read_no_allocate := "False";
+
   // Atomic Operation Policy
   // All Near executes all Atomics at L1 (variable set to 0; default)
   // Unique Near executes Atomics at HNF for states I, SC, SD (set to 1)
@@ -465,6 +469,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     SendReadOnce,         out_trans="yes", desc="Send a ReadOnce";
     SendReadNoSnp,        out_trans="yes", desc="Send a SendReadNoSnp";
     SendReadNoSnpDMT,     out_trans="yes", desc="Send a SendReadNoSnp using DMT";
+    PrepareDDIOWrite,     desc="Prepare a classified NIC write after upstream invalidations";
     SendReadUnique,       out_trans="yes", desc="Send a ReadUnique";
     SendMakeReadUnique,   out_trans="yes", desc="Send a MakeReadUnique";
     SendCompAck,          desc="Send CompAck";
@@ -679,9 +684,12 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     RequestPtr seqReq,      default="nullptr", desc="Pointer to original request from CPU/sequencer";
     bool isSeqReqValid,     default="false",   desc="Set if seqReq is valid (not nullptr)";
 
-    // DDIO classification of the transaction (home node only): set when the
-    // original DMA request is a NIC RX payload write / TX payload read.
-    bool is_ddio_payload,   default="false",   desc="NIC RX payload DMA write (DDIO)";
+    // NIC classification of the transaction (home node only). Payload and
+    // header telemetry remain separate, while all NIC writes share the DDIO
+    // allocation policy.
+    bool is_ddio_write,     default="false",   desc="NIC DMA write subject to DDIO policy";
+    bool is_ddio_payload,   default="false",   desc="NIC RX payload DMA write";
+    bool is_ddio_header,    default="false",   desc="NIC RX header DMA write";
     bool is_tx_payload,     default="false",   desc="NIC TX payload DMA read";
     bool stale_wb_path,     default="false",   desc="Writeback handled via stale-copyback path";
 
@@ -696,6 +704,8 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     DataBlock dataBlk,            desc="Local copy of the line";
     DataBlock oldDataBlk,         desc="Local copy of the line before executing atomic";
     WriteMask dataBlkValid,       desc="Marks which bytes in the DataBlock are valid";
+    WriteMask wuAccessMask,       desc="Bytes declared by the WriteUnique request";
+    WriteMask wuDataValid,        desc="WriteUnique bytes received from the requester";
     bool dataValid,               desc="Local copy is valid";
     bool dataAMOValid,            desc="Local copy is valid for AMO";
     bool dataDirty,               desc="Local copy is dirtry";

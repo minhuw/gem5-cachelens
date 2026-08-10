@@ -58,5 +58,30 @@ Source('TimerTable.cc')
 Source('BankedArray.cc')
 Source('ALUFreeListArray.cc')
 Source('TBEStorage.cc')
+GTest('cache_memory.test', 'cache_memory.test.cc', 'CacheMemory.cc',
+      SourceLib('z', tags=[]),
+      'BankedArray.cc', 'ALUFreeListArray.cc',
+      '../../cache/replacement_policies/lru_rp.cc',
+      '../../cache/replacement_policies/weighted_lru_rp.cc',
+      '../common/Address.cc', '../slicc_interface/AbstractCacheEntry.cc',
+      '../../../sim/cur_tick.cc', '../../../sim/sim_object.cc',
+      '../../../sim/serialize.cc', '../../../sim/drain.cc',
+      '../../../sim/eventq.cc', '../../../sim/root.cc', '../../../sim/globals.cc',
+      '../../../sim/sim_events.cc', '../../../sim/global_event.cc',
+      '../../../sim/core.cc', '../../../sim/bufval.cc',
+      '../../../base/debug.cc', '../../../base/statistics.cc',
+      '../../../base/stats/group.cc', '../../../base/stats/info.cc',
+      '../../../base/stats/storage.cc', '../../../base/match.cc',
+      '../../../base/str.cc', '../../../base/trace.cc',
+      '../../../base/atomicio.cc', '../../../base/hostinfo.cc',
+      '../../../base/inifile.cc', '../../../base/time.cc',
+      '../../../base/output.cc',
+      '../../../sim/backtrace_glibc.cc', '../../../base/version.cc',
+      '../../../mem/packet.cc', '../common/DataBlock.cc',
+      '../common/WriteMask.cc', '../system/CacheRecorder.cc',
+      env.File('mem/ruby/protocol/CacheRequestType.cc', env['BUILDDIR']),
+      env.File('mem/ruby/protocol/RubyAccessMode.cc', env['BUILDDIR']),
+      env.File('mem/ruby/protocol/RubyRequestType.cc', env['BUILDDIR']),
+      env.File('sim/tags.cc', env['BUILDDIR']))
 if env['CONF']['RUBY_PROTOCOL_CHI']:
     Source('MN_TBETable.cc')

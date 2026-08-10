@@ -122,6 +122,7 @@ CacheMemory::init()
 
     m_cache.resize(m_cache_num_sets,
                     std::vector<AbstractCacheEntry*>(m_cache_assoc, nullptr));
+    m_next_invalid_way.resize(m_cache_num_sets, 0);
     replacement_data.resize(m_cache_num_sets,
                                std::vector<ReplData>(m_cache_assoc, nullptr));
 
@@ -167,10 +168,14 @@ CacheMemory::findTagInSet(int64_t cacheSet, Addr tag) const
     assert(tag == makeLineAddress(tag));
     // search the set for the tags
     auto it = m_tag_index.find(tag);
-    if (it != m_tag_index.end())
-        if (m_cache[cacheSet][it->second]->m_Permission !=
+    if (it != m_tag_index.end() && it->second >= 0 &&
+        it->second < m_cache_assoc) {
+        AbstractCacheEntry* entry = m_cache[cacheSet][it->second];
+        if (entry && entry->m_Address == tag &&
+            entry->m_Permission !=
             AccessPermission_NotPresent)
             return it->second;
+    }
     return -1; // Not found
 }
 
@@ -313,14 +318,27 @@ CacheMemory::cacheAvailInWays(Addr address, int ways) const
              "Invalid DDIO way subset [0, %d) for %d-way cache",
              ways, m_cache_assoc);
 
-    // A tag match in *any* way is available (payload writes may hit in any
-    // way, like real DDIO); free slots only count inside [0, ways).
+    // A present tag match in *any* way is available (NIC writes may hit in
+    // any way, like real DDIO). A NotPresent placeholder outside the subset
+    // is not capacity in the subset; allocateInWays will reclaim it safely.
     int64_t cacheSet = addressToCacheSet(address);
+    int matching_way = -1;
     for (int i = 0; i < m_cache_assoc; i++) {
         AbstractCacheEntry* entry = m_cache[cacheSet][i];
         if (entry != NULL && entry->m_Address == address) {
+            fatal_if(matching_way >= 0,
+                     "Duplicate cache entries for address %#x in ways %d "
+                     "and %d", address, matching_way, i);
+            matching_way = i;
+        }
+    }
+    if (matching_way >= 0) {
+        AbstractCacheEntry* entry = m_cache[cacheSet][matching_way];
+        if (entry->m_Permission != AccessPermission_NotPresent) {
             return true;
         }
+        if (matching_way < ways)
+            return true;
     }
     for (int i = 0; i < ways; i++) {
         AbstractCacheEntry* entry = m_cache[cacheSet][i];
@@ -350,14 +368,22 @@ CacheMemory::allocateInWays(Addr address, AbstractCacheEntry *entry,
     int64_t cacheSet = addressToCacheSet(address);
     std::vector<AbstractCacheEntry*> &set = m_cache[cacheSet];
 
-    // A NotPresent entry for this same address (rare placeholder left by
-    // the protocol) may be reused regardless of way; it already "is" this
-    // address.  Mirror CacheMemory::allocate()'s slot-reuse behavior.
+    // NotPresent is not a protocol-visible line. Reclaim a stale
+    // same-address placeholder even when it was left in an unrestricted way,
+    // then allocate the line in the configured subset.
     int way = -1;
     for (int i = 0; i < m_cache_assoc; i++) {
         if (set[i] && set[i]->m_Address == address) {
+            fatal_if(way >= 0,
+                     "Duplicate cache entries for address %#x in ways %d "
+                     "and %d", address, way, i);
+            fatal_if(set[i]->m_Permission != AccessPermission_NotPresent,
+                     "Cannot allocate already-present address %#x in DDIO "
+                     "ways [0, %d)", address, ways);
+            fatal_if(i >= ways,
+                     "NotPresent placeholder for address %#x is in way %d "
+                     "outside DDIO subset [0, %d)", address, i, ways);
             way = i;
-            break;
         }
     }
 
@@ -379,13 +405,28 @@ CacheMemory::allocateInWays(Addr address, AbstractCacheEntry *entry,
             }
         }
         if (!free_candidates.empty()) {
-            way = m_replacementPolicy_ptr->
-                getVictim(free_candidates)->getWay();
+            // Invalid LRU entries commonly all have tick zero. Select such
+            // ties round-robin rather than relying on candidate order.
+            for (int offset = 0; offset < ways; ++offset) {
+                const int candidate =
+                    (m_next_invalid_way[cacheSet] + offset) % ways;
+                if (!set[candidate] || set[candidate]->m_Permission ==
+                        AccessPermission_NotPresent) {
+                    way = candidate;
+                    break;
+                }
+            }
         }
     }
 
     if (way >= 0) {
         int i = way;
+        if (set[i] && set[i]->m_Address != address) {
+            auto old = m_tag_index.find(set[i]->m_Address);
+            if (old != m_tag_index.end() && old->second == i) {
+                m_tag_index.erase(old);
+            }
+        }
         set[i] = entry;  // Init entry
         set[i]->m_Address = address;
         set[i]->m_Permission = AccessPermission_Invalid;
@@ -398,6 +439,7 @@ CacheMemory::allocateInWays(Addr address, AbstractCacheEntry *entry,
         // Call reset function here to set initial value for different
         // replacement policies.
         m_replacementPolicy_ptr->reset(entry->replacementData);
+        m_next_invalid_way[cacheSet] = (i + 1) % ways;
 
         return entry;
     }
@@ -469,7 +511,17 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
                     static_cast<ReplaceableEntry*>(set[i]));
             }
         }
-        if (!free_candidates.empty()) {
+        if (!free_candidates.empty() && m_ddio_way_part > 0) {
+            for (int offset = 0; offset < m_cache_assoc; ++offset) {
+                const int candidate =
+                    (m_next_invalid_way[cacheSet] + offset) % m_cache_assoc;
+                if (!set[candidate] || set[candidate]->m_Permission ==
+                        AccessPermission_NotPresent) {
+                    free_way = candidate;
+                    break;
+                }
+            }
+        } else if (!free_candidates.empty()) {
             free_way = m_replacementPolicy_ptr->
                 getVictim(free_candidates)->getWay();
         }
@@ -477,6 +529,12 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
     for (int i = 0; i < m_cache_assoc; i++) {
         if (subset_safe && i != free_way) continue;
         if (!set[i] || set[i]->m_Permission == AccessPermission_NotPresent) {
+            if (set[i] && set[i]->m_Address != address) {
+                auto old = m_tag_index.find(set[i]->m_Address);
+                if (old != m_tag_index.end() && old->second == i) {
+                    m_tag_index.erase(old);
+                }
+            }
             if (set[i] && (set[i] != entry)) {
                 warn_once("This protocol contains a cache entry handling bug: "
                     "Entries in the cache should never be NotPresent! If\n"
@@ -498,6 +556,10 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
             // Call reset function here to set initial value for different
             // replacement policies.
             m_replacementPolicy_ptr->reset(entry->replacementData);
+            if (m_ddio_way_part > 0) {
+                m_next_invalid_way[cacheSet] =
+                    (i + 1) % m_cache_assoc;
+            }
 
             return entry;
         }
@@ -747,15 +809,21 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
                m_prefetch_hits + m_prefetch_misses),
       ADD_STAT(m_accessModeType, ""),
       ADD_STAT(rxPayloadRequests,
-               "Number of NIC RX payload DMA write line transactions"),
+               "Number of NIC RX data DMA write line transactions"),
       ADD_STAT(rxPayloadHits,
-               "Number of NIC RX payload DMA writes hitting a present line"),
+               "Number of NIC RX data DMA writes hitting a present line"),
       ADD_STAT(rxPayloadMisses,
-               "Number of NIC RX payload DMA writes missing at acceptance"),
-      ADD_STAT(rxPayloadHitRate, "NIC RX payload DMA write hit rate",
+               "Number of NIC RX data DMA writes missing at acceptance"),
+      ADD_STAT(rxPayloadHitRate, "NIC RX data DMA write hit rate",
                rxPayloadHits / (rxPayloadHits + rxPayloadMisses)),
-      ADD_STAT(rxPayloadHitWays, "Way histogram of RX payload hits"),
+      ADD_STAT(rxPayloadHitWays, "Way histogram of RX data hits"),
       ADD_STAT(rxPayloadAllocWays, "Way histogram of RX payload allocations"),
+      ADD_STAT(ddioAllocWays, "Way histogram of all NIC DDIO allocations"),
+      ADD_STAT(rxHeaderRequests, "Number of NIC RX header DMA write line transactions"),
+      ADD_STAT(rxHeaderHits, "Number of NIC RX header DMA writes hitting a present line"),
+      ADD_STAT(rxHeaderMisses, "Number of NIC RX header DMA writes missing at acceptance"),
+      ADD_STAT(rxHeaderHitRate, "NIC RX header DMA write hit rate",
+               rxHeaderHits / (rxHeaderHits + rxHeaderMisses)),
       ADD_STAT(txPayloadRequests,
                "Number of NIC TX payload DMA read line transactions"),
       ADD_STAT(txPayloadHits,
@@ -765,6 +833,8 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(txPayloadHitRate, "NIC TX payload DMA read hit rate",
                txPayloadHits / (txPayloadHits + txPayloadMisses))
 {
+    rxPayloadHitRate.flags(statistics::nonan);
+    txPayloadHitRate.flags(statistics::nonan);
     numDataArrayReads
         .flags(statistics::nozero);
 

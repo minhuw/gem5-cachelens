@@ -405,6 +405,8 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
 
   tbe.dataToBeInvalid := false;
   tbe.dataToBeSharedClean := false;
+  tbe.wuAccessMask.clear();
+  tbe.wuDataValid.clear();
 
   tbe.doCacheFill := false;
 
@@ -442,6 +444,7 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
 
   tbe.accAddr := in_msg.accAddr;
   tbe.accSize := in_msg.accSize;
+  tbe.wuAccessMask.orMask(in_msg.accessMask);
   tbe.requestor := in_msg.requestor;
   tbe.reqType := in_msg.type;
 
@@ -457,8 +460,14 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
       cache.isNicDdioWriteReq(in_msg.seqReq);
   tbe.is_ddio_payload := is_HN && in_msg.isSeqReqValid &&
       cache.isNicRxPayloadWriteReq(in_msg.seqReq);
+  tbe.is_ddio_header := is_HN && in_msg.isSeqReqValid &&
+      cache.isNicRxHeaderWriteReq(in_msg.seqReq);
   tbe.is_tx_payload := is_HN && in_msg.isSeqReqValid &&
       cache.isNicTxPayloadReadReq(in_msg.seqReq);
+  tbe.is_nic_desc := is_HN && in_msg.isSeqReqValid &&
+      cache.isNicDescDmaReq(in_msg.seqReq);
+  tbe.is_nic_read := is_HN && in_msg.isSeqReqValid &&
+      cache.isNicDdioReadReq(in_msg.seqReq);
   // Profile at request acceptance, before any protocol action can change the
   // tag state. This counts both hit and miss paths exactly once.
   if (tbe.is_ddio_payload) {
@@ -493,6 +502,7 @@ TBE allocateDvmRequestTBE(Addr txnId, CHIRequestMsg in_msg), return_by_pointer="
 
   // Setting .addr = txnId
   initializeTBE(tbe, txnId, storDvmTBEs.addEntryToNewSlot());
+  tbe.txnId := txnId;
 
   assert(tbe.is_snp_tbe == false);
   assert(tbe.is_repl_tbe == false);
@@ -557,6 +567,7 @@ TBE allocateDvmSnoopTBE(Addr txnId, CHIRequestMsg in_msg), return_by_pointer="ye
   dvmSnpTBEs.allocate(txnId);
   TBE tbe := dvmSnpTBEs[txnId];
   initializeTBE(tbe, txnId, storDvmSnpTBEs.addEntryToNewSlot());
+  tbe.txnId := txnId;
 
   assert(tbe.is_req_tbe == false);
   assert(tbe.is_repl_tbe == false);
@@ -675,6 +686,7 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   out_msg.addr := tbe.addr;
   out_msg.accAddr := tbe.addr;
   out_msg.accSize := blockSize;
+  out_msg.accessMask := tbe.wuAccessMask;
   out_msg.requestor := machineID;
   out_msg.fwdRequestor := tbe.requestor;
   out_msg.type := type;
@@ -723,6 +735,7 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.fwdRequestor := tbe.requestor;
   out_msg.accAddr := tbe.pendReqAccAddr;
   out_msg.accSize := tbe.pendReqAccSize;
+  out_msg.accessMask := tbe.wuAccessMask;
   out_msg.type := tbe.pendReqType;
   out_msg.Destination := tbe.pendReqDest;
   out_msg.dataToFwdRequestor := tbe.pendReqD2OrigReq;

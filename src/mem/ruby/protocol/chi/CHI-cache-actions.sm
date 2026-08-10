@@ -269,6 +269,16 @@ action(Initiate_Request, desc="") {
                                      cache_entry, dir_entry,
                                      tbe.is_local_pf);
   bool dealloc_entry := needDeallocCacheEntry(tbe.reqType);
+  // NIC writes either allocate in the configured DDIO subset or, when
+  // disabled, use the write-through/no-retention path below. NIC-read
+  // no-allocation is an explicit controller/profile policy.
+  if (is_HN && is_invalid(cache_entry)) {
+    if (tbe.is_nic_read && nic_read_no_allocate) {
+      alloc_entry := false;
+    } else if (tbe.is_ddio_write) {
+      alloc_entry := cache.getDDIOWayPart() > 0;
+    }
+  }
   assert((alloc_entry && dealloc_entry) == false);
 
   // always drops any data when not caching it or when this transaction
@@ -573,13 +583,16 @@ action(Initiate_ReadOnce_HitUpstream, desc="") {
   // no need to update or access tags/data on ReadOnce served from upstream
 
   if (is_invalid(cache_entry)) {
-    // if we receive data, invalidate at the end so it can be dropped
+    // This path never runs CheckCacheFill. Drop any data returned to the HNF
+    // by a non-DCT SnpOnce rather than finalizing without a cache entry.
     tbe.dataToBeInvalid := true;
-  } else if (tbe.dataValid == false) {
-    // possible on UD_RU,UC_RU where cache_entry valid but tbe.dataValid == false
-    // this prevents going to RU if no data is received from snoop
-    tbe.dataValid := true;
   }
+
+  // Never manufacture local validity for an upstream-only state. With DCT,
+  // the owner forwards data directly to the requester and the home node can
+  // receive only CompAck; claiming local data here leaves an empty validity
+  // mask and later finalizes a data-bearing cache state. If a non-forwarded
+  // snoop does return data, Receive_SnpDataResp establishes validity normally.
 }
 
 
@@ -981,7 +994,13 @@ action(Initiate_StoreUpgrade, desc="") {
 
 action(Initiate_WriteUnique_Zero, desc="") {
   assert(is_HN);
+  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0;
   tbe.dataUnique := true;
+  if (no_ddio) {
+    tbe.use_DMT := false;
+    tbe.doCacheFill := false;
+    tbe.dataToBeInvalid := true;
+  }
   if (tbe.dir_sharers.count() > 0) {
     tbe.actions.push(Event:SendSnpCleanInvalid);
   }
@@ -994,27 +1013,62 @@ action(Initiate_WriteUnique_Zero, desc="") {
     tbe.actions.push(Event:SendCompDBIDResp);
     tbe.actions.pushNB(Event:WriteFEPipe);
   }
-  tbe.actions.push(Event:CheckCacheFill);
-  tbe.actions.push(Event:TagArrayWrite);
+  if (no_ddio) {
+    tbe.actions.push(Event:SendWriteNoSnp);
+    tbe.actions.push(Event:WriteBEPipe);
+    tbe.actions.push(Event:SendWBData);
+    tbe.actions.pushNB(Event:TagArrayWrite);
+  } else {
+    tbe.actions.push(Event:CheckCacheFill);
+    tbe.actions.push(Event:TagArrayWrite);
+  }
 }
 
 action(Initiate_WriteUnique_LocalWrite, desc="") {
-  // auto-upgrade if hn but state was not unique
-  assert(is_HN || tbe.dataUnique);
-  tbe.dataUnique := true;
-  if (tbe.dir_sharers.count() > 0) {
-    tbe.actions.push(Event:SendSnpCleanInvalid);
-  }
-  if (comp_wu) {
-    tbe.actions.push(Event:SendDBIDResp_WU);
-    tbe.actions.pushNB(Event:WriteFEPipe);
-    tbe.actions.pushNB(Event:SendComp_WU);
+  bool no_ddio := is_HN && tbe.is_ddio_write &&
+      cache.getDDIOWayPart() < 0;
+  if (no_ddio) {
+    // Disabled DDIO is write-through/no-retention on both HNF hits and
+    // misses. Preserve an authoritative full line long enough to merge a
+    // partial request, invalidate every upstream copy, publish the complete
+    // line downstream, then discard the HNF copy.
+    tbe.use_DMT := false;
+    tbe.doCacheFill := false;
+    tbe.dataToBeInvalid := true;
+    if (tbe.dir_sharers.count() > 0) {
+      tbe.actions.push(Event:SendSnpCleanInvalid);
+    }
+    tbe.actions.push(Event:PrepareDDIOWrite);
+    if (comp_wu) {
+      tbe.actions.push(Event:SendDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+      tbe.actions.pushNB(Event:SendComp_WU);
+    } else {
+      tbe.actions.push(Event:SendCompDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+    }
+    tbe.actions.push(Event:SendWriteNoSnp);
+    tbe.actions.push(Event:WriteBEPipe);
+    tbe.actions.push(Event:SendWBData);
+    tbe.actions.pushNB(Event:TagArrayWrite);
   } else {
-    tbe.actions.push(Event:SendCompDBIDResp_WU);
-    tbe.actions.pushNB(Event:WriteFEPipe);
+    // auto-upgrade if hn but state was not unique
+    assert(is_HN || tbe.dataUnique);
+    tbe.dataUnique := true;
+    if (tbe.dir_sharers.count() > 0) {
+      tbe.actions.push(Event:SendSnpCleanInvalid);
+    }
+    if (comp_wu) {
+      tbe.actions.push(Event:SendDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+      tbe.actions.pushNB(Event:SendComp_WU);
+    } else {
+      tbe.actions.push(Event:SendCompDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+    }
+    tbe.actions.push(Event:CheckCacheFill);
+    tbe.actions.push(Event:TagArrayWrite);
   }
-  tbe.actions.push(Event:CheckCacheFill);
-  tbe.actions.push(Event:TagArrayWrite);
 }
 
 action(Initiate_WriteUnique_LocalWrite_AfterUpgrade, desc="") {
@@ -1036,31 +1090,94 @@ action(Initiate_WriteUnique_LocalWrite_AfterUpgrade, desc="") {
 action(Initiate_WriteUnique_Writeback, desc="") {
   assert(is_HN);
   assert(tbe.dir_sharers.count() > 0);
-  tbe.actions.push(Event:SendSnpUnique);
-  if (comp_wu) {
-    tbe.actions.push(Event:SendDBIDResp_WU);
-    tbe.actions.pushNB(Event:WriteFEPipe);
-    tbe.actions.pushNB(Event:SendWriteNoSnp);
-    tbe.actions.pushNB(Event:SendComp_WU);
+  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0;
+  bool ddio_fill := tbe.is_ddio_write && cache.getDDIOWayPart() > 0;
+  if (no_ddio) {
+    tbe.use_DMT := false;
+    tbe.doCacheFill := false;
+    tbe.dataToBeInvalid := true;
+    tbe.actions.push(Event:SendSnpCleanInvalid);
+    tbe.actions.push(Event:PrepareDDIOWrite);
+    if (comp_wu) {
+      tbe.actions.push(Event:SendDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+      tbe.actions.pushNB(Event:SendComp_WU);
+    } else {
+      tbe.actions.push(Event:SendCompDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+    }
+    tbe.actions.push(Event:SendWriteNoSnp);
+    tbe.actions.push(Event:WriteBEPipe);
+    tbe.actions.push(Event:SendWBData);
+    tbe.actions.pushNB(Event:TagArrayWrite);
+  } else if (ddio_fill) {
+    // Upstream ownership is directory state, not an LLC allocation. Bring
+    // the NIC write into the constrained DDIO subset after invalidating the
+    // owner. Partial writes also fetch bytes not supplied by the request.
+    tbe.use_DMT := false;
+    tbe.doCacheFill := true;
+    tbe.dataToBeInvalid := false;
+    tbe.actions.push(Event:SendSnpCleanInvalid);
+    tbe.actions.push(Event:PrepareDDIOWrite);
+    if (comp_wu) {
+      tbe.actions.push(Event:SendDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+      tbe.actions.pushNB(Event:SendComp_WU);
+    } else {
+      tbe.actions.push(Event:SendCompDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+    }
+    tbe.actions.push(Event:WriteBEPipe);
+    tbe.actions.push(Event:CheckCacheFill);
+    tbe.actions.pushNB(Event:TagArrayWrite);
   } else {
-    tbe.actions.push(Event:SendCompDBIDResp_WU);
-    tbe.actions.pushNB(Event:WriteFEPipe);
-    tbe.actions.pushNB(Event:SendWriteNoSnp);
+    tbe.actions.push(Event:SendSnpUnique);
+    if (comp_wu) {
+      tbe.actions.push(Event:SendDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+      tbe.actions.pushNB(Event:SendWriteNoSnp);
+      tbe.actions.pushNB(Event:SendComp_WU);
+    } else {
+      tbe.actions.push(Event:SendCompDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+      tbe.actions.pushNB(Event:SendWriteNoSnp);
+    }
+    tbe.actions.push(Event:WriteBEPipe);
+    tbe.actions.push(Event:SendWBData);
+    tbe.dataToBeInvalid := true;
+    tbe.actions.pushNB(Event:TagArrayWrite);
   }
-  tbe.actions.push(Event:WriteBEPipe);
-  tbe.actions.push(Event:SendWBData);
-  tbe.dataToBeInvalid := true;
-  tbe.actions.pushNB(Event:TagArrayWrite);
 }
 
 action(Initiate_WriteUnique_PartialWrite, desc="") {
   assert(is_HN);
-  bool ddio_partial_fill := tbe.is_ddio_payload &&
-      (tbe.reqType == CHIRequestType:WriteUniquePtl) &&
-      (cache.getDDIOWayPart() > 0);
+  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0;
+  bool ddio_fill := tbe.is_ddio_write && cache.getDDIOWayPart() > 0;
 
-  if (ddio_partial_fill) {
-    // Obtain the untouched bytes before allocating a partial RX write.
+  if (no_ddio) {
+    tbe.use_DMT := false;
+    tbe.doCacheFill := false;
+    tbe.dataToBeInvalid := true;
+    if (tbe.dir_sharers.count() > 0) {
+      tbe.actions.push(Event:SendSnpCleanInvalid);
+    }
+    tbe.actions.push(Event:PrepareDDIOWrite);
+    if (comp_wu) {
+      tbe.actions.push(Event:SendDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+      tbe.actions.pushNB(Event:SendComp_WU);
+    } else {
+      tbe.actions.push(Event:SendCompDBIDResp_WU);
+      tbe.actions.pushNB(Event:WriteFEPipe);
+    }
+    tbe.actions.push(Event:SendWriteNoSnp);
+    tbe.actions.push(Event:WriteBEPipe);
+    tbe.actions.push(Event:SendWBData);
+    tbe.actions.pushNB(Event:TagArrayWrite);
+  } else if (ddio_fill) {
+    // Allocate classified NIC writes independently of the generic writeback
+    // allocation policy. PrepareDDIOWrite obtains untouched bytes only for a
+    // partial write which has no authoritative complete line.
     tbe.use_DMT := false;
     tbe.doCacheFill := true;
     tbe.dataToBeInvalid := false;
@@ -1068,7 +1185,7 @@ action(Initiate_WriteUnique_PartialWrite, desc="") {
     if (tbe.dir_sharers.count() > 0) {
       tbe.actions.push(Event:SendSnpCleanInvalid);
     }
-    tbe.actions.push(Event:SendReadNoSnp);
+    tbe.actions.push(Event:PrepareDDIOWrite);
     if (comp_wu) {
       tbe.actions.push(Event:SendDBIDResp_WU);
       tbe.actions.pushNB(Event:WriteFEPipe);
@@ -1110,6 +1227,22 @@ action(Initiate_WriteUnique_Forward, desc="") {
   tbe.actions.push(Event:SendWUData);
   tbe.dataToBeInvalid := true;
   tbe.actions.pushNB(Event:TagArrayWrite);
+}
+
+action(Prepare_DDIOWrite, desc="") {
+  // This action cannot run until all preceding snoop responses have drained.
+  // Data returned by a dirty owner is authoritative and must not be replaced
+  // by a stale memory response. Clean/no-data and no-owner partial writes
+  // still need memory to supply untouched bytes.
+  assert(tbe.dir_sharers.count() == 0);
+  bool needs_read := cache.ddioWriteNeedsRead(
+      tbe.reqType == CHIRequestType:WriteUniquePtl, tbe.dataValid);
+  if (needs_read) {
+    tbe.dataUnique := false;
+    tbe.actions.pushFront(Event:SendReadNoSnp);
+  } else {
+    tbe.dataUnique := true;
+  }
 }
 
 action(Initiate_AtomicReturn_LocalWrite, desc="") {
@@ -1307,10 +1440,15 @@ action(Initiate_CopyBack_Stale, desc="") {
   tbe.stale_wb_path := true;
   tbe.expected_req_resp.addExpectedDataType(CHIDataType:CBWrData_SC);
   tbe.expected_req_resp.addExpectedDataType(CHIDataType:CBWrData_I);
-  // A writeback considered stale at this controller can still carry the
-  // requester's authoritative dirty data when it crosses a back-invalidation.
-  tbe.expected_req_resp.addExpectedDataType(CHIDataType:CBWrData_UD_PD);
-  tbe.expected_req_resp.addExpectedDataType(CHIDataType:CBWrData_SD_PD);
+  // The requester can still hold the authoritative dirty copy when this
+  // controller no longer tracks it (for example, after a directory eviction).
+  // Sink it only when there is no competing upstream authority.
+  if ((tbe.dir_ownerExists == false) &&
+      (tbe.dataMaybeDirtyUpstream == false) &&
+      ((tbe.dataValid == false) || (tbe.dataDirty == false))) {
+    tbe.expected_req_resp.addExpectedDataType(CHIDataType:CBWrData_UD_PD);
+    tbe.expected_req_resp.addExpectedDataType(CHIDataType:CBWrData_SD_PD);
+  }
   tbe.expected_req_resp.setExpectedCount(1);
 
   tbe.actions.pushNB(Event:SendCompDBIDRespStale);
@@ -1799,7 +1937,8 @@ action(Send_WriteUnique, desc="") {
   assert(is_valid(tbe));
 
   enqueue(reqOutPort, CHIRequestMsg, request_latency) {
-    if (tbe.accSize == blockSize) {
+    if (tbe.wuAccessMask.isFull() ||
+        (tbe.wuAccessMask.isEmpty() && tbe.accSize == blockSize)) {
       prepareRequest(tbe, CHIRequestType:WriteUniqueFull, out_msg);
     } else {
       prepareRequest(tbe, CHIRequestType:WriteUniquePtl, out_msg);
@@ -2113,17 +2252,20 @@ action(Send_SnpOnceFwd, desc="") {
 
 
 action(ExpectNCBWrData, desc="") {
-  // Expected data
-  int num_msgs := tbe.accSize / data_channel_size;
-  if ((tbe.accSize % data_channel_size) != 0) {
-    num_msgs := num_msgs + 1;
+  // Legacy/non-TLM requestors describe a contiguous access with accAddr and
+  // accSize. TLM requestors preserve their exact byte enables in accessMask.
+  if (tbe.wuAccessMask.isEmpty()) {
+    tbe.wuAccessMask.setMask(
+        addressOffset(tbe.accAddr, tbe.addr), tbe.accSize);
   }
+
+  // CHI sends one data beat per occupied data-channel slice. Popcount or
+  // access extent alone is insufficient for sparse or cross-slice writes.
+  int num_msgs := tbe.wuAccessMask.countChunks(data_channel_size);
+  assert(num_msgs > 0);
   tbe.expected_req_resp.clear(num_msgs);
   tbe.expected_req_resp.addExpectedDataType(CHIDataType:NCBWrData);
   tbe.expected_req_resp.setExpectedCount(1);
-
-  // Clear the mask bits we expect to receive
-  tbe.dataBlkValid.setMask(addressOffset(tbe.accAddr, tbe.addr), tbe.accSize, false);
 }
 
 action(ExpectNCBWrData_A, desc="") {
@@ -2155,12 +2297,21 @@ action(ExpectComp, desc="") {
 action(WriteZero, desc="") {
   tbe.dataBlkValid.fillMask();
   tbe.dataBlk.clear();
+  tbe.dataValid := true;
+  tbe.dataDirty := true;
 }
 
 action(Receive_ReqDataResp, desc="") {
   assert(is_valid(tbe));
   assert(tbe.expected_req_resp.hasExpected());
   peek(datInPort, CHIDataMsg) {
+    if (tbe.stale_wb_path &&
+        ((in_msg.type == CHIDataType:CBWrData_UD_PD) ||
+         (in_msg.type == CHIDataType:CBWrData_SD_PD))) {
+      // Never replace an authoritative local dirty copy with data from an
+      // untracked requester. The expected-response gate enforces this too.
+      assert((tbe.dataValid && tbe.dataDirty) == false);
+    }
     // Decrement pending
     if (tbe.expected_req_resp.receiveData(in_msg.type) == false) {
       error("Received unexpected message");
@@ -2182,19 +2333,43 @@ action(Receive_ReqDataResp, desc="") {
       tbe.dataBlkValid.orMask(in_msg.bitMask);
       DPRINTF(RubySlicc, "Received %s\n", tbe.oldDataBlk);
       DPRINTF(RubySlicc, "dataBlkValid = %s\n", tbe.dataBlkValid);
+    } else if ((in_msg.type == CHIDataType:NCBWrData) &&
+               ((tbe.reqType == CHIRequestType:WriteUniquePtl) ||
+                (tbe.reqType == CHIRequestType:WriteUniqueFull))) {
+      // WriteUnique data intentionally overwrites enabled bytes in any
+      // authoritative line already held by the TBE. Reject bytes outside the
+      // declared request and duplicate requester bytes before updating either
+      // the data block or its masks.
+      assert(tbe.wuAccessMask.containsMask(in_msg.bitMask));
+      assert(tbe.wuDataValid.isOverlap(in_msg.bitMask) == false);
+      tbe.dataBlk.copyPartial(in_msg.dataBlk, in_msg.bitMask);
+      tbe.dataBlkValid.orMask(in_msg.bitMask);
+      tbe.wuDataValid.orMask(in_msg.bitMask);
     } else if ((tbe.dataBlkValid.isFull() == false) ||
         (in_msg.type == CHIDataType:CompData_UD_PD) ||
         (in_msg.type == CHIDataType:CompData_SD_PD) ||
         (in_msg.type == CHIDataType:CBWrData_UD_PD) ||
         (in_msg.type == CHIDataType:CBWrData_SD_PD) ||
         (in_msg.type == CHIDataType:NCBWrData)) {
-      // clear mask if started to receive new data
-      if(tbe.dataBlkValid.isFull()){
-        tbe.dataBlkValid.clear();
+      if ((tbe.reqType == CHIRequestType:WriteUniquePtl) &&
+          (tbe.wuDataValid.isEmpty() == false)) {
+        // A full authoritative response raced with partial requester data.
+        // Fill only bytes which have not already been supplied by the NIC.
+        WriteMask copy_mask;
+        copy_mask.setBlockSize(in_msg.bitMask.getBlockSize());
+        copy_mask.setInvertedMask(tbe.wuDataValid);
+        copy_mask.andMask(in_msg.bitMask);
+        tbe.dataBlk.copyPartial(in_msg.dataBlk, copy_mask);
+        tbe.dataBlkValid.orMask(in_msg.bitMask);
+      } else {
+        // clear mask if started to receive new data
+        if(tbe.dataBlkValid.isFull()){
+          tbe.dataBlkValid.clear();
+        }
+        tbe.dataBlk.copyPartial(in_msg.dataBlk, in_msg.bitMask);
+        assert(tbe.dataBlkValid.isOverlap(in_msg.bitMask) == false);
+        tbe.dataBlkValid.orMask(in_msg.bitMask);
       }
-      tbe.dataBlk.copyPartial(in_msg.dataBlk, in_msg.bitMask);
-      assert(tbe.dataBlkValid.isOverlap(in_msg.bitMask) == false);
-      tbe.dataBlkValid.orMask(in_msg.bitMask);
     }
   }
 }
@@ -2252,13 +2427,23 @@ action(Receive_SnpDataResp, desc="") {
         (in_msg.type == CHIDataType:SnpRespData_SC_PD_Fwded_SC) ||
         (in_msg.type == CHIDataType:SnpRespData_I_Fwded_SD_PD) ||
         (in_msg.type == CHIDataType:SnpRespData_I_PD_Fwded_SC)) {
-      // clear mask if started to receive new data
-      if(tbe.dataBlkValid.isFull()){
-        tbe.dataBlkValid.clear();
+      if ((tbe.reqType == CHIRequestType:WriteUniquePtl) &&
+          (tbe.wuDataValid.isEmpty() == false)) {
+        WriteMask copy_mask;
+        copy_mask.setBlockSize(in_msg.bitMask.getBlockSize());
+        copy_mask.setInvertedMask(tbe.wuDataValid);
+        copy_mask.andMask(in_msg.bitMask);
+        tbe.dataBlk.copyPartial(in_msg.dataBlk, copy_mask);
+        tbe.dataBlkValid.orMask(in_msg.bitMask);
+      } else {
+        // clear mask if started to receive new data
+        if(tbe.dataBlkValid.isFull()){
+          tbe.dataBlkValid.clear();
+        }
+        tbe.dataBlk.copyPartial(in_msg.dataBlk, in_msg.bitMask);
+        assert(tbe.dataBlkValid.isOverlap(in_msg.bitMask) == false);
+        tbe.dataBlkValid.orMask(in_msg.bitMask);
       }
-      tbe.dataBlk.copyPartial(in_msg.dataBlk, in_msg.bitMask);
-      assert(tbe.dataBlkValid.isOverlap(in_msg.bitMask) == false);
-      tbe.dataBlkValid.orMask(in_msg.bitMask);
     }
   }
 }
@@ -2279,9 +2464,10 @@ action(UpdateDirState_FromReqDataResp, desc="") {
 
       } else if (in_msg.type == CHIDataType:CBWrData_UD_PD) {
         if (tbe.stale_wb_path) {
-          // The supported stale-dirty race is a writeback crossing an
-          // invalidation which already removed its owner.
           assert(tbe.dir_ownerExists == false);
+          if (tbe.reqType != CHIRequestType:WriteCleanFull) {
+            tbe.dir_sharers.remove(in_msg.responder);
+          }
         } else {
           assert(tbe.dir_ownerExists && tbe.dir_ownerIsExcl &&
                  (tbe.dir_owner == in_msg.responder));
@@ -2303,6 +2489,9 @@ action(UpdateDirState_FromReqDataResp, desc="") {
       } else if (in_msg.type == CHIDataType:CBWrData_SD_PD) {
         if (tbe.stale_wb_path) {
           assert(tbe.dir_ownerExists == false);
+          if (tbe.reqType != CHIRequestType:WriteCleanFull) {
+            tbe.dir_sharers.remove(in_msg.responder);
+          }
         } else {
           assert(tbe.dir_ownerExists && (tbe.dir_ownerIsExcl == false) &&
                  (tbe.dir_owner == in_msg.responder));
@@ -2410,13 +2599,16 @@ action(UpdateDataState_FromReqDataResp, desc="") {
   // only perform the update once we received all chunks
   if (tbe.expected_req_resp.hasReceivedData()) {
     assert(tbe.dataBlkValid.isFull());
+    bool merged_wu_data :=
+        (tbe.reqType == CHIRequestType:WriteUniquePtl) &&
+        (tbe.wuDataValid.isEmpty() == false);
     peek(datInPort, CHIDataMsg) {
 
       if ((in_msg.type == CHIDataType:CompData_UC) ||
           (in_msg.type == CHIDataType:DataSepResp_UC)) {
         assert(tbe.dataUnique == false);
         assert((tbe.dataValid && tbe.dataDirty) == false);
-        tbe.dataDirty := false;
+        tbe.dataDirty := merged_wu_data;
         tbe.dataUnique := true;
         tbe.dataValid := true;
         assert(tbe.dataMaybeDirtyUpstream == false);
@@ -2501,6 +2693,7 @@ action(UpdateDataState_FromReqDataResp, desc="") {
         tbe.dataToBeInvalid := true;
         tbe.actions.push(Event:MaintainCoherence);
       }
+
     }
   }
   printTBEState(tbe);
@@ -2511,6 +2704,7 @@ action(UpdateDataState_FromWUDataResp, desc="") {
   if (tbe.expected_req_resp.hasReceivedData() &&
        (tbe.reqType != CHIRequestType:AtomicReturn) &&
        (tbe.reqType != CHIRequestType:AtomicNoReturn)) {
+    assert(tbe.wuDataValid.containsMask(tbe.wuAccessMask));
     assert(tbe.dataBlkValid.test(addressOffset(tbe.accAddr, tbe.addr)));
     assert(tbe.dataBlkValid.test(addressOffset(tbe.accAddr, tbe.addr)
                                   + tbe.accSize - 1));
@@ -2554,9 +2748,15 @@ action(UpdateDataState_FromCUResp, desc="") {
   peek(rspInPort, CHIResponseMsg) {
     assert(in_msg.type == CHIResponseType:Comp_UC);
     assert(tbe.dataUnique == false);
-    tbe.dataUnique := tbe.dataValid || (tbe.dir_sharers.count() > 0);
-    // self and upstream may have been invalidated while waiting for this
-    // expect to follow up with a ReadUnique
+    if (in_msg.stale) {
+      // The downstream directory did not grant ownership. Keep this false so
+      // CheckUpgrade follows up with ReadUnique even if local data is valid.
+      assert(tbe.is_stale);
+    } else {
+      tbe.dataUnique := tbe.dataValid || (tbe.dir_sharers.count() > 0);
+      // self and upstream may have been invalidated while waiting for this
+      // expect to follow up with a ReadUnique
+    }
   }
   printTBEState(tbe);
 }
@@ -2705,7 +2905,29 @@ action(Receive_ReqResp, desc="") {
     if (tbe.expected_req_resp.receiveResp(in_msg.type) == false) {
       error("Received unexpected message");
     }
-    assert(in_msg.stale == tbe.is_stale);
+    if (in_msg.stale && (tbe.pendReqType == CHIRequestType:CleanUnique)) {
+      // The downstream directory no longer recognizes this requester, so a
+      // Comp_UC does not grant ownership. Force the upgrade path to retry with
+      // ReadUnique rather than allowing two upstream dirty owners. Discard a
+      // clean local copy so the response replaces it, but preserve dirty data:
+      // an untracked requester may still hold the authoritative dirty copy.
+      tbe.is_stale := true;
+      tbe.dataUnique := false;
+      if (tbe.dataDirty == false) {
+        tbe.dataValid := false;
+        tbe.dataBlkValid.clear();
+      }
+    } else if ((tbe.pendReqType == CHIRequestType:WriteBackFull) ||
+               (tbe.pendReqType == CHIRequestType:WriteCleanFull) ||
+               (tbe.pendReqType == CHIRequestType:WriteEvictFull) ||
+               (tbe.pendReqType == CHIRequestType:Evict)) {
+      // Downstream "stale" means untracked; it does not make authoritative
+      // requester copyback data obsolete. A locally stale request, however,
+      // must also be stale downstream.
+      assert((tbe.is_stale == false) || in_msg.stale);
+    } else {
+      assert(in_msg.stale == tbe.is_stale);
+    }
   }
 }
 
@@ -2873,16 +3095,24 @@ action(Send_WBData, desc="") {
            (tbe.dir_ownerIsExcl && tbe.dataUnique && tbe.dataDirty));
     tbe.snd_msgType := CHIDataType:NCBWrData;
   } else {
-    if (tbe.dataValid == false) {
-      // only possible when the WB was made stale by a snoop or
-      // Writeback on UD_RU line.
-      if (tbe.dir_ownerIsExcl && tbe.dataUnique && tbe.dataDirty) {
-        tbe.snd_msgType := CHIDataType:CBWrData_UD_PD;
+    if (tbe.is_stale) {
+      // A crossing snoop has already transferred or consumed the state that
+      // made this copyback authoritative. The restored pending copyback is
+      // stale and must report only its current clean state.
+      if (tbe.dataValid) {
+        assert(tbe.dataDirty == false);
+        assert(tbe.dataUnique == false);
+        assert(tbe.dataBlkValid.isFull());
+        tbe.snd_msgType := CHIDataType:CBWrData_SC;
       } else {
-        assert(tbe.is_stale);
         tbe.dataBlkValid.fillMask();
         tbe.snd_msgType := CHIDataType:CBWrData_I;
       }
+    } else if (tbe.dataValid == false) {
+      // Writeback on a UD_RU line has no local valid copy, but the owner data
+      // is still authoritative and has not crossed a snoop.
+      assert(tbe.dir_ownerIsExcl && tbe.dataUnique && tbe.dataDirty);
+      tbe.snd_msgType := CHIDataType:CBWrData_UD_PD;
     } else if (tbe.dataUnique) {
       assert(tbe.dataBlkValid.isFull());
       if (tbe.dataDirty) {
@@ -2901,6 +3131,11 @@ action(Send_WBData, desc="") {
   }
   tbe.snd_destination := mapAddressToDownstreamMachine(tbe.addr);
   setupPendingSend(tbe);
+  // A WriteCleanFull publishes the retained dirty copy downstream. It is
+  // clean locally once the data send has been committed to the network.
+  if (tbe.pendReqType == CHIRequestType:WriteCleanFull) {
+    tbe.dataDirty := false;
+  }
 }
 
 action(Send_WUData, desc="") {
@@ -3268,6 +3503,7 @@ action(Send_CompI_Stale, desc="") {
     out_msg.type := CHIResponseType:Comp_I;
     out_msg.responder := machineID;
     out_msg.Destination.add(tbe.requestor);
+    out_msg.txnId := tbe.txnId;
     out_msg.dbid := tbe.txnId;
     // We don't know if this is a stale writeback or a bug, so flag the
     // reponse so the requestor can make further checks
@@ -3309,6 +3545,7 @@ action(Send_DBIDResp, desc="") {
     out_msg.type := CHIResponseType:DBIDResp;
     out_msg.responder := machineID;
     out_msg.Destination.add(tbe.requestor);
+    out_msg.txnId := tbe.txnId;
     out_msg.dbid := tbe.txnId;
   }
 }
@@ -3320,6 +3557,7 @@ action(Send_Comp_WU, desc="") {
     out_msg.type := CHIResponseType:Comp;
     out_msg.responder := machineID;
     out_msg.Destination.add(tbe.requestor);
+    out_msg.txnId := tbe.txnId;
   }
 }
 
@@ -3345,6 +3583,7 @@ action(Send_Comp_ANR, desc="") {
     out_msg.type := CHIResponseType:Comp;
     out_msg.responder := machineID;
     out_msg.Destination.add(tbe.requestor);
+    out_msg.txnId := tbe.txnId;
   }
 }
 
@@ -3400,8 +3639,15 @@ action(CheckUpgrade_FromStoreOrRU, desc="") {
     // success, just send CompAck next
     assert(tbe.dataValid);
   } else {
-    // will need to get data instead
+    // A stale CleanUnique can leave an untracked requester holding the
+    // authoritative dirty copy. Publish it before asking for ownership;
+    // stale-copyback handling rejects this if a competing owner exists.
     tbe.actions.pushFront(Event:SendReadUnique);
+    if (tbe.dataDirty && tbe.dataValid) {
+      tbe.actions.pushFront(Event:SendWBData);
+      tbe.actions.pushFront(Event:WriteBEPipe);
+      tbe.actions.pushFront(Event:SendWriteClean);
+    }
     // we must have received an invalidation snoop that marked
     // the req as stale
     assert(tbe.is_stale);
@@ -3492,8 +3738,8 @@ action(CheckCacheFill, desc="") {
   bool need_fill := tbe.dataValid && (tbe.dataToBeInvalid == false) && tbe.doCacheFill;
   bool execute_next := true;
 
-  // DDIO (home node only): confine NIC RX payload fills to the DDIO way
-  // subset [0, ddio_way_part).
+  // DDIO (home node only): confine all NIC write fills to the configured
+  // way subset [0, ddio_way_part).
   int ddio_ways := cache.getDDIOWayPart();
   bool ddio_fill := is_HN && tbe.is_ddio_write && ddio_ways > 0;
 
@@ -3740,8 +3986,9 @@ action(Callback_Miss, desc="") {
     DPRINTF(RubySlicc, "Read data %s\n", tbe.dataBlk);
     sequencer.readCallback(tbe.addr, tbe.dataBlk, true);
 
-  } else if (tbe.dataValid && ((tbe.reqType == CHIRequestType:Store) ||
-                               (tbe.reqType == CHIRequestType:StoreLine))) {
+  } else if (tbe.dataValid && tbe.dataUnique &&
+             ((tbe.reqType == CHIRequestType:Store) ||
+              (tbe.reqType == CHIRequestType:StoreLine))) {
     DPRINTF(RubySlicc, "Write before %s\n", tbe.dataBlk);
     sequencer.writeCallback(tbe.addr, tbe.dataBlk, true);
     DPRINTF(RubySlicc, "Write after %s\n", tbe.dataBlk);

@@ -37,6 +37,8 @@
 
 #include <ARM/TLM/arm_chi.h>
 
+#include <cstring>
+
 #include "python/pybind11/pybind.hh"
 #include "sim/init.hh"
 
@@ -72,6 +74,17 @@ tlm_chi_pybind(pybind11::module_ &m_internal)
             [] (const Payload &p) { return p.size; },
             [] (Payload &p, SizeEnum val) { p.size = val; })
         .def_readwrite("lpid", &Payload::lpid)
+        .def_property("data",
+            [] (const Payload &p) {
+                return py::bytes(reinterpret_cast<const char *>(p.data), 64);
+            },
+            [] (Payload &p, py::bytes val) {
+                std::string data = val;
+                if (data.size() != 64)
+                    throw py::value_error("CHI payload data must be 64 bytes");
+                std::memcpy(p.data, data.data(), data.size());
+            })
+        .def_readwrite("byte_enable", &Payload::byte_enable)
         .def_property("ns",
             [] (const Payload &p) { return p.ns; },
             [] (Payload &p, bool val) { p.ns = val; })
@@ -208,6 +221,7 @@ tlm_chi_pybind(pybind11::module_ &m_internal)
         .value("WRITE_CLEAN_FULL", REQ_OPCODE_WRITE_CLEAN_FULL)
         .value("WRITE_UNIQUE_PTL", REQ_OPCODE_WRITE_UNIQUE_PTL)
         .value("WRITE_UNIQUE_FULL", REQ_OPCODE_WRITE_UNIQUE_FULL)
+        .value("WRITE_UNIQUE_ZERO", REQ_OPCODE_WRITE_UNIQUE_ZERO)
         .value("WRITE_BACK_PTL", REQ_OPCODE_WRITE_BACK_PTL)
         .value("WRITE_BACK_FULL", REQ_OPCODE_WRITE_BACK_FULL)
         .value("WRITE_NO_SNP_PTL", REQ_OPCODE_WRITE_NO_SNP_PTL)

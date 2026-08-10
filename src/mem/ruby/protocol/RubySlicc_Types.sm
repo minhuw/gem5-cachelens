@@ -219,8 +219,13 @@ structure (CacheMemory, external = "yes") {
   void profileRxPayload(Addr);
   void profileRxHeader(Addr);
   void profileTxPayload(Addr);
+  bool isNicRxWriteReq(RequestPtr);
+  bool isNicDdioWriteReq(RequestPtr);
   bool isNicRxPayloadWriteReq(RequestPtr);
+  bool isNicRxHeaderWriteReq(RequestPtr);
+  bool isNicDdioReadReq(RequestPtr);
   bool isNicTxPayloadReadReq(RequestPtr);
+  bool ddioWriteNeedsRead(bool, bool);
   AbstractCacheEntry getNullEntry();
   AbstractCacheEntry allocate(Addr, AbstractCacheEntry);
   AbstractCacheEntry allocate(Addr, AbstractCacheEntry, bool);

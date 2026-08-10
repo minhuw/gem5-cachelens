@@ -263,6 +263,7 @@ reqOpcode(ReqOpcode req)
         { REQ_OPCODE_STASH_ONCE_SEP_UNIQUE, CHIRequestType_StashOnceUnique },
         { REQ_OPCODE_WRITE_NO_SNP_PTL, CHIRequestType_WriteUniquePtl },
         { REQ_OPCODE_WRITE_NO_SNP_FULL, CHIRequestType_WriteUniqueFull },
+        { REQ_OPCODE_WRITE_UNIQUE_PTL, CHIRequestType_WriteUniquePtl },
         { REQ_OPCODE_WRITE_UNIQUE_FULL, CHIRequestType_WriteUniqueFull },
         { REQ_OPCODE_WRITE_UNIQUE_ZERO, CHIRequestType_WriteUniqueZero },
         { REQ_OPCODE_WRITE_BACK_FULL, CHIRequestType_WriteBackFull },
@@ -378,9 +379,12 @@ rspOpcode(CHIResponseType rsp)
       case CHIResponseType_Comp_UD_PD:
       case CHIResponseType_Comp_UC:
       case CHIResponseType_Comp_I:
+      case CHIResponseType_Comp:
         return RSP_OPCODE_COMP;
       case CHIResponseType_CompDBIDResp:
         return RSP_OPCODE_COMP_DBID_RESP;
+      case CHIResponseType_DBIDResp:
+        return RSP_OPCODE_DBID_RESP;
       case CHIResponseType_RetryAck:
         return RSP_OPCODE_RETRY_ACK;
       default:
@@ -462,6 +466,8 @@ rspResp(CHIResponseType rsp)
       case CHIResponseType_Comp_UD_PD:
         return RESP_UD_PD;
       case CHIResponseType_CompDBIDResp:
+      case CHIResponseType_DBIDResp:
+      case CHIResponseType_Comp:
         return RESP_I;
       case CHIResponseType_RetryAck:
         // Just setup to zero

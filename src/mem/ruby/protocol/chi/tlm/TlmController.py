@@ -41,3 +41,12 @@ class TlmController(CHIGenericController):
     type = "TlmController"
     cxx_header = "mem/ruby/protocol/chi/tlm/controller.hh"
     cxx_class = "gem5::tlm::chi::CacheController"
+
+    test_nic_rx_payload_write = Param.Bool(
+        False,
+        "Attach a synthetic NIC RX payload Request (legacy test option)",
+    )
+    test_nic_dma_category = Param.String(
+        "",
+        "Synthetic NIC DMA category for CHI-TLM tests",
+    )
