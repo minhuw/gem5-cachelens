@@ -61,6 +61,48 @@ class IGbEInt;
 class IGbE : public EtherDevice
 {
   private:
+    // RX descriptor lifecycle tracker and time-weighted queue lengths.
+    enum class RxDescState
+    {
+        Uninitialized,
+        Posted,
+        NicDescCached,
+        PayloadDmaInFlight,
+        CompleteNotVisible,
+        RxWaiting
+    };
+
+    struct RxDescTrack
+    {
+        RxDescState state = RxDescState::Uninitialized;
+        Addr buffer = 0;
+        uint64_t generation = 0;
+        Tick postedTick = 0;
+    };
+
+    std::vector<RxDescTrack> rxDescTrack;
+    uint64_t rxCntPosted = 0;
+    uint64_t rxCntCached = 0;
+    uint64_t rxCntPayload = 0;
+    uint64_t rxCntComplete = 0;
+    uint64_t rxCntWaiting = 0;
+    Tick rxLastQueueSample = 0;
+
+    std::deque<int> rxUnusedIndices;
+    std::deque<int> rxUsedIndices;
+
+    void rxEnsureTrack(long len);
+    void rxQueueReset();
+    void rxQueueSample();
+    void rxQueueStatsReset();
+    void rxTransition(int idx, RxDescState to);
+    void rxNoteAreaChanged();
+    void rxNoteRdtWrite(long old_tail, long new_tail);
+    void rxNoteFetched(int idx, Addr buffer);
+    void rxNotePayloadStart(int idx, Addr buffer);
+    void rxNotePayloadComplete(int idx);
+    void rxNoteWritebackComplete(int idx);
+    Addr rxDescBuffer(const igbreg::RxDesc *desc);
     IGbEInt *etherInt;
 
     // device registers
@@ -85,6 +127,7 @@ class IGbE : public EtherDevice
     bool txFifoTick;
 
     bool rxDmaPacket;
+    const uint32_t rxDmaEngines;
 
     // Number of bytes copied from current RX packet
     unsigned pktOffset;
@@ -237,6 +280,10 @@ class IGbE : public EtherDevice
         virtual Request::Flags descFetchCategory() const { return 0; }
         virtual Request::Flags descWritebackCategory() const { return 0; }
 
+        /** RX descriptor lifecycle hooks (no-ops for TX). */
+        virtual void noteFetched(int old_cp, int count) {}
+        virtual void noteWbComplete(int old_head, int count) {}
+
         typedef std::deque<T *> CacheType;
         CacheType usedCache;
         CacheType unusedCache;
@@ -327,6 +374,15 @@ class IGbE : public EtherDevice
             return left;
         }
 
+        bool
+        ringFull() const
+        {
+            const long len = descLen();
+            if (len <= 1)
+                return false;
+            return (descTail() - descHead() + len) % len == len - 1;
+        }
+
         /* Return the number of descriptors used and not written back.
          */
         unsigned descUsed() const { return usedCache.size(); }
@@ -383,6 +439,8 @@ class IGbE : public EtherDevice
         {
             return Request::NIC_RX_DESC_WRITEBACK;
         }
+        void noteFetched(int old_cp, int count) override;
+        void noteWbComplete(int old_head, int count) override;
 
         /** Write the given packet into the buffer(s) pointed to by the
          * descriptor and update the book keeping. Should only be called when
@@ -538,6 +596,50 @@ class IGbE : public EtherDevice
     friend class TxDescCache;
 
     TxDescCache txDescCache;
+
+    struct IGbEStats : public statistics::Group
+    {
+        IGbEStats(IGbE &parent)
+            : statistics::Group(&parent, "rxq"),
+              igbe(parent),
+              ADD_STAT(rxQueue, statistics::units::Count::get(),
+                       "Time-weighted RX_WAITING queue length"),
+              ADD_STAT(rxReplenishQueue, statistics::units::Count::get(),
+                       "Time-weighted RX replenish queue length"),
+              ADD_STAT(rxInFlightQueue, statistics::units::Count::get(),
+                       "Time-weighted RX DMA/completion in-flight length"),
+              ADD_STAT(rxQueueTransitions, statistics::units::Count::get(),
+                       "RX descriptor lifecycle transitions"),
+              ADD_STAT(rxConservationViolations, statistics::units::Count::get(),
+                       "Descriptor conservation violations"),
+              ADD_STAT(rxReservedDescriptors, statistics::units::Count::get(),
+                       "Permanently reserved RX descriptors"),
+              ADD_STAT(rxPostedWait, statistics::units::Tick::get(),
+                       "Time from RX descriptor post to NIC payload write"),
+              ADD_STAT(rxDmaEngineLimit, statistics::units::Count::get(),
+                       "Configured RX payload DMA engine limit; currently one")
+        {
+            rxQueue.init(0, 4096, 1);
+            rxReplenishQueue.init(0, 4096, 1);
+            rxInFlightQueue.init(0, 4096, 1);
+            rxReservedDescriptors = 0;
+            rxPostedWait.init(1);
+            rxDmaEngineLimit = 1;
+        }
+
+        void preDumpStats() override;
+
+        IGbE &igbe;
+
+        statistics::Distribution rxQueue;
+        statistics::Distribution rxReplenishQueue;
+        statistics::Distribution rxInFlightQueue;
+        statistics::Scalar rxQueueTransitions;
+        statistics::Scalar rxConservationViolations;
+        statistics::Scalar rxReservedDescriptors;
+        statistics::SparseHistogram rxPostedWait;
+        statistics::Scalar rxDmaEngineLimit;
+    } igbeStats;
 
   public:
     PARAMS(IGbE);

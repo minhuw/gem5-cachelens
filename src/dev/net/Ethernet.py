@@ -181,8 +181,8 @@ class IGbE(EtherDevice):
     hardware_address = Param.EthernetAddr(
         NextEthernetAddr, "Ethernet Hardware Address"
     )
-    rx_fifo_size = Param.MemorySize("384KiB", "Size of the rx FIFO")
-    tx_fifo_size = Param.MemorySize("384KiB", "Size of the tx FIFO")
+    rx_fifo_size = Param.MemorySize("48KiB", "Size of the rx FIFO")
+    tx_fifo_size = Param.MemorySize("16KiB", "Size of the tx FIFO")
     rx_desc_cache_size = Param.Int(
         64, "Number of enteries in the rx descriptor cache"
     )
