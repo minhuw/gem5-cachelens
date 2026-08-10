@@ -31,5 +31,15 @@ with gem5_scons.Configure(main) as conf:
     # Check if the TUN/TAP driver is available.
     conf.env['CONF']['HAVE_TUNTAP'] = conf.CheckHeader('linux/if_tun.h', '<>')
 
+    # The pcap replay load generator is optional. Keep its dependency scoped
+    # to the gem5 library rather than adding libpcap to every linked target.
+    conf.env['CONF']['HAVE_PCAP'] = conf.CheckLibWithHeader(
+        'pcap', 'pcap/pcap.h', 'C++', 'pcap_close(nullptr);')
+    if conf.env['CONF']['HAVE_PCAP']:
+        conf.env.TagImplies('pcap', 'gem5 lib')
+
 if not main['CONF']['HAVE_TUNTAP']:
     print("Info: Compatible header file <linux/if_tun.h> not found.")
+
+if not main['CONF']['HAVE_PCAP']:
+    print("Info: libpcap headers/library not found; disabling Pcap load generator.")

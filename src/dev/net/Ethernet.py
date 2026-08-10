@@ -210,6 +210,12 @@ class IGbE(EtherDevice):
     phy_pid = Param.UInt16("Phy PID that corresponds to device ID")
     phy_epid = Param.UInt16("Phy EPID that corresponds to device ID")
 
+    # The current model has one RX payload DMA completion path. Keep this
+    # explicit until a safe multi-engine refactor is available.
+    rx_dma_engines = Param.UInt32(
+        1, "Maximum concurrent RX payload DMA engines (currently max 1)"
+    )
+
 
 class IGbE_e1000(IGbE):
     # Older Intel 8254x based gigabit ethernet adapter

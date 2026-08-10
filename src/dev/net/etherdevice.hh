@@ -59,6 +59,14 @@ class EtherDevice : public PciDevice
     {
         EtherDeviceStats(statistics::Group *parent);
 
+        statistics::Scalar rxdisabledDrops;
+        statistics::Scalar rxFifoDrops;
+        statistics::Scalar txFifoFullEvents;
+        statistics::Scalar rxDescCacheEmptyEvents;
+        statistics::Scalar txDescCacheEmptyEvents;
+        statistics::Scalar rxRingBufferEmptyEvents;
+        statistics::Scalar txRingBufferFullEvents;
+
         statistics::Scalar postedInterrupts;
 
         statistics::Scalar txBytes;
