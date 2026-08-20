@@ -36,11 +36,27 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "power of two"):
             CacheLensCHIHierarchy(num_hnfs=3)
 
+    def test_hnf_inclusion_validation_and_reporting(self) -> None:
+        default = CacheLensCHIHierarchy()
+        self.assertEqual(
+            "noninclusive", default.get_configuration()["hnf_inclusion"]
+        )
+        for mode in ("noninclusive", "inclusive"):
+            hierarchy = CacheLensCHIHierarchy(hnf_inclusion=mode)
+            self.assertEqual(
+                mode, hierarchy.get_configuration()["hnf_inclusion"]
+            )
+        for mode in ("", "non-inclusive", "strict", "Inclusive"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, "hnf_inclusion"):
+                    CacheLensCHIHierarchy(hnf_inclusion=mode)
+
     def test_default_model_is_bounded_and_explicit(self) -> None:
         hierarchy = CacheLensCHIHierarchy(num_hnfs=4, hnf_size="2MiB")
         configuration = hierarchy.get_configuration()
         self.assertEqual("abstract", hierarchy.get_model_profile())
         self.assertEqual("linear", hierarchy.get_indexing_policy())
+        self.assertEqual("noninclusive", configuration["hnf_inclusion"])
         self.assertEqual(-1, configuration["ddio_way_part"])
         self.assertEqual(8 << 20, hierarchy.get_total_hnf_capacity_bytes())
         self.assertEqual("cold", configuration["cache_state_restore_policy"])

@@ -198,6 +198,7 @@ class _CachedHNF(AbstractNode):
         nic_read_no_allocate: bool,
         addr_hash: bool,
         dealloc_on_unique: bool,
+        hnf_inclusion: str,
         addr_ranges: List[AddrRange],
         start_index_bit: int,
         network,
@@ -224,21 +225,22 @@ class _CachedHNF(AbstractNode):
         self.use_prefetcher = False
         self.prefetcher = NULL
         self.is_HN = True
-        self.enable_DMT = True
-        self.enable_DCT = True
+        inclusive = hnf_inclusion == "inclusive"
+        self.enable_DMT = not inclusive
+        self.enable_DCT = not inclusive
         self.nic_read_no_allocate = nic_read_no_allocate
         self.allow_SD = True
         self.alloc_on_seq_acc = False
         self.alloc_on_seq_line_write = False
         self.alloc_on_readshared = True
-        self.alloc_on_readunique = False
+        self.alloc_on_readunique = inclusive
         self.alloc_on_readonce = True
         self.alloc_on_writeback = True
         self.alloc_on_atomic = True
-        self.dealloc_on_unique = dealloc_on_unique
+        self.dealloc_on_unique = False if inclusive else dealloc_on_unique
         self.dealloc_on_shared = False
-        self.dealloc_backinv_unique = False
-        self.dealloc_backinv_shared = False
+        self.dealloc_backinv_unique = inclusive
+        self.dealloc_backinv_shared = inclusive
         self.number_of_TBEs = 32
         self.number_of_repl_TBEs = 32
         self.number_of_snoop_TBEs = 1
@@ -308,6 +310,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         # New configurations should use indexing_policy explicitly.
         addr_hash: Optional[bool] = None,
         dealloc_on_unique: bool = False,
+        hnf_inclusion: str = "noninclusive",
         model_profile: str = "abstract",
         core_clock: Optional[str] = None,
         link_latency: int = 1,
@@ -337,6 +340,10 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             raise ValueError("Network latencies must be positive.")
         if network_buffer_size <= 0:
             raise ValueError("network_buffer_size must be positive.")
+        if hnf_inclusion not in ("noninclusive", "inclusive"):
+            raise ValueError(
+                "hnf_inclusion must be 'noninclusive' or 'inclusive'."
+            )
 
         if indexing_policy is None:
             indexing_policy = "splitmix64" if addr_hash else "linear"
@@ -394,6 +401,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         self._indexing_policy = indexing_policy
         self._addr_hash = indexing_policy == "splitmix64"
         self._dealloc_on_unique = dealloc_on_unique
+        self._hnf_inclusion = hnf_inclusion
         self._model_profile = model_profile
         self._core_clock = core_clock
         self._link_latency = link_latency
@@ -447,6 +455,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             "indexing_policy": self._indexing_policy,
             "ddio_way_part": self._ddio_way_part,
             "nic_read_no_allocate": self._nic_read_no_allocate,
+            "hnf_inclusion": self._hnf_inclusion,
             "num_hnfs": self._num_hnfs,
             "hnf_size_per_hnf": self._hnf_size,
             "hnf_size_per_hnf_bytes": self._hnf_size_bytes,
@@ -517,6 +526,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 nic_read_no_allocate=self._nic_read_no_allocate,
                 addr_hash=self._addr_hash,
                 dealloc_on_unique=self._dealloc_on_unique,
+                hnf_inclusion=self._hnf_inclusion,
                 addr_ranges=hnf_ranges[index],
                 start_index_bit=start_index_bit,
                 network=self.ruby_system.network,

@@ -55,6 +55,7 @@ def cachelens_test(
     max_ticks=None,
     cpu_type="timing",
     model_profile="abstract",
+    hnf_inclusion="noninclusive",
 ):
     suffix = "config" if max_ticks is not None else "boot"
     config_args = [
@@ -66,14 +67,16 @@ def cachelens_test(
         resource_directory,
         "--model-profile",
         model_profile,
+        "--hnf-inclusion",
+        hnf_inclusion,
     ]
     if max_ticks is not None:
         config_args += ["--max-ticks", str(max_ticks)]
 
     gem5_verify_config(
         name=(
-            f"cachelens-modern-{isa}-{cpu_type}-{model_profile}-8gib-"
-            f"{suffix}"
+            f"cachelens-modern-{isa}-{cpu_type}-{model_profile}-"
+            f"{hnf_inclusion}-8gib-{suffix}"
         ),
         fixtures=(),
         verifiers=(
@@ -289,6 +292,13 @@ for isa in ("arm", "x86"):
         model_profile=(
             "arm-generic" if isa == "arm" else "x86-generic"
         ),
+    )
+    cachelens_test(
+        isa=isa,
+        length=constants.quick_tag,
+        max_ticks=1,
+        cpu_type="timing",
+        hnf_inclusion="inclusive",
     )
     cachelens_test(
         isa=isa,

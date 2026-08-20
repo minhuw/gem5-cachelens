@@ -146,6 +146,11 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ddio-way-part", type=int, default=None)
     parser.add_argument(
+        "--hnf-inclusion",
+        choices=("noninclusive", "inclusive"),
+        default="noninclusive",
+    )
+    parser.add_argument(
         "--indexing-policy",
         choices=("linear", "splitmix64"),
         default="linear",
@@ -349,6 +354,7 @@ def main() -> None:
             indexing_policy=args.indexing_policy,
             addr_hash=args.addr_hash,
             dealloc_on_unique=args.dealloc_on_unique,
+            hnf_inclusion=args.hnf_inclusion,
             model_profile=model_profile,
             core_clock=args.clock,
             link_latency=args.link_latency,
@@ -415,6 +421,7 @@ def main() -> None:
         f"isa={args.isa} cpu={args.cpu_type} cores={args.num_cores} "
         f"hierarchy={hierarchy_name} memory={args.mem_size} "
         f"profile={hierarchy_config.get('model_profile', 'checkpoint-prep')} "
+        f"hnf_inclusion={hierarchy_config.get('hnf_inclusion', 'n/a')} "
         f"indexing={hierarchy_config.get('indexing_policy', 'n/a')} "
         f"hnfs={args.num_hnfs} "
         f"hnf_capacity={hierarchy_config.get('total_hnf_capacity_bytes', 'n/a')} "

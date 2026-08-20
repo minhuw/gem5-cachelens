@@ -22,6 +22,11 @@ parser.add_argument("--resource-directory")
 parser.add_argument("--max-ticks", type=int)
 parser.add_argument("--cpu-type", choices=("timing", "o3"), default="timing")
 parser.add_argument("--model-profile")
+parser.add_argument(
+    "--hnf-inclusion",
+    choices=("noninclusive", "inclusive"),
+    default="noninclusive",
+)
 args = parser.parse_args()
 
 isa = ISA.ARM if args.isa == "arm" else ISA.X86
@@ -37,6 +42,7 @@ hierarchy = CacheLensCHIHierarchy(
     ddio_way_part=ddio_way_part,
     indexing_policy="linear",
     dealloc_on_unique=False,
+    hnf_inclusion=args.hnf_inclusion,
     model_profile=model_profile,
     core_clock="3GHz",
     link_latency=2,
@@ -131,7 +137,22 @@ assert int(hierarchy.ruby_system.network.buffer_size) == 8
 assert int(hierarchy.ruby_system.network.routers[0].int_routing_latency) == 1
 assert int(hierarchy.ruby_system.network.int_links[0].latency) == 2
 assert int(hierarchy.ruby_system.network.ext_links[0].latency) == 2
-assert not bool(hierarchy.hnfs[0].dealloc_on_unique)
+hnf = hierarchy.hnfs[0]
+assert bool(hnf.enable_DMT) == (args.hnf_inclusion == "noninclusive")
+assert bool(hnf.enable_DCT) == (args.hnf_inclusion == "noninclusive")
+assert bool(hnf.alloc_on_readshared)
+assert bool(hnf.alloc_on_readunique) == (args.hnf_inclusion == "inclusive")
+assert bool(hnf.alloc_on_readonce)
+assert bool(hnf.alloc_on_writeback)
+assert not bool(hnf.dealloc_on_unique)
+assert not bool(hnf.dealloc_on_shared)
+assert bool(hnf.dealloc_backinv_unique) == (
+    args.hnf_inclusion == "inclusive"
+)
+assert bool(hnf.dealloc_backinv_shared) == (
+    args.hnf_inclusion == "inclusive"
+)
+assert hierarchy.get_configuration()["hnf_inclusion"] == args.hnf_inclusion
 assert len(hierarchy.dma_requestors) == len(board.get_dma_ports())
 if isa == ISA.X86:
     # The PCI-hole split is guest-visible only. There is still one
@@ -166,6 +187,7 @@ if isa == ISA.X86:
 print(
     f"CACHELENS_CONFIG_OK isa={args.isa} cpu={args.cpu_type} "
     f"profile={hierarchy.get_model_profile()} "
+    f"hnf_inclusion={args.hnf_inclusion} "
     f"indexing={hierarchy.get_indexing_policy()} "
     f"hnf_capacity={hierarchy.get_total_hnf_capacity_bytes()} "
     f"cache_restore={hierarchy.get_cache_state_restore_policy()} "
