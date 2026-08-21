@@ -31,15 +31,21 @@ from testlib import *
 from testlib import test_util
 
 
-_CONFIG = joinpath(config.base_dir, "configs", "example", "ruby_mem_test.py")
-_L2_ROUTING_STAT = re.compile(
-    r"^system\.ruby\.l2_cntrl(?P<bank>\d+)\.L2cache\."
-    r"(?P<stat>dmaRoutingProxyRequests|dmaRoutingTransientRecycles)$"
+_MEMTEST_CONFIG = joinpath(
+    config.base_dir, "configs", "example", "ruby_mem_test.py"
+)
+_DIRECTED_CONFIG = joinpath(
+    config.base_dir,
+    "tests",
+    "gem5",
+    "mesi_ddio",
+    "configs",
+    "mesi_ddio_directed.py",
 )
 
 
 class DMARoutingStatsVerifier(verifier.Verifier):
-    def __init__(self, l2_banks, classified, max_reads):
+    def __init__(self, l2_banks, classified, max_reads=0):
         super().__init__()
         self._l2_banks = l2_banks
         self._classified = classified
@@ -69,34 +75,45 @@ class DMARoutingStatsVerifier(verifier.Verifier):
             test_util.fail(f"Expected integer statistic {name}, got {value}")
         return int(value)
 
-    def test(self, params):
-        tempdir = params.fixtures[constants.tempdir_fixture_name].path
-        stats_path = joinpath(tempdir, constants.gem5_simulation_stats)
-        if not os.path.isfile(stats_path):
-            test_util.fail(f"Could not find gem5 stats file: {stats_path}")
+    def _check_classified(self, stats):
+        per_bank = {
+            "dmaRoutingProxyRequests": 0,
+            "dmaRoutingTransientRecycles": 0,
+            "ddioReplacementStalls": 0,
+            "ddioOwnershipRequests": 1,
+            "ddioOwnershipAcks": 1,
+            "rxPayloadRequests": 1,
+            "rxPayloadHits": 0,
+            "rxPayloadMisses": 1,
+            "txPayloadRequests": 1,
+            "txPayloadHits": 1,
+            "txPayloadMisses": 0,
+            "ddioWayFill::nic_rx_payload_way0": 1,
+            "ddioWayAccess::nic_tx_payload_way0": 1,
+        }
+        for bank in range(self._l2_banks):
+            prefix = f"system.ruby.l2_cntrl{bank}.L2cache."
+            for suffix, expected in per_bank.items():
+                observed = self._integer_stat(stats, prefix + suffix)
+                if observed != expected:
+                    test_util.fail(
+                        "Classified full-line routing used an unexpected "
+                        f"outcome for bank {bank} {suffix}: "
+                        f"observed={observed}, expected={expected}"
+                    )
 
-        stats = self._read_stats(stats_path)
-        proxy = {}
-        recycle = {}
-        for name, value in stats.items():
-            match = _L2_ROUTING_STAT.match(name)
-            if not match:
-                continue
-            bank = int(match.group("bank"))
-            target = (
-                proxy
-                if match.group("stat").endswith("ProxyRequests")
-                else recycle
+        for event in ("ReadRequest", "Data", "WriteRequest", "Ack"):
+            observed = self._integer_stat(
+                stats, f"system.ruby.DMA_Controller.{event}"
             )
-            target[bank] = self._integer_stat(stats, name)
+            if observed != self._l2_banks:
+                test_util.fail(
+                    f"DMA controller {event} count {observed} does not "
+                    f"match one full-line operation per L2 bank "
+                    f"({self._l2_banks})"
+                )
 
-        expected_banks = set(range(self._l2_banks))
-        if set(proxy) != expected_banks or set(recycle) != expected_banks:
-            test_util.fail(
-                "Missing per-bank DMA routing telemetry: "
-                f"proxy={proxy}, recycle={recycle}, expected={expected_banks}"
-            )
-
+    def _check_generic(self, stats):
         dma_reads = self._integer_stat(
             stats, "system.dma_devices.numReads"
         )
@@ -112,14 +129,11 @@ class DMARoutingStatsVerifier(verifier.Verifier):
             or dma_atomics != 0
         ):
             test_util.fail(
-                "DMA MemTest did not complete the expected timing requests: "
-                f"reads={dma_reads}, writes={dma_writes}, "
+                "Generic DMA MemTest did not complete the expected timing "
+                f"requests: reads={dma_reads}, writes={dma_writes}, "
                 f"atomics={dma_atomics}"
             )
 
-        # Request and response events are counted at the DMA controller. Their
-        # equality proves that both read data and write acknowledgements made
-        # the full round trip back to the DMA sequencer.
         completed_events = (
             ("ReadRequest", dma_reads),
             ("Data", dma_reads),
@@ -132,52 +146,70 @@ class DMARoutingStatsVerifier(verifier.Verifier):
             )
             if observed != completed:
                 test_util.fail(
-                    f"DMA controller {event} count {observed} does not match "
-                    f"completed count {completed}"
+                    f"DMA controller {event} count {observed} does not "
+                    f"match completed count {completed}"
                 )
 
-        completed = dma_reads + dma_writes
-        if self._classified:
-            expected_proxy = {bank: 0 for bank in expected_banks}
-            expected_proxy[0] = completed
-            if proxy != expected_proxy:
-                test_util.fail(
-                    "Classified DMA used unexpected L2 bank(s): "
-                    f"observed={proxy}, expected={expected_proxy}"
-                )
-
-            # CPUs and the DMA tester repeatedly read the same two lines. This
-            # deterministically places bank 0 in transient states while the
-            # classified request arrives and exercises the recycle action.
-            if recycle[0] <= 0 or any(
-                count != 0 for bank, count in recycle.items() if bank != 0
+        for bank in range(self._l2_banks):
+            prefix = f"system.ruby.l2_cntrl{bank}.L2cache."
+            for suffix in (
+                "dmaRoutingProxyRequests",
+                "dmaRoutingTransientRecycles",
+                "ddioReplacementStalls",
+                "ddioOwnershipRequests",
+                "ddioOwnershipAcks",
+                "rxPayloadRequests",
+                "txPayloadRequests",
             ):
-                test_util.fail(
-                    "Transient DMA recycling was not confined to L2 bank 0: "
-                    f"{recycle}"
+                observed = self._integer_stat(stats, prefix + suffix)
+                if observed != 0:
+                    test_util.fail(
+                        "Generic DMA must route directly to the directory: "
+                        f"bank={bank}, stat={suffix}, observed={observed}"
+                    )
+
+    def test(self, params):
+        tempdir = params.fixtures[constants.tempdir_fixture_name].path
+        stats_path = joinpath(tempdir, constants.gem5_simulation_stats)
+        if not os.path.isfile(stats_path):
+            test_util.fail(f"Could not find gem5 stats file: {stats_path}")
+
+        stats = self._read_stats(stats_path)
+        if self._classified:
+            self._check_classified(stats)
+        else:
+            self._check_generic(stats)
+
+
+def _register_classified(name, l2_banks):
+    gem5_verify_config(
+        name=name,
+        fixtures=(),
+        verifiers=(
+            verifier.MatchRegex(
+                re.compile(
+                    r".*MESI DDIO directed scenario "
+                    r"'routing_full_line' passed"
                 )
-        elif any(proxy.values()) or any(recycle.values()):
-            test_util.fail(
-                "Generic DMA must route directly to the directory without "
-                f"L2 proxy/recycle activity: proxy={proxy}, recycle={recycle}"
-            )
+            ),
+            DMARoutingStatsVerifier(l2_banks, classified=True),
+        ),
+        config=_DIRECTED_CONFIG,
+        config_args=(
+            "--scenario=routing_full_line",
+            f"--num-l2caches={l2_banks}",
+            "--ddio-way-part=1",
+            "--abs-max-tick=10000000",
+        ),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+        protocol="MESI_Two_Level",
+    )
 
 
-def _register_routing_smoke(name, l2_banks, classified):
+def _register_generic(name, l2_banks):
     max_reads = 100
-    args = [
-        "--num-cpus=2",
-        "--num-dmas=1",
-        f"--num-nic-dmas={1 if classified else 0}",
-        f"--num-l2caches={l2_banks}",
-        "--maxloads=0",
-        f"--dma-maxloads={max_reads}",
-        "--tester-size=64",
-        "--percent-reads=100",
-        "--progress=100",
-        "--abs-max-tick=100000000",
-    ]
-
     gem5_verify_config(
         name=name,
         fixtures=(),
@@ -188,10 +220,23 @@ def _register_routing_smoke(name, l2_banks, classified):
                     r"loads reached"
                 )
             ),
-            DMARoutingStatsVerifier(l2_banks, classified, max_reads),
+            DMARoutingStatsVerifier(
+                l2_banks, classified=False, max_reads=max_reads
+            ),
         ),
-        config=_CONFIG,
-        config_args=args,
+        config=_MEMTEST_CONFIG,
+        config_args=(
+            "--num-cpus=2",
+            "--num-dmas=1",
+            "--num-nic-dmas=0",
+            f"--num-l2caches={l2_banks}",
+            "--maxloads=0",
+            f"--dma-maxloads={max_reads}",
+            "--tester-size=64",
+            "--percent-reads=100",
+            "--progress=100",
+            "--abs-max-tick=100000000",
+        ),
         valid_isas=(constants.x86_tag,),
         valid_hosts=constants.supported_hosts,
         length=constants.quick_tag,
@@ -199,18 +244,15 @@ def _register_routing_smoke(name, l2_banks, classified):
     )
 
 
-_register_routing_smoke(
+_register_classified(
     name="mesi-ddio-classified-dma-single-l2-bank",
     l2_banks=1,
-    classified=True,
 )
-_register_routing_smoke(
+_register_classified(
     name="mesi-ddio-classified-dma-four-l2-banks",
     l2_banks=4,
-    classified=True,
 )
-_register_routing_smoke(
+_register_generic(
     name="mesi-ddio-generic-dma-directory-route",
     l2_banks=4,
-    classified=False,
 )

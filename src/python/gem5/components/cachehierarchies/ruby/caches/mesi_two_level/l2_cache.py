@@ -27,9 +27,11 @@
 import math
 
 from m5.objects import (
+    LRURP,
     MESI_Two_Level_L2Cache_Controller,
     MessageBuffer,
     RubyCache,
+    TreePLRURP,
 )
 
 
@@ -49,6 +51,7 @@ class L2Cache(MESI_Two_Level_L2Cache_Controller):
         network,
         l2_select_num_bits,
         cache_line_size,
+        ddio_way_part=-1,
     ):
         super().__init__()
 
@@ -57,10 +60,19 @@ class L2Cache(MESI_Two_Level_L2Cache_Controller):
         self.connectQueues(network)
 
         # This is the cache memory object that stores the cache data and tags
+        if ddio_way_part != -1 and not 1 <= ddio_way_part <= int(l2_assoc):
+            raise ValueError(
+                "ddio_way_part must be -1 or between 1 and l2_assoc"
+            )
+
         self.L2cache = RubyCache(
             size=l2_size,
             assoc=l2_assoc,
             start_index_bit=self.getIndexBit(l2_select_num_bits),
+            ddio_way_part=ddio_way_part,
+            replacement_policy=(
+                LRURP() if ddio_way_part > 0 else TreePLRURP()
+            ),
         )
 
         self.transitions_per_cycle = 4

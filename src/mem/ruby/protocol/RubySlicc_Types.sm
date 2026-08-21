@@ -215,6 +215,9 @@ structure (CacheMemory, external = "yes") {
   // MESI classified-DMA routing telemetry (separate from DDIO hit stats).
   void profileDmaRoutingProxy();
   void profileDmaRoutingTransientRecycle();
+  void profileDdioReplacementStall();
+  void profileDdioOwnershipRequest();
+  void profileDdioOwnershipAck();
 
   // DDIO way-partitioned allocation + NIC DMA classification/profiling
   bool cacheAvailInWays(Addr, int);

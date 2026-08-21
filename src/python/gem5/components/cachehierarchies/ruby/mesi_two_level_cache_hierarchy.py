@@ -72,6 +72,7 @@ class MESITwoLevelCacheHierarchy(
         l2_size: str,
         l2_assoc: str,
         num_l2_banks: int,
+        ddio_way_part: int = -1,
     ):
         AbstractRubyCacheHierarchy.__init__(self=self)
         AbstractTwoLevelCacheHierarchy.__init__(
@@ -85,6 +86,7 @@ class MESITwoLevelCacheHierarchy(
         )
 
         self._num_l2_banks = num_l2_banks
+        self._ddio_way_part = ddio_way_part
 
     @overrides(AbstractCacheHierarchy)
     def get_coherence_protocol(self):
@@ -154,6 +156,7 @@ class MESITwoLevelCacheHierarchy(
                 self.ruby_system.network,
                 l2_select_num_bits,
                 cache_line_size,
+                self._ddio_way_part,
             )
             for _ in range(self._num_l2_banks)
         ]

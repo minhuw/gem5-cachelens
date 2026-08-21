@@ -129,26 +129,28 @@ CacheMemory::init()
 
     // Size the DDIO way-histogram stats now that the associativity is known
     cacheMemoryStats.rxPayloadHitWays.init(m_cache_assoc).flags(
-        statistics::nozero | statistics::total);
+        statistics::total);
     cacheMemoryStats.rxPayloadAllocWays.init(m_cache_assoc).flags(
-        statistics::nozero | statistics::total);
+        statistics::total);
     cacheMemoryStats.ddioAllocWays.init(m_cache_assoc).flags(
-        statistics::nozero | statistics::total);
+        statistics::total);
 
-    // Per-way, per-source accounting vectors ([src][way] flattened)
+    // Per-way, per-source accounting vectors ([src][way] flattened). Keep
+    // zero-valued way entries visible so runtime contracts can distinguish a
+    // real zero from a missing statistic.
     static const char *ddio_src_names[5] = {
         "nic_rx_payload", "nic_tx_payload", "nic_desc", "cpu_other",
         "nic_rx_header"};
     cacheMemoryStats.ddioWayAccess.init(5 * m_cache_assoc).flags(
-        statistics::nozero | statistics::total);
+        statistics::total);
     cacheMemoryStats.ddioWayFill.init(5 * m_cache_assoc).flags(
-        statistics::nozero | statistics::total);
+        statistics::total);
     cacheMemoryStats.wayDeallocations.init(m_cache_assoc).flags(
-        statistics::nozero | statistics::total);
+        statistics::total);
     cacheMemoryStats.rxPayloadCpuAccessWays.init(m_cache_assoc).flags(
-        statistics::nozero | statistics::total);
+        statistics::total);
     cacheMemoryStats.rxPayloadCpuFillWays.init(m_cache_assoc).flags(
-        statistics::nozero | statistics::total);
+        statistics::total);
     for (int s = 0; s < 5; s++) {
         for (int w = 0; w < m_cache_assoc; w++) {
             cacheMemoryStats.ddioWayAccess.subname(
@@ -886,6 +888,12 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
                "Classified DMA requests proxied through this cache bank"),
       ADD_STAT(dmaRoutingTransientRecycles,
                "Classified DMA requests recycled in a transient cache state"),
+      ADD_STAT(ddioReplacementStalls,
+               "Classified DMA writes stalled for DDIO subset replacement"),
+      ADD_STAT(ddioOwnershipRequests,
+               "Retained DDIO ownership requests sent to the directory"),
+      ADD_STAT(ddioOwnershipAcks,
+               "Retained DDIO ownership acknowledgements received"),
       ADD_STAT(rxPayloadRequests,
                "Number of NIC RX data DMA write line transactions"),
       ADD_STAT(rxPayloadHits,
@@ -994,19 +1002,9 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
     }
 
     // NOTE: the way-histogram vectors are sized in CacheMemory::init(),
-    // since m_cache_assoc is not yet set when this constructor runs.
-    rxPayloadRequests.flags(statistics::nozero);
-    rxPayloadHits.flags(statistics::nozero);
-    rxPayloadMisses.flags(statistics::nozero);
+    // since m_cache_assoc is not yet set when this constructor runs. DDIO
+    // scalar zeros intentionally remain printable for strict test contracts.
     rxHeaderHitRate.flags(statistics::nonan);
-    rxHeaderRequests.flags(statistics::nozero);
-    rxHeaderHits.flags(statistics::nozero);
-    rxHeaderMisses.flags(statistics::nozero);
-    txPayloadRequests.flags(statistics::nozero);
-    txPayloadHits.flags(statistics::nozero);
-    txPayloadMisses.flags(statistics::nozero);
-    rxPayloadUniqueLines.flags(statistics::nozero);
-    txPayloadUniqueLines.flags(statistics::nozero);
 }
 
 // assumption: SLICC generated files will only call this function

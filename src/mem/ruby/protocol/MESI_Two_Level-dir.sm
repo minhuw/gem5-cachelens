@@ -66,6 +66,7 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
 //added by SS for dma
     DMA_READ, desc="A DMA Read memory request";
     DMA_WRITE, desc="A DMA Write memory request";
+    DDIO_WRITE, desc="An L2 claims ownership of a retained full NIC line";
     CleanReplacement, desc="Clean Replacement in L2 cache";
 
   }
@@ -210,6 +211,11 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
         } else if (in_msg.Type == CoherenceRequestType:DMA_WRITE) {
           trigger(Event:DMA_WRITE, makeLineAddress(in_msg.addr),
                   TBEs[makeLineAddress(in_msg.addr)]);
+        } else if (in_msg.Type == CoherenceRequestType:DDIO_WRITE) {
+          assert(machineIDToMachineType(in_msg.Requestor) ==
+                 MachineType:L2Cache);
+          trigger(Event:DDIO_WRITE, makeLineAddress(in_msg.addr),
+                  TBEs[makeLineAddress(in_msg.addr)]);
         } else {
           DPRINTF(RubySlicc, "%s\n", in_msg);
           error("Invalid message");
@@ -349,8 +355,48 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     }
   }
 
+  action(qft_queueMemoryFetchRequestDMATBE, "qfdt",
+         desc="Queue saved DMA fetch after a clean owner replacement") {
+    assert(is_valid(tbe));
+    enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+      out_msg.addr := address;
+      out_msg.Type := MemoryRequestType:MEMORY_READ;
+      out_msg.Sender := tbe.Requestor;
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+      out_msg.Len := 0;
+    }
+  }
+
   action(p_popIncomingDMARequestQueue, "p", desc="Pop incoming DMA queue") {
     requestNetwork_in.dequeue(clockEdge());
+  }
+
+  action(do_recordDdioOwner, "do",
+         desc="Record the L2 containing authoritative retained NIC data") {
+    peek(requestNetwork_in, RequestMsg) {
+      Entry e := getDirectoryEntry(address);
+      e.Owner := in_msg.Requestor;
+    }
+  }
+
+  action(do_assertDdioOwner, "doa",
+         desc="A repeated ownership claim must come from the current L2") {
+    peek(requestNetwork_in, RequestMsg) {
+      assert(getDirectoryEntry(address).Owner == in_msg.Requestor);
+    }
+  }
+
+  action(do_sendDdioOwnershipAck, "doack",
+         desc="Confirm directory ownership before the DMA is acknowledged") {
+    peek(requestNetwork_in, RequestMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DDIO_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
   }
 
   action(dr_sendDMAData, "dr", desc="Send Data to DMA controller from directory") {
@@ -436,16 +482,33 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   }
 
   action(qw_queueMemoryWBRequest_partialTBE, "qwt",
-         desc="Queue off-chip writeback request") {
+         desc="Merge a saved DMA write into current owner data") {
     peek(responseNetwork_in, ResponseMsg) {
+      assert(is_valid(tbe));
+      DataBlock merged_data := in_msg.DataBlk;
+      merged_data.copyPartial(tbe.DataBlk,
+                              getOffset(tbe.PhysicalAddress), tbe.Len);
       enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
-        out_msg.addr := tbe.PhysicalAddress;
+        out_msg.addr := address;
         out_msg.Type := MemoryRequestType:MEMORY_WB;
         out_msg.Sender := in_msg.Sender;
         out_msg.MessageSize := MessageSizeType:Writeback_Data;
-        out_msg.DataBlk := tbe.DataBlk;
-        out_msg.Len := tbe.Len;
+        out_msg.DataBlk := merged_data;
+        out_msg.Len := 0;
       }
+    }
+  }
+
+  action(qwt_queueMemoryWBRequestDMATBE, "qwtd",
+         desc="Queue saved DMA write after a clean owner replacement") {
+    assert(is_valid(tbe));
+    enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+      out_msg.addr := tbe.PhysicalAddress;
+      out_msg.Type := MemoryRequestType:MEMORY_WB;
+      out_msg.Sender := tbe.Requestor;
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.Len := tbe.Len;
     }
   }
 
@@ -488,6 +551,27 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     aa_sendAck;
     l_popMemQueue;
     kd_wakeUpDependents;
+  }
+
+  // A retained full-line NIC write makes its L2 bank the authoritative
+  // owner without fetching stale memory. The L2 does not ACK the DMA until
+  // this directory transition has completed.
+  transition(I, DDIO_WRITE, M) {
+    do_recordDdioOwner;
+    do_sendDdioOwnershipAck;
+    j_popIncomingRequestQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(M, DDIO_WRITE) {
+    do_assertDdioOwner;
+    do_sendDdioOwnershipAck;
+    j_popIncomingRequestQueue;
+  }
+
+  transition({ID, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI},
+             DDIO_WRITE) {
+    zz_recycleDMAQueue;
   }
 
 
@@ -540,6 +624,15 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     k_popIncomingResponseQueue;
   }
 
+  // A clean replacement is the owner's terminal response to the invalidate.
+  // Memory is current, so ACK the blocked replacement and replay the saved
+  // DMA read through the normal memory-data completion state.
+  transition(M_DRD, CleanReplacement, ID) {
+    a_sendAck;
+    qft_queueMemoryFetchRequestDMATBE;
+    k_popIncomingResponseQueue;
+  }
+
   transition(M_DRDI, Memory_Ack, I) {
     aa_sendAck;
     l_popMemQueue;
@@ -554,6 +647,15 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
 
   transition(M_DWR, Data, M_DWRI) {
     qw_queueMemoryWBRequest_partialTBE;
+    k_popIncomingResponseQueue;
+  }
+
+  // As for the read race, do not recycle the clean replacement: its L2 is
+  // waiting for this ACK. Replay the original DMA write from the TBE and let
+  // ID_W produce the sole DMA completion after memory commits it.
+  transition(M_DWR, CleanReplacement, ID_W) {
+    a_sendAck;
+    qwt_queueMemoryWBRequestDMATBE;
     k_popIncomingResponseQueue;
   }
 

@@ -50,7 +50,15 @@ class L2Cache(RubyCache):
 
 
 def define_options(parser):
-    return
+    parser.add_argument(
+        "--ddio-way-part",
+        type=int,
+        default=-1,
+        help=(
+            "number of MESI L2 ways reserved for NIC DDIO allocation; "
+            "-1 selects coherent write-through/no-retention"
+        ),
+    )
 
 
 def create_system(
@@ -142,6 +150,12 @@ def create_system(
         l1_cntrl.responseToL1Cache.in_port = ruby_system.network.out_port
 
     l2_index_start = block_size_bits + l2_bits
+    ddio_way_part = getattr(options, "ddio_way_part", -1)
+    if ddio_way_part != -1 and not 1 <= ddio_way_part <= options.l2_assoc:
+        raise ValueError(
+            "--ddio-way-part must be -1 or between 1 and --l2-assoc "
+            f"({options.l2_assoc})"
+        )
 
     for i in range(options.num_l2caches):
         #
@@ -151,6 +165,8 @@ def create_system(
             size=options.l2_size,
             assoc=options.l2_assoc,
             start_index_bit=l2_index_start,
+            ddio_way_part=ddio_way_part,
+            replacement_policy=LRURP() if ddio_way_part > 0 else TreePLRURP(),
         )
 
         l2_cntrl = L2Cache_Controller(

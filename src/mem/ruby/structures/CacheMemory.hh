@@ -284,6 +284,13 @@ class CacheMemory : public SimObject
           // statistics.
           statistics::Scalar dmaRoutingProxyRequests;
           statistics::Scalar dmaRoutingTransientRecycles;
+          statistics::Scalar ddioReplacementStalls;
+
+          // Retained DDIO ownership handshakes. A cold/subset-replacement
+          // fill must publish its L2 owner at the directory before the DMA
+          // write is acknowledged.
+          statistics::Scalar ddioOwnershipRequests;
+          statistics::Scalar ddioOwnershipAcks;
 
           // DDIO (NIC RX data DMA write) accounting. A request is a packet
           // data line transaction seen by this cache; a hit means the line
@@ -356,6 +363,18 @@ class CacheMemory : public SimObject
       void profileDmaRoutingTransientRecycle()
       {
           cacheMemoryStats.dmaRoutingTransientRecycles++;
+      }
+      void profileDdioReplacementStall()
+      {
+          cacheMemoryStats.ddioReplacementStalls++;
+      }
+      void profileDdioOwnershipRequest()
+      {
+          cacheMemoryStats.ddioOwnershipRequests++;
+      }
+      void profileDdioOwnershipAck()
+      {
+          cacheMemoryStats.ddioOwnershipAcks++;
       }
 
       // DDIO accounting hooks (called from the CHI home node).

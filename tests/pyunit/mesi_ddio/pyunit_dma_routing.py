@@ -164,15 +164,14 @@ class MESIDMARoutingTest(unittest.TestCase):
         ):
             self.assertNotIn(f"out_msg.{field}:=", body)
 
-    def test_l2_handles_every_state_without_touching_cache_state(self) -> None:
+    def test_l2_plan003_states_events_and_routes_are_complete(self) -> None:
         source = _L2.read_text(encoding="utf-8")
         state_body = _braced_body(source, "state_declaration(State")
         states = set(
             re.findall(r"^\s*([A-Z][A-Z0-9_]*)\s*,", state_body, re.M)
         )
-
         stable = {"NP", "SS", "M", "MT"}
-        transient = {
+        legacy_transient = {
             "M_I",
             "MT_I",
             "MCT_I",
@@ -187,22 +186,91 @@ class MESIDMARoutingTest(unittest.TestCase):
             "MT_IB",
             "MT_SB",
         }
-        self.assertEqual(states, stable | transient)
-        self.assertFalse(stable & transient)
+        ddio_transient = {"DM_WI", "DM_WS", "DM_WM", "DM_RT"}
+        self.assertEqual(states, stable | legacy_transient | ddio_transient)
+
+        event_body = _braced_body(source, "enumeration(Event")
+        events = set(
+            re.findall(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*,", event_body, re.M)
+        )
+        self.assertEqual(
+            events,
+            {
+                "L1_GET_INSTR",
+                "L1_GETS",
+                "L1_GETX",
+                "L1_UPGRADE",
+                "L1_PUTX",
+                "L1_PUTX_old",
+                "DMA_WRITE_FULL",
+                "DMA_WRITE_NORETAIN",
+                "DMA_TX_READ",
+                "DMA_DESC_READ",
+                "DMA_OTHER",
+                "L2_Replacement",
+                "L2_Replacement_clean",
+                "DDIO_Replacement",
+                "DDIO_Replacement_clean",
+                "Mem_Data",
+                "Mem_Ack",
+                "Ddio_Ack",
+                "WB_Data",
+                "WB_Data_clean",
+                "Ack",
+                "Ack_all",
+                "Unblock",
+                "Exclusive_Unblock",
+                "MEM_Inv",
+            },
+        )
 
         compact = _compact(source)
-        stable_transition = (
-            "transition({NP,SS,M,MT},{DMA_READ,DMA_WRITE})"
-            "{ad_proxyDMARequestToDirectory;jj_popL1RequestQueue;}"
-        )
+        # Classified Plan 003 traffic can complete in the L2 or proxy to the
+        # directory according to category, state, and DDIO enablement.
+        for transition in (
+            "transition(NP,DMA_WRITE_FULL,DM_WI)",
+            "transition(M,DMA_WRITE_FULL)",
+            "transition(SS,DMA_WRITE_FULL,DM_WS)",
+            "transition(MT,DMA_WRITE_FULL,DM_WM)",
+            "transition(NP,DMA_TX_READ)",
+            "transition({SS,M},DMA_TX_READ)",
+            "transition(MT,DMA_TX_READ,DM_RT)",
+            "transition({NP,SS,M,MT},DMA_WRITE_NORETAIN)",
+            "transition({NP,SS,M,MT},{DMA_DESC_READ,DMA_OTHER})",
+        ):
+            self.assertIn(transition, compact)
+
         transient_transition = (
             "transition({M_I,MT_I,MCT_I,I_I,S_I,ISS,IS,IM,SS_MB,MT_MB,"
-            "MT_IIB,MT_IB,MT_SB},{DMA_READ,DMA_WRITE})"
-            "{zdr_recycleDMARequestQueue;}"
+            "MT_IIB,MT_IB,MT_SB,DM_WI,DM_WS,DM_WM,DM_RT},"
+            "{DMA_WRITE_FULL,DMA_WRITE_NORETAIN,DMA_TX_READ,DMA_DESC_READ,"
+            "DMA_OTHER}){zdr_recycleDMARequestQueue;}"
         )
-        self.assertIn(stable_transition, compact)
         self.assertIn(transient_transition, compact)
 
+    def test_partial_classified_writes_fail_before_transition(
+        self,
+    ) -> None:
+        source = _L2.read_text(encoding="utf-8")
+        ingress = _compact(
+            _braced_body(source, "in_port(L1RequestL2Network_in")
+        )
+        rejection = (
+            "if(classified_write&&!full_line){error("
+            '"MESIDDIOclassifiedNICDMAwritesrequireonealignedfullcacheline;'
+            'partialwritesareunsupporteduntilPlan004");}'
+        )
+        self.assertIn(rejection, ingress)
+        self.assertNotIn("DMA_WRITE_PARTIAL", source)
+        self.assertLess(
+            ingress.index(rejection),
+            ingress.index("trigger(Event:DMA_WRITE_NORETAIN"),
+        )
+
+    def test_proxy_and_recycle_telemetry_do_not_mutate_protocol_state(
+        self,
+    ) -> None:
+        source = _L2.read_text(encoding="utf-8")
         proxy = _compact(
             _action_body(source, "ad_proxyDMARequestToDirectory")
         )
@@ -237,12 +305,21 @@ class MESIDMARoutingTest(unittest.TestCase):
         for stat in (
             "dmaRoutingProxyRequests",
             "dmaRoutingTransientRecycles",
+            "ddioReplacementStalls",
+            "ddioOwnershipRequests",
+            "ddioOwnershipAcks",
         ):
             self.assertIn(f"statistics::Scalar{stat};", header)
             self.assertIn(f"ADD_STAT({stat},", implementation)
             self.assertNotIn(f"{stat}.flags(", implementation)
-        self.assertIn("voidprofileDmaRoutingProxy();", slicc_types)
-        self.assertIn("voidprofileDmaRoutingTransientRecycle();", slicc_types)
+        for method in (
+            "profileDmaRoutingProxy",
+            "profileDmaRoutingTransientRecycle",
+            "profileDdioReplacementStall",
+            "profileDdioOwnershipRequest",
+            "profileDdioOwnershipAck",
+        ):
+            self.assertIn(f"void{method}();", slicc_types)
 
         proxy = _compact(
             _braced_body(header_source, "void profileDmaRoutingProxy()")
@@ -258,6 +335,43 @@ class MESIDMARoutingTest(unittest.TestCase):
         self.assertEqual(
             recycle, "cacheMemoryStats.dmaRoutingTransientRecycles++;"
         )
+        self.assertIn(
+            "L2cache.profileDdioReplacementStall();",
+            _compact(_L2.read_text(encoding="utf-8")),
+        )
+
+    def test_ddio_zero_valued_runtime_stats_remain_printable(self) -> None:
+        implementation = _compact(
+            _CACHE_MEMORY_CC.read_text(encoding="utf-8")
+        )
+        for stat in (
+            "rxPayloadRequests",
+            "rxPayloadHits",
+            "rxPayloadMisses",
+            "rxHeaderRequests",
+            "rxHeaderHits",
+            "rxHeaderMisses",
+            "txPayloadRequests",
+            "txPayloadHits",
+            "txPayloadMisses",
+        ):
+            self.assertNotIn(
+                f"{stat}.flags(statistics::nozero);", implementation
+            )
+
+        vector_sizes = {
+            "rxPayloadHitWays": "m_cache_assoc",
+            "rxPayloadAllocWays": "m_cache_assoc",
+            "ddioAllocWays": "m_cache_assoc",
+            "ddioWayAccess": "5*m_cache_assoc",
+            "ddioWayFill": "5*m_cache_assoc",
+            "wayDeallocations": "m_cache_assoc",
+        }
+        for vector, size in vector_sizes.items():
+            self.assertIn(
+                f"{vector}.init({size}).flags(statistics::total);",
+                implementation,
+            )
 
     def test_nic_dma_memtest_rejects_atomic_system_mode(self) -> None:
         memtest = _compact(_MEMTEST.read_text(encoding="utf-8"))
@@ -289,6 +403,102 @@ class MESIDMARoutingTest(unittest.TestCase):
         self.assertIn("tbe.Requestor:=in_msg.Requestor;", allocate)
         for response in (read_response, owner_read_response, write_response):
             self.assertIn("out_msg.Destination.add(tbe.Requestor);", response)
+
+    def test_directory_clean_replacement_dma_races_complete_once(
+        self,
+    ) -> None:
+        source = _DIRECTORY.read_text(encoding="utf-8")
+        compact = _compact(source)
+        read_replay = _compact(
+            _action_body(source, "qft_queueMemoryFetchRequestDMATBE")
+        )
+        write_replay = _compact(
+            _action_body(source, "qwt_queueMemoryWBRequestDMATBE")
+        )
+        owner_write = _compact(
+            _action_body(source, "qw_queueMemoryWBRequest_partialTBE")
+        )
+
+        self.assertIn("assert(is_valid(tbe));", read_replay)
+        self.assertIn("out_msg.addr:=address;", read_replay)
+        self.assertIn(
+            "out_msg.Type:=MemoryRequestType:MEMORY_READ;", read_replay
+        )
+        self.assertIn("out_msg.Sender:=tbe.Requestor;", read_replay)
+        self.assertNotIn("requestNetwork_in", read_replay)
+
+        self.assertIn("assert(is_valid(tbe));", write_replay)
+        self.assertIn("out_msg.addr:=tbe.PhysicalAddress;", write_replay)
+        self.assertIn(
+            "out_msg.Type:=MemoryRequestType:MEMORY_WB;", write_replay
+        )
+        self.assertIn("out_msg.Sender:=tbe.Requestor;", write_replay)
+        self.assertIn("out_msg.DataBlk:=tbe.DataBlk;", write_replay)
+        self.assertIn("out_msg.Len:=tbe.Len;", write_replay)
+        self.assertNotIn("responseNetwork_in", write_replay)
+
+        # A Data response contains the current owner line. Overlay the saved
+        # DMA byte range before the full-line writeback; sending sparse TBE
+        # bytes alone would erase untouched dirty owner data.
+        self.assertIn("DataBlockmerged_data:=in_msg.DataBlk;", owner_write)
+        self.assertIn(
+            "merged_data.copyPartial(tbe.DataBlk,"
+            "getOffset(tbe.PhysicalAddress),tbe.Len);",
+            owner_write,
+        )
+        self.assertIn("out_msg.addr:=address;", owner_write)
+        self.assertIn("out_msg.DataBlk:=merged_data;", owner_write)
+        self.assertIn("out_msg.Len:=0;", owner_write)
+        self.assertIn("out_msg.Sender:=in_msg.Sender;", owner_write)
+
+        # ACK is terminal for a clean owner replacement. It must be consumed,
+        # not recycled, while the saved DMA operation continues in the normal
+        # memory-response state with its TBE still live.
+        self.assertIn(
+            "transition(M_DRD,CleanReplacement,ID){a_sendAck;"
+            "qft_queueMemoryFetchRequestDMATBE;"
+            "k_popIncomingResponseQueue;}",
+            compact,
+        )
+        self.assertIn(
+            "transition(M_DWR,CleanReplacement,ID_W){a_sendAck;"
+            "qwt_queueMemoryWBRequestDMATBE;"
+            "k_popIncomingResponseQueue;}",
+            compact,
+        )
+
+        # The owner's Data and CleanReplacement responses are mutually
+        # exclusive. Each branch issues one memory operation, and only its
+        # immediate memory-response successor completes the DMA.
+        for transition in (
+            "transition(M_DRD,Data,M_DRDI){drp_sendDMAData;"
+            "w_deallocateTBE;qw_queueMemoryWBRequest;"
+            "k_popIncomingResponseQueue;}",
+            "transition(M_DRDI,Memory_Ack,I){aa_sendAck;"
+            "l_popMemQueue;kd_wakeUpDependents;}",
+            "transition(ID,Memory_Data,I){dr_sendDMAData;"
+            "w_deallocateTBE;l_popMemQueue;kd_wakeUpDependents;}",
+            "transition(M_DWR,Data,M_DWRI){"
+            "qw_queueMemoryWBRequest_partialTBE;"
+            "k_popIncomingResponseQueue;}",
+            "transition(M_DWRI,Memory_Ack,I){aa_sendAck;da_sendDMAAck;"
+            "w_deallocateTBE;l_popMemQueue;kd_wakeUpDependents;}",
+            "transition(ID_W,Memory_Ack,I){da_sendDMAAck;"
+            "w_deallocateTBE;l_popMemQueue;kd_wakeUpDependents;}",
+        ):
+            self.assertIn(transition, compact)
+
+        l2 = _compact(_L2.read_text(encoding="utf-8"))
+        self.assertIn(
+            "transition(M,L2_Replacement_clean,M_I){i_allocateTBE;"
+            "c_exclusiveCleanReplacement;rr_deallocateL2CacheBlock;}",
+            l2,
+        )
+        self.assertIn(
+            "transition({I_I,S_I,M_I,MT_I,MCT_I,NP},MEM_Inv){"
+            "o_popIncomingResponseQueue;}",
+            l2,
+        )
 
 
 if __name__ == "__main__":
