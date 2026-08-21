@@ -66,6 +66,11 @@ structure(RequestMsg, desc="...", interface="Message") {
   MessageSizeType MessageSize,  desc="size category of the message";
   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
   int Len;
+  Addr accessAddr, default="0", desc="Physical address of this request fragment";
+  int accessSize, default="0",  desc="Size of this request fragment";
+  WriteMask accessMask,         desc="Exact cache-line bytes touched by this fragment";
+  RequestPtr seqReq, default="nullptr", desc="Original DMA request (nullptr if unavailable)";
+  bool isSeqReqValid, default="false", desc="Set when seqReq is non-null";
   bool Dirty, default="false",  desc="Dirty bit";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
 

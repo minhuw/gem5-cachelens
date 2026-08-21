@@ -36,6 +36,7 @@
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/DMASequencerRequestType.hh"
+#include "mem/ruby/system/DMASequencerUtils.hh"
 #include "mem/ruby/system/RubyPort.hh"
 #include "params/DMASequencer.hh"
 
@@ -57,6 +58,7 @@ struct DMARequest
     int bytes_issued;
     uint8_t *data;
     PacketPtr pkt;
+    RequestPtr seqReq;
 };
 
 class DMASequencer : public RubyPort
@@ -82,11 +84,13 @@ class DMASequencer : public RubyPort
 
   private:
     void issueNext(const Addr &addr);
+    Addr requestAddressForCallback(const Addr &addr) const;
 
     uint64_t m_data_block_mask;
 
     typedef std::unordered_map<Addr, DMARequest> RequestTable;
     RequestTable m_RequestTable;
+    DMARequestLineReservations m_lineReservations;
 
     int m_outstanding_count;
     int m_max_outstanding_requests;

@@ -140,6 +140,11 @@ machine(MachineType:DMA, "DMA Controller")
         out_msg.Requestor := machineID;
         out_msg.DataBlk := in_msg.DataBlk;
         out_msg.Len := in_msg.Len;
+        out_msg.accessAddr := in_msg.PhysicalAddress;
+        out_msg.accessSize := in_msg.Len;
+        out_msg.accessMask := in_msg.writeMask;
+        out_msg.seqReq := in_msg.seqReq;
+        out_msg.isSeqReqValid := in_msg.isSeqReqValid;
         out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
         out_msg.MessageSize := MessageSizeType:Writeback_Control;
       }
@@ -154,6 +159,11 @@ machine(MachineType:DMA, "DMA Controller")
           out_msg.Requestor := machineID;
           out_msg.DataBlk := in_msg.DataBlk;
           out_msg.Len := in_msg.Len;
+          out_msg.accessAddr := in_msg.PhysicalAddress;
+          out_msg.accessSize := in_msg.Len;
+          out_msg.accessMask := in_msg.writeMask;
+          out_msg.seqReq := in_msg.seqReq;
+          out_msg.isSeqReqValid := in_msg.isSeqReqValid;
           out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
           out_msg.MessageSize := MessageSizeType:Writeback_Control;
         }
