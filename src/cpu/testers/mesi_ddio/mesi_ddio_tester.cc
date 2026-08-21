@@ -155,7 +155,7 @@ MESIDDIODirectedTester::addReadAt(
     fatal_if(expected.empty(),
              "Read operation %s has no expected bytes", label);
     operations.push_back({phase, issue_delay, port, cpu, true, address, flags,
-                          expected, label});
+                          expected, label, {}});
 }
 
 void
@@ -164,9 +164,22 @@ MESIDDIODirectedTester::addWriteAt(
     Addr address, Request::Flags flags, const std::vector<uint8_t> &data,
     const std::string &label)
 {
+    addMaskedWriteAt(phase, issue_delay, port, cpu, address, flags, data,
+                     std::vector<bool>(data.size(), true), label);
+}
+
+void
+MESIDDIODirectedTester::addMaskedWriteAt(
+    unsigned phase, unsigned issue_delay, PortKind port, unsigned cpu,
+    Addr address, Request::Flags flags, const std::vector<uint8_t> &data,
+    const std::vector<bool> &byte_enable, const std::string &label)
+{
     fatal_if(data.empty(), "Write operation %s has no bytes", label);
+    fatal_if(byte_enable.size() != data.size(),
+             "Write operation %s has %zu bytes but %zu byte enables", label,
+             data.size(), byte_enable.size());
     operations.push_back({phase, issue_delay, port, cpu, false, address, flags,
-                          data, label});
+                          data, label, byte_enable});
 }
 
 void
@@ -183,6 +196,16 @@ MESIDDIODirectedTester::addWrite(
     const std::vector<uint8_t> &data, const std::string &label)
 {
     addWriteAt(reservePhase(), 0, port, cpu, address, flags, data, label);
+}
+
+void
+MESIDDIODirectedTester::addMaskedWrite(
+    PortKind port, unsigned cpu, Addr address, Request::Flags flags,
+    const std::vector<uint8_t> &data,
+    const std::vector<bool> &byte_enable, const std::string &label)
+{
+    addMaskedWriteAt(reservePhase(), 0, port, cpu, address, flags, data,
+                     byte_enable, label);
 }
 
 void
@@ -352,16 +375,199 @@ MESIDDIODirectedTester::buildScenario()
         auto merged = first;
         merged[1] = 0x92;
         merged[2] = 0x75;
+        merged[4] = 0x39;
+        const std::vector<uint8_t> sparse = {0x75, 0x66, 0x39, 0x44};
+        const std::vector<bool> sparseMask = {true, false, true, false};
         addWrite(PortKind::Dma, 0, a, generic, first,
                  "initialize generic dirty-owner line");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create private owner before generic partial write");
         addWrite(PortKind::Cpu, 0, a + 1, generic, {merged[1]},
                  "dirty owner byte preserved across DMA write");
-        addWrite(PortKind::Dma, 0, a + 2, generic, {merged[2]},
-                 "generic partial DMA write into dirty owner");
+        addMaskedWrite(PortKind::Dma, 0, a + 2, generic, sparse, sparseMask,
+                       "generic sparse DMA write into dirty owner");
         addRead(PortKind::Dma, 0, a, generic, merged,
                 "merged generic dirty-owner DMA readback");
+    } else if (scenario == "partial_one_byte") {
+        auto merged = first;
+        merged[0] = 0x11;
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean memory for aligned partial write");
+        addWrite(PortKind::Dma, 0, a, rxPayload, {merged[0]},
+                 "aligned one-byte retained NIC write");
+        addRead(PortKind::Dma, 0, a, txPayload, merged,
+                "TX observes aligned one-byte merge");
+    } else if (scenario == "partial_unaligned") {
+        auto merged = first;
+        const auto partial = bytes(13, 0xa0);
+        std::copy(partial.begin(), partial.end(), merged.begin() + 17);
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean memory for unaligned partial write");
+        addWrite(PortKind::Dma, 0, a + 17, rxPayload, partial,
+                 "unaligned retained NIC write");
+        addRead(PortKind::Dma, 0, a, txPayload, merged,
+                "TX observes unaligned merge");
+    } else if (scenario == "partial_l2_m") {
+        auto merged = first;
+        const auto partial = bytes(5, 0xc0);
+        std::copy(partial.begin(), partial.end(), merged.begin() + 9);
+        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+                 "seed retained M line");
+        addWrite(PortKind::Dma, 0, a + 9, rxPayload, partial,
+                 "partial NIC hit in L2 M");
+        addRead(PortKind::Dma, 0, a, txPayload, merged,
+                "TX observes L2 M partial merge");
+    } else if (scenario == "partial_ss_sharers") {
+        auto merged = first;
+        const auto partial = bytes(4, 0xd0);
+        std::copy(partial.begin(), partial.end(), merged.begin() + 20);
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean shared line");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "create first clean sharer");
+        addRead(PortKind::Cpu, 1, a + 1, generic, {first[1]},
+                "create second clean sharer");
+        addWrite(PortKind::Dma, 0, a + 20, rxPayload, partial,
+                 "partial NIC write invalidates SS sharers");
+        addRead(PortKind::Dma, 0, a, txPayload, merged,
+                "TX observes SS merge");
+        addRead(PortKind::Cpu, 0, a + 20, generic, {merged[20]},
+                "first CPU observes SS invalidation");
+        addRead(PortKind::Cpu, 1, a + 23, generic, {merged[23]},
+                "second CPU observes SS invalidation");
+    } else if (scenario == "partial_dirty_owner") {
+        auto merged = first;
+        merged[7] = 0xee;
+        const auto partial = bytes(3, 0x70);
+        std::copy(partial.begin(), partial.end(), merged.begin() + 2);
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize dirty-owner partial line");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "create private owner before partial NIC write");
+        addWrite(PortKind::Cpu, 0, a + 7, generic, {merged[7]},
+                 "dirty untouched owner byte");
+        addWrite(PortKind::Dma, 0, a + 2, rxPayload, partial,
+                 "partial NIC write retrieves dirty owner");
+        addRead(PortKind::Dma, 0, a, txPayload, merged,
+                "TX observes owner data before NIC merge");
+    } else if (scenario == "partial_no_retention") {
+        auto cleanMerged = first;
+        cleanMerged[3] = 0x51;
+        auto dirtyMerged = second;
+        dirtyMerged[7] = 0xee;
+        dirtyMerged[2] = 0x62;
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean no-retention memory line");
+        addWrite(PortKind::Dma, 0, b, generic, second,
+                 "initialize dirty-owner no-retention line");
+        addRead(PortKind::Cpu, 0, b, generic, {second[0]},
+                "create no-retention private owner");
+        addWrite(PortKind::Cpu, 0, b + 7, generic, {dirtyMerged[7]},
+                 "dirty no-retention owner byte");
+        addWrite(PortKind::Dma, 0, a + 3, rxPayload, {cleanMerged[3]},
+                 "clean no-retention partial NIC write");
+        addWrite(PortKind::Dma, 0, b + 2, rxPayload, {dirtyMerged[2]},
+                 "dirty-owner no-retention partial NIC write");
+        addRead(PortKind::Dma, 0, a, txPayload, cleanMerged,
+                "memory readback of clean no-retention merge");
+        addRead(PortKind::Dma, 0, b, txPayload, dirtyMerged,
+                "memory readback of dirty-owner no-retention merge");
+    } else if (scenario == "partial_cross_line") {
+        const Addr next = a + blockSize;
+        auto left = first;
+        auto right = second;
+        const auto partial = bytes(16, 0x30);
+        std::copy(partial.begin(), partial.begin() + 8, left.end() - 8);
+        std::copy(partial.begin() + 8, partial.end(), right.begin());
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize first cross-line memory line");
+        addWrite(PortKind::Dma, 0, next, generic, second,
+                 "initialize second cross-line memory line");
+        addWrite(PortKind::Dma, 0, a + blockSize - 8, rxPayload, partial,
+                 "contiguous cross-line retained NIC write");
+        addRead(PortKind::Dma, 0, a, txPayload, left,
+                "TX observes first cross-line fragment");
+        addRead(PortKind::Dma, 0, next, txPayload, right,
+                "TX observes second cross-line fragment");
+    } else if (scenario == "sparse_mask") {
+        const Addr middle = a + blockSize;
+        const Addr last = a + 2 * blockSize;
+        auto firstMerged = first;
+        auto lastMerged = third;
+        const auto localData = bytes(8, 0x90);
+        std::vector<bool> localMask(8, false);
+        for (const int byte : {0, 3, 7}) {
+            localMask[byte] = true;
+            firstMerged[8 + byte] = localData[byte];
+        }
+        const auto spanningData = bytes(72, 0xb0);
+        std::vector<bool> spanningMask(72, false);
+        for (const int byte : {0, 3, 68, 71})
+            spanningMask[byte] = true;
+        firstMerged[60] = spanningData[0];
+        firstMerged[63] = spanningData[3];
+        lastMerged[0] = spanningData[68];
+        lastMerged[3] = spanningData[71];
+
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize first sparse memory line");
+        addWrite(PortKind::Dma, 0, middle, generic, second,
+                 "initialize all-disabled middle sparse line");
+        addWrite(PortKind::Dma, 0, last, generic, third,
+                 "initialize last sparse memory line");
+        addMaskedWrite(PortKind::Dma, 0, a + 8, rxPayload, localData,
+                       localMask, "single-line sparse NIC write");
+        addMaskedWrite(PortKind::Dma, 0, a + 60, rxPayload, spanningData,
+                       spanningMask,
+                       "multi-line sparse NIC write with empty middle");
+        addRead(PortKind::Dma, 0, a, txPayload, firstMerged,
+                "TX observes first sparse line");
+        addRead(PortKind::Dma, 0, middle, txPayload, second,
+                "TX observes untouched all-disabled middle line");
+        addRead(PortKind::Dma, 0, last, txPayload, lastMerged,
+                "TX observes last sparse line");
+    } else if (scenario == "partial_subset_race") {
+        auto victim = first;
+        victim[7] = 0xee;
+        auto secondMerged = second;
+        secondMerged[5] = 0x5b;
+        auto thirdMerged = third;
+        thirdMerged[9] = 0x6c;
+        addWrite(PortKind::Dma, 0, b, generic, second,
+                 "initialize first partial replacement target");
+        addWrite(PortKind::Dma, 0, c, generic, third,
+                 "initialize second partial replacement target");
+        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+                 "seed partial replacement victim");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "create private partial replacement victim");
+        addWrite(PortKind::Cpu, 0, a + 7, generic, {victim[7]},
+                 "dirty partial replacement victim");
+        const unsigned phase = reservePhase();
+        addWriteAt(phase, 0, PortKind::Dma, 0, b + 5, rxPayload,
+                   {secondMerged[5]}, "first partial subset replacement");
+        addWriteAt(phase, 1, PortKind::Dma, 0, c + 9, rxPayload,
+                   {thirdMerged[9]}, "second partial subset replacement");
+        addRead(PortKind::Dma, 0, a, generic, victim,
+                "read back dirty partial replacement victim");
+        addRead(PortKind::Dma, 0, b, generic, secondMerged,
+                "read back first partial replacement target");
+        addRead(PortKind::Dma, 0, c, generic, thirdMerged,
+                "read back second partial replacement target");
+    } else if (scenario == "masked_rejection") {
+        const auto maskedData = bytes(4, 0xe0);
+        const std::vector<bool> maskedBytes = {true, false, true, false};
+        addMaskedWrite(PortKind::Dma, 0, a, generic, maskedData,
+                       maskedBytes, "masked DMA capability probe");
+    } else if (scenario == "zero_mask") {
+        const auto disabledData = bytes(16, 0xf0);
+        const std::vector<bool> disabledMask(disabledData.size(), false);
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize zero-mask memory line");
+        addMaskedWrite(PortKind::Dma, 0, a + 4, rxPayload, disabledData,
+                       disabledMask, "all-disabled NIC write no-op");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "TX observes zero-mask no-op");
     } else if (scenario == "routing_full_line") {
         for (unsigned bank = 0; bank < routingBanks; ++bank) {
             const Addr address = a + bank * blockSize;
@@ -417,7 +623,8 @@ MESIDDIODirectedTester::buildScenario()
         addRead(PortKind::Dma, 0, c, generic, third,
                 "generic second replacement readback");
     } else if (scenario == "clean_replacement_dma_read" ||
-               scenario == "clean_replacement_dma_write") {
+               scenario == "clean_replacement_dma_write" ||
+               scenario == "clean_replacement_dma_partial_write") {
         addWrite(PortKind::Dma, 0, a, generic, first,
                  "initialize clean replacement victim");
         addWrite(PortKind::Dma, 0, b, generic, second,
@@ -447,9 +654,13 @@ MESIDDIODirectedTester::buildScenario()
         if (scenario == "clean_replacement_dma_read") {
             addReadAt(phase, 0, PortKind::Dma, 0, a, generic, first,
                       "DMA read racing clean L2 replacement");
-        } else {
+        } else if (scenario == "clean_replacement_dma_write") {
             addWriteAt(phase, 0, PortKind::Dma, 0, a, generic, second,
                        "DMA write racing clean L2 replacement");
+        } else {
+            addWriteAt(phase, 0, PortKind::Dma, 0, a + 7, generic,
+                       {second[7]},
+                       "partial DMA write racing clean L2 replacement");
         }
         addReadAt(phase, 4, PortKind::Cpu, 1, e, generic, {fifth[0]},
                   "CPU fill completing clean L2 replacement");
@@ -457,29 +668,11 @@ MESIDDIODirectedTester::buildScenario()
         if (scenario == "clean_replacement_dma_write") {
             addRead(PortKind::Dma, 0, a, generic, second,
                     "final DMA read after clean-replacement write race");
-        }
-    } else if (scenario == "partial_one_byte" ||
-               scenario == "partial_unaligned" ||
-               scenario == "partial_cross_line") {
-        auto dirty = first;
-        dirty[7] = 0xee;
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
-                 "retained line before rejected write");
-        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
-                "private owner before rejected write");
-        addWrite(PortKind::Cpu, 0, a + 7, generic, {dirty[7]},
-                 "dirty private owner before rejected write");
-
-        if (scenario == "partial_one_byte") {
-            addWrite(PortKind::Dma, 0, a + 3, rxPayload, bytes(1, 0x11),
-                     "classified one-byte write must fail");
-        } else if (scenario == "partial_unaligned") {
-            addWrite(PortKind::Dma, 0, a + 3, rxPayload, bytes(16, 0x22),
-                     "classified unaligned write must fail");
-        } else {
-            addWrite(PortKind::Dma, 0, a + blockSize - 8, rxPayload,
-                     bytes(16, 0x33),
-                     "classified cross-line write must fail");
+        } else if (scenario == "clean_replacement_dma_partial_write") {
+            auto merged = first;
+            merged[7] = second[7];
+            addRead(PortKind::Dma, 0, a, generic, merged,
+                    "final DMA read after partial clean-replacement race");
         }
     } else {
         fatal("Unknown MESI DDIO directed scenario '%s'", scenario);
@@ -536,6 +729,12 @@ MESIDDIODirectedTester::issueOperation(size_t index)
 
     auto req = std::make_shared<Request>(
         op.address, op.data.size(), op.flags, requestorId);
+    if (!op.read) {
+        fatal_if(op.byteEnable.size() != op.data.size(),
+                 "Write operation %s has an invalid byte-enable mask",
+                 op.label);
+        req->setByteEnable(op.byteEnable);
+    }
     PacketPtr pkt = new Packet(
         req, op.read ? MemCmd::ReadReq : MemCmd::WriteReq);
     auto *data = new uint8_t[op.data.size()];

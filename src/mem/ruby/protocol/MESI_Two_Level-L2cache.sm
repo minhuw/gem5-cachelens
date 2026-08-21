@@ -94,9 +94,10 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     MT_SB, AccessPermission:Busy, desc="Blocked for L1_GETS from MT, got data,  waiting for unblock";
 
     // Classified NIC DMA transactions owned by this L2 bank.
-    DM_WI, AccessPermission:Busy, desc="Full NIC write allocated in L2, waiting for directory ownership";
-    DM_WS, AccessPermission:Busy, desc="Full NIC write invalidating shared L1 copies";
-    DM_WM, AccessPermission:Busy, desc="Full NIC write invalidating an exclusive L1 owner";
+    DM_WF, AccessPermission:Busy, desc="Partial NIC write fetching an authoritative memory line";
+    DM_WI, AccessPermission:Busy, desc="NIC write waiting for directory ownership";
+    DM_WS, AccessPermission:Busy, desc="NIC write invalidating shared L1 copies";
+    DM_WM, AccessPermission:Busy, desc="NIC write invalidating an exclusive L1 owner";
     DM_RT, AccessPermission:Busy, desc="TX payload read retrieving data from an exclusive L1 owner";
 
   }
@@ -117,7 +118,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     // Events initiated by a classified DMA request. Classification is based
     // exclusively on the preserved seqReq provenance.
     DMA_WRITE_FULL,          desc="Full-line NIC DDIO write retained in L2";
-    DMA_WRITE_NORETAIN,      desc="Full-line NIC write-through request";
+    DMA_WRITE_PARTIAL,       desc="Masked NIC DDIO write retained in L2";
+    DMA_WRITE_NORETAIN,      desc="NIC write-through request";
     DMA_TX_READ,             desc="NIC TX payload read with no allocation";
     DMA_DESC_READ,           desc="NIC descriptor read using generic DMA behavior";
     DMA_OTHER,               desc="Other classified DMA request";
@@ -160,7 +162,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   structure(TBE, desc="...") {
     Addr addr,            desc="Physical address for this TBE";
     State TBEState,             desc="Transient state";
-    DataBlock DataBlk,          desc="Buffer for the data block";
+    DataBlock DataBlk,          desc="Authoritative line data";
+    WriteMask DataBlkValid,     desc="Bytes valid in authoritative line data";
     bool Dirty, default="false", desc="Data is Dirty";
 
     NetDest L1_GetS_IDs,            desc="Set of the internal processors that want the block in shared state";
@@ -447,30 +450,26 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
           bool classified_write := in_msg.isSeqReqValid &&
               L2cache.isNicDdioWriteReq(in_msg.seqReq);
-          bool full_line := in_msg.accessMask.isFull() &&
-              in_msg.accessAddr == line_addr &&
-              in_msg.accessSize == blockSize;
+          bool full_line := in_msg.accessMask.isFull();
 
-          // Exact masked merging is Plan 004 work. Reject every classified
-          // NIC write fragment before triggering a transition: no
-          // invalidation, data/state mutation, directory proxy, or ACK may
-          // occur for a partial, unaligned, or cross-line fragment.
-          if (classified_write && !full_line) {
-            error("MESI DDIO classified NIC DMA writes require one aligned full cache line; partial writes are unsupported until Plan 004");
-          } else if (classified_write) {
+          if (classified_write) {
+            assert(in_msg.accessMask.isEmpty() == false);
             int ddio_ways := L2cache.getDDIOWayPart();
             if (ddio_ways < 0) {
               trigger(Event:DMA_WRITE_NORETAIN, line_addr, cache_entry, tbe);
             } else if (is_valid(cache_entry) ||
                        L2cache.cacheAvailInWays(line_addr, ddio_ways)) {
               // A hit in any way is eligible. The subset constrains only a
-              // miss allocation and victim selection.
-              trigger(Event:DMA_WRITE_FULL, line_addr, cache_entry, tbe);
+              // miss allocation and victim selection. Every partial fragment
+              // carries a line-sized exact byte mask.
+              if (full_line) {
+                trigger(Event:DMA_WRITE_FULL, line_addr, cache_entry, tbe);
+              } else {
+                trigger(Event:DMA_WRITE_PARTIAL, line_addr, cache_entry, tbe);
+              }
             } else {
               // Complete an inclusive victim replacement before accepting and
               // profiling the DMA write, then retry the original request.
-              // Count each deterministic stall so directed replacement stress
-              // can prove that overlapping requests exercised this path.
               L2cache.profileDdioReplacementStall();
               Addr victim := L2cache.cacheProbeInWays(line_addr, ddio_ways);
               Entry victim_entry := getCacheEntry(victim);
@@ -573,14 +572,16 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(di_allocateDmaTBE, "di",
-         desc="Save the original classified DMA transaction") {
+         desc="Save incoming NIC bytes separately from authoritative data") {
     check_allocate(TBEs);
     TBEs.allocate(address);
     set_tbe(TBEs[address]);
     tbe.isDmaRequest := true;
     tbe.L1_GetS_IDs.clear();
+    tbe.DataBlkValid.clear();
     if (is_valid(cache_entry)) {
       tbe.DataBlk := cache_entry.DataBlk;
+      tbe.DataBlkValid.fillMask();
       tbe.Dirty := cache_entry.Dirty;
       tbe.pendingAcks := cache_entry.Sharers.count();
     } else {
@@ -588,6 +589,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
       tbe.pendingAcks := 0;
     }
     peek(L1RequestL2Network_in, RequestMsg) {
+      assert(in_msg.accessMask.isEmpty() == false);
       tbe.DmaRequestor := in_msg.Requestor;
       tbe.DmaDataBlk := in_msg.DataBlk;
       tbe.DmaAccessAddr := in_msg.accessAddr;
@@ -596,6 +598,20 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
       tbe.DmaSeqReq := in_msg.seqReq;
       tbe.isDmaSeqReqValid := in_msg.isSeqReqValid;
     }
+  }
+
+  action(dic_requireOwnerData, "dic",
+         desc="Do not treat the stale MT L2 copy as authoritative") {
+    assert(is_valid(tbe));
+    assert(tbe.isDmaRequest);
+    tbe.DataBlkValid.clear();
+  }
+
+  action(div_validateSavedL2Data, "div",
+         desc="A clean private owner confirms the saved L2 data") {
+    assert(is_valid(tbe));
+    assert(tbe.isDmaRequest);
+    tbe.DataBlkValid.fillMask();
   }
 
   action(dq_allocateDdioL2CacheBlock, "dq",
@@ -612,32 +628,60 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         dmaSourceClass(tbe.DmaSeqReq), cache_entry.getWay(), address);
   }
 
-  action(dw_writeFullLineFromRequest, "dw",
-         desc="Replace the complete L2 line with incoming NIC data") {
+  action(dw_mergeWriteFromRequest, "dw",
+         desc="Merge enabled NIC bytes into a current local L2 line") {
     peek(L1RequestL2Network_in, RequestMsg) {
-      assert(in_msg.accessMask.isFull());
+      assert(in_msg.accessMask.isEmpty() == false);
       assert(is_valid(cache_entry));
-      cache_entry.DataBlk := in_msg.DataBlk;
+      cache_entry.DataBlk.copyPartial(in_msg.DataBlk, in_msg.accessMask);
       cache_entry.Dirty := true;
       cache_entry.Sharers.clear();
     }
   }
 
-  action(dwt_writeFullLineFromTBE, "dwt",
-         desc="Commit saved complete NIC data after invalidations") {
+  action(dwt_mergeWriteFromTBE, "dwt",
+         desc="Merge saved NIC bytes only after a complete line exists") {
     assert(is_valid(tbe));
     assert(tbe.isDmaRequest);
-    assert(tbe.DmaAccessMask.isFull());
+    assert(tbe.DmaAccessMask.isEmpty() == false);
+    assert(tbe.DataBlkValid.isFull() || tbe.DmaAccessMask.isFull());
     assert(is_valid(cache_entry));
-    cache_entry.DataBlk := tbe.DmaDataBlk;
+    tbe.DataBlk.copyPartial(tbe.DmaDataBlk, tbe.DmaAccessMask);
+    tbe.DataBlkValid.orMask(tbe.DmaAccessMask);
+    assert(tbe.DataBlkValid.isFull());
+    cache_entry.DataBlk := tbe.DataBlk;
     cache_entry.Dirty := true;
     cache_entry.Sharers.clear();
+  }
+
+  action(dmf_requestAuthoritativeMemoryLine, "dmf",
+         desc="Fetch untouched bytes for a retained partial NIC miss") {
+    enqueue(DirRequestL2Network_out, RequestMsg, l2_request_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:GETS;
+      out_msg.Requestor := machineID;
+      out_msg.Destination.add(
+          mapAddressToMachine(address, MachineType:Directory));
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+    }
+  }
+
+  action(dmc_captureAuthoritativeMemoryLine, "dmc",
+         desc="Record the complete memory line before merging NIC bytes") {
+    assert(is_valid(tbe));
+    assert(tbe.isDmaRequest);
+    peek(responseL2Network_in, ResponseMsg) {
+      tbe.DataBlk := in_msg.DataBlk;
+      tbe.DataBlkValid.fillMask();
+      tbe.Dirty := in_msg.Dirty;
+    }
   }
 
   action(drt_writeRetrievedDataToCache, "drt",
          desc="Retain authoritative data retrieved from an L1 owner") {
     assert(is_valid(tbe));
     assert(tbe.isDmaRequest);
+    assert(tbe.DataBlkValid.isFull());
     assert(is_valid(cache_entry));
     cache_entry.DataBlk := tbe.DataBlk;
     cache_entry.Dirty := tbe.Dirty;
@@ -910,6 +954,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     tbe.isDmaRequest := false;
     tbe.L1_GetS_IDs.clear();
     tbe.DataBlk := cache_entry.DataBlk;
+    tbe.DataBlkValid.fillMask();
     tbe.Dirty := cache_entry.Dirty;
     tbe.pendingAcks := cache_entry.Sharers.count();
   }
@@ -964,10 +1009,11 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     }
   }
 
-  action(qq_writeDataToTBE, "\qq", desc="Write data from response queue to TBE") {
+  action(qq_writeDataToTBE, "\qq", desc="Write authoritative response data to TBE") {
     peek(responseL2Network_in, ResponseMsg) {
       assert(is_valid(tbe));
       tbe.DataBlk := in_msg.DataBlk;
+      tbe.DataBlkValid.fillMask();
       tbe.Dirty := in_msg.Dirty;
     }
   }
@@ -1114,19 +1160,19 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   //*****************************************************
 
 
-  // Full-line retained NIC writes.
+  // Full-line retained NIC writes do not need an authoritative old line.
   transition(NP, DMA_WRITE_FULL, DM_WI) {
     dp_profileDmaAcceptance;
     di_allocateDmaTBE;
     dq_allocateDdioL2CacheBlock;
-    dwt_writeFullLineFromTBE;
+    dwt_mergeWriteFromTBE;
     do_requestDdioOwnership;
     jj_popL1RequestQueue;
   }
 
   transition(M, DMA_WRITE_FULL) {
     dp_profileDmaAcceptance;
-    dw_writeFullLineFromRequest;
+    dw_mergeWriteFromRequest;
     set_setMRU;
     da_sendDmaAckFromRequest;
     jj_popL1RequestQueue;
@@ -1142,6 +1188,49 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   transition(MT, DMA_WRITE_FULL, DM_WM) {
     dp_profileDmaAcceptance;
     di_allocateDmaTBE;
+    dic_requireOwnerData;
+    f_sendInvToSharers;
+    jj_popL1RequestQueue;
+  }
+
+  // A retained partial miss first reconstructs the complete memory line.
+  transition(NP, DMA_WRITE_PARTIAL, DM_WF) {
+    dp_profileDmaAcceptance;
+    di_allocateDmaTBE;
+    dq_allocateDdioL2CacheBlock;
+    dmf_requestAuthoritativeMemoryLine;
+    jj_popL1RequestQueue;
+  }
+
+  transition(DM_WF, Mem_Data, DM_WI) {
+    dmc_captureAuthoritativeMemoryLine;
+    dwt_mergeWriteFromTBE;
+    do_requestDdioOwnership;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(M, DMA_WRITE_PARTIAL) {
+    dp_profileDmaAcceptance;
+    di_allocateDmaTBE;
+    dwt_mergeWriteFromTBE;
+    dat_sendDmaAckFromTBE;
+    set_setMRU;
+    s_deallocateTBE;
+    jj_popL1RequestQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(SS, DMA_WRITE_PARTIAL, DM_WS) {
+    dp_profileDmaAcceptance;
+    di_allocateDmaTBE;
+    f_sendInvToSharers;
+    jj_popL1RequestQueue;
+  }
+
+  transition(MT, DMA_WRITE_PARTIAL, DM_WM) {
+    dp_profileDmaAcceptance;
+    di_allocateDmaTBE;
+    dic_requireOwnerData;
     f_sendInvToSharers;
     jj_popL1RequestQueue;
   }
@@ -1160,8 +1249,18 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     o_popIncomingResponseQueue;
   }
 
-  transition(DM_WS, {Ack_all, WB_Data, WB_Data_clean}, M) {
-    dwt_writeFullLineFromTBE;
+  transition(DM_WS, Ack_all, M) {
+    dwt_mergeWriteFromTBE;
+    dat_sendDmaAckFromTBE;
+    set_setMRU;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(DM_WS, {WB_Data, WB_Data_clean}, M) {
+    qq_writeDataToTBE;
+    dwt_mergeWriteFromTBE;
     dat_sendDmaAckFromTBE;
     set_setMRU;
     s_deallocateTBE;
@@ -1174,8 +1273,19 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     o_popIncomingResponseQueue;
   }
 
-  transition(DM_WM, {Ack_all, WB_Data, WB_Data_clean}, M) {
-    dwt_writeFullLineFromTBE;
+  transition(DM_WM, Ack_all, M) {
+    div_validateSavedL2Data;
+    dwt_mergeWriteFromTBE;
+    dat_sendDmaAckFromTBE;
+    set_setMRU;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(DM_WM, {WB_Data, WB_Data_clean}, M) {
+    qq_writeDataToTBE;
+    dwt_mergeWriteFromTBE;
     dat_sendDmaAckFromTBE;
     set_setMRU;
     s_deallocateTBE;
@@ -1248,8 +1358,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   // A request matching any active L2 transaction is retried deterministically
   // so it cannot overtake invalidation, replacement, or ownership commit.
   transition({M_I, MT_I, MCT_I, I_I, S_I, ISS, IS, IM, SS_MB, MT_MB,
-              MT_IIB, MT_IB, MT_SB, DM_WI, DM_WS, DM_WM, DM_RT},
-             {DMA_WRITE_FULL, DMA_WRITE_NORETAIN, DMA_TX_READ,
+              MT_IIB, MT_IB, MT_SB, DM_WF, DM_WI, DM_WS, DM_WM, DM_RT},
+             {DMA_WRITE_FULL, DMA_WRITE_PARTIAL, DMA_WRITE_NORETAIN, DMA_TX_READ,
               DMA_DESC_READ, DMA_OTHER}) {
     zdr_recycleDMARequestQueue;
   }
@@ -1258,7 +1368,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   // BASE STATE - I
 
   // Transitions from I (Idle)
-  transition({DM_WI, DM_WS, DM_WM, DM_RT}, {L1_PUTX, L1_PUTX_old}) {
+  transition({DM_WF, DM_WI, DM_WS, DM_WM, DM_RT}, {L1_PUTX, L1_PUTX_old}) {
     zz_stallAndWaitL1RequestQueue;
   }
 
@@ -1273,14 +1383,14 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   transition({IM, IS, ISS, SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB,
-              DM_WI, DM_WS, DM_WM, DM_RT},
+              DM_WF, DM_WI, DM_WS, DM_WM, DM_RT},
              {L2_Replacement, L2_Replacement_clean,
               DDIO_Replacement, DDIO_Replacement_clean}) {
     zz_stallAndWaitL1RequestQueue;
   }
 
   transition({IM, IS, ISS, SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB,
-              DM_WI, DM_WS, DM_WM, DM_RT}, MEM_Inv) {
+              DM_WF, DM_WI, DM_WS, DM_WM, DM_RT}, MEM_Inv) {
     zn_recycleResponseNetwork;
   }
 
@@ -1290,7 +1400,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
 
   transition({SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB,
-              DM_WI, DM_WS, DM_WM, DM_RT},
+              DM_WF, DM_WI, DM_WS, DM_WM, DM_RT},
              {L1_GETS, L1_GET_INSTR, L1_GETX, L1_UPGRADE}) {
     zz_stallAndWaitL1RequestQueue;
   }

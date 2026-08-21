@@ -48,6 +48,8 @@ _CACHE_MEMORY_HH = _REPO_ROOT / "src/mem/ruby/structures/CacheMemory.hh"
 _CACHE_MEMORY_CC = _REPO_ROOT / "src/mem/ruby/structures/CacheMemory.cc"
 _SLICC_TYPES = _PROTOCOL / "RubySlicc_Types.sm"
 _MEMTEST = _REPO_ROOT / "src/cpu/testers/memtest/memtest.cc"
+_DMA_SEQUENCER_PY = _REPO_ROOT / "src/mem/ruby/system/Sequencer.py"
+_DMA_SEQUENCER_CC = _REPO_ROOT / "src/mem/ruby/system/DMASequencer.cc"
 
 
 def _compact(source: str) -> str:
@@ -139,6 +141,43 @@ class MESIDMARoutingTest(unittest.TestCase):
         self.assertNotIn("math.log", stdlib_l1)
         self.assertNotIn("math.log", stdlib_dma)
 
+    def test_masked_dma_capability_is_default_off_and_mesi_only(self) -> None:
+        sequencer = _compact(
+            _DMA_SEQUENCER_PY.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            sequencer.count("supports_masked_writes=Param.Bool(False,"), 1
+        )
+
+        enabled = {}
+        for root in (
+            _REPO_ROOT / "configs",
+            _REPO_ROOT / "src/python",
+        ):
+            for path in root.rglob("*.py"):
+                count = _compact(path.read_text(encoding="utf-8")).count(
+                    "supports_masked_writes=True"
+                )
+                if count:
+                    enabled[path] = count
+
+        self.assertEqual(enabled, {_LEGACY: 2, _STDLIB: 1})
+
+    def test_masked_dma_rejection_precedes_protocol_admission(self) -> None:
+        source = _DMA_SEQUENCER_CC.read_text(encoding="utf-8")
+        body = _compact(
+            _braced_body(source, "DMASequencer::makeRequest(PacketPtr pkt)")
+        )
+        rejection = (
+            "panic_if(!isSupportedDMARequest(is_masked_write,"
+            "m_supports_masked_writes)"
+        )
+        self.assertIn(rejection, body)
+        self.assertIn("supports_masked_writesisfalse", body)
+        self.assertLess(
+            body.index(rejection), body.index("issueRequestFragment")
+        )
+
     def test_l2_proxy_preserves_the_complete_request_message(self) -> None:
         source = _L2.read_text(encoding="utf-8")
         body = _compact(_action_body(source, "ad_proxyDMARequestToDirectory"))
@@ -164,7 +203,7 @@ class MESIDMARoutingTest(unittest.TestCase):
         ):
             self.assertNotIn(f"out_msg.{field}:=", body)
 
-    def test_l2_plan003_states_events_and_routes_are_complete(self) -> None:
+    def test_l2_plan004_states_events_and_routes_are_complete(self) -> None:
         source = _L2.read_text(encoding="utf-8")
         state_body = _braced_body(source, "state_declaration(State")
         states = set(
@@ -186,7 +225,13 @@ class MESIDMARoutingTest(unittest.TestCase):
             "MT_IB",
             "MT_SB",
         }
-        ddio_transient = {"DM_WI", "DM_WS", "DM_WM", "DM_RT"}
+        ddio_transient = {
+            "DM_WF",
+            "DM_WI",
+            "DM_WS",
+            "DM_WM",
+            "DM_RT",
+        }
         self.assertEqual(states, stable | legacy_transient | ddio_transient)
 
         event_body = _braced_body(source, "enumeration(Event")
@@ -203,6 +248,7 @@ class MESIDMARoutingTest(unittest.TestCase):
                 "L1_PUTX",
                 "L1_PUTX_old",
                 "DMA_WRITE_FULL",
+                "DMA_WRITE_PARTIAL",
                 "DMA_WRITE_NORETAIN",
                 "DMA_TX_READ",
                 "DMA_DESC_READ",
@@ -225,13 +271,16 @@ class MESIDMARoutingTest(unittest.TestCase):
         )
 
         compact = _compact(source)
-        # Classified Plan 003 traffic can complete in the L2 or proxy to the
-        # directory according to category, state, and DDIO enablement.
         for transition in (
             "transition(NP,DMA_WRITE_FULL,DM_WI)",
             "transition(M,DMA_WRITE_FULL)",
             "transition(SS,DMA_WRITE_FULL,DM_WS)",
             "transition(MT,DMA_WRITE_FULL,DM_WM)",
+            "transition(NP,DMA_WRITE_PARTIAL,DM_WF)",
+            "transition(DM_WF,Mem_Data,DM_WI)",
+            "transition(M,DMA_WRITE_PARTIAL)",
+            "transition(SS,DMA_WRITE_PARTIAL,DM_WS)",
+            "transition(MT,DMA_WRITE_PARTIAL,DM_WM)",
             "transition(NP,DMA_TX_READ)",
             "transition({SS,M},DMA_TX_READ)",
             "transition(MT,DMA_TX_READ,DM_RT)",
@@ -242,29 +291,51 @@ class MESIDMARoutingTest(unittest.TestCase):
 
         transient_transition = (
             "transition({M_I,MT_I,MCT_I,I_I,S_I,ISS,IS,IM,SS_MB,MT_MB,"
-            "MT_IIB,MT_IB,MT_SB,DM_WI,DM_WS,DM_WM,DM_RT},"
-            "{DMA_WRITE_FULL,DMA_WRITE_NORETAIN,DMA_TX_READ,DMA_DESC_READ,"
-            "DMA_OTHER}){zdr_recycleDMARequestQueue;}"
+            "MT_IIB,MT_IB,MT_SB,DM_WF,DM_WI,DM_WS,DM_WM,DM_RT},"
+            "{DMA_WRITE_FULL,DMA_WRITE_PARTIAL,DMA_WRITE_NORETAIN,"
+            "DMA_TX_READ,DMA_DESC_READ,DMA_OTHER})"
+            "{zdr_recycleDMARequestQueue;}"
         )
         self.assertIn(transient_transition, compact)
 
-    def test_partial_classified_writes_fail_before_transition(
+    def test_partial_writes_keep_request_and_authoritative_data_separate(
         self,
     ) -> None:
         source = _L2.read_text(encoding="utf-8")
+        compact = _compact(source)
         ingress = _compact(
             _braced_body(source, "in_port(L1RequestL2Network_in")
         )
-        rejection = (
-            "if(classified_write&&!full_line){error("
-            '"MESIDDIOclassifiedNICDMAwritesrequireonealignedfullcacheline;'
-            'partialwritesareunsupporteduntilPlan004");}'
+        allocate = _compact(_action_body(source, "di_allocateDmaTBE"))
+        merge = _compact(_action_body(source, "dwt_mergeWriteFromTBE"))
+        owner = _compact(_action_body(source, "dic_requireOwnerData"))
+        memory = _compact(
+            _action_body(source, "dmc_captureAuthoritativeMemoryLine")
         )
-        self.assertIn(rejection, ingress)
-        self.assertNotIn("DMA_WRITE_PARTIAL", source)
-        self.assertLess(
-            ingress.index(rejection),
-            ingress.index("trigger(Event:DMA_WRITE_NORETAIN"),
+
+        self.assertNotIn("unsupporteduntilPlan004", ingress)
+        self.assertIn("boolfull_line:=in_msg.accessMask.isFull();", ingress)
+        self.assertIn("trigger(Event:DMA_WRITE_PARTIAL", ingress)
+        self.assertIn("tbe.DataBlkValid.clear();", allocate)
+        self.assertIn("tbe.DmaDataBlk:=in_msg.DataBlk;", allocate)
+        self.assertIn("tbe.DmaAccessMask:=in_msg.accessMask;", allocate)
+        self.assertNotIn("tbe.DataBlk:=in_msg.DataBlk;", allocate)
+        self.assertIn(
+            "assert(tbe.DataBlkValid.isFull()||"
+            "tbe.DmaAccessMask.isFull());",
+            merge,
+        )
+        self.assertIn(
+            "tbe.DataBlk.copyPartial(tbe.DmaDataBlk,tbe.DmaAccessMask);",
+            merge,
+        )
+        self.assertIn("tbe.DataBlkValid.clear();", owner)
+        self.assertIn("tbe.DataBlk:=in_msg.DataBlk;", memory)
+        self.assertIn("tbe.DataBlkValid.fillMask();", memory)
+        self.assertIn(
+            "transition(DM_WM,{WB_Data,WB_Data_clean},M)"
+            "{qq_writeDataToTBE;dwt_mergeWriteFromTBE;",
+            compact,
         )
 
     def test_proxy_and_recycle_telemetry_do_not_mutate_protocol_state(
@@ -404,20 +475,28 @@ class MESIDMARoutingTest(unittest.TestCase):
         for response in (read_response, owner_read_response, write_response):
             self.assertIn("out_msg.Destination.add(tbe.Requestor);", response)
 
-    def test_directory_clean_replacement_dma_races_complete_once(
+    def test_directory_masked_dma_races_merge_before_single_ack(
         self,
     ) -> None:
         source = _DIRECTORY.read_text(encoding="utf-8")
         compact = _compact(source)
+        allocate = _compact(_action_body(source, "v_allocateTBE"))
         read_replay = _compact(
             _action_body(source, "qft_queueMemoryFetchRequestDMATBE")
         )
-        write_replay = _compact(
-            _action_body(source, "qwt_queueMemoryWBRequestDMATBE")
+        full_write_replay = _compact(
+            _action_body(source, "qwf_queueSavedFullDMAWrite")
         )
         owner_write = _compact(
-            _action_body(source, "qw_queueMemoryWBRequest_partialTBE")
+            _action_body(source, "qw_mergeOwnerDataAndWrite")
         )
+        memory_write = _compact(
+            _action_body(source, "qmm_mergeMemoryDataAndWrite")
+        )
+
+        self.assertIn("tbe.DataBlkValid.clear();", allocate)
+        self.assertIn("tbe.DmaDataBlk:=in_msg.DataBlk;", allocate)
+        self.assertIn("tbe.DmaAccessMask:=in_msg.accessMask;", allocate)
 
         self.assertIn("assert(is_valid(tbe));", read_replay)
         self.assertIn("out_msg.addr:=address;", read_replay)
@@ -427,33 +506,27 @@ class MESIDMARoutingTest(unittest.TestCase):
         self.assertIn("out_msg.Sender:=tbe.Requestor;", read_replay)
         self.assertNotIn("requestNetwork_in", read_replay)
 
-        self.assertIn("assert(is_valid(tbe));", write_replay)
-        self.assertIn("out_msg.addr:=tbe.PhysicalAddress;", write_replay)
+        self.assertIn("assert(tbe.DmaAccessMask.isFull());", full_write_replay)
+        self.assertIn("out_msg.addr:=address;", full_write_replay)
         self.assertIn(
-            "out_msg.Type:=MemoryRequestType:MEMORY_WB;", write_replay
+            "out_msg.Type:=MemoryRequestType:MEMORY_WB;", full_write_replay
         )
-        self.assertIn("out_msg.Sender:=tbe.Requestor;", write_replay)
-        self.assertIn("out_msg.DataBlk:=tbe.DataBlk;", write_replay)
-        self.assertIn("out_msg.Len:=tbe.Len;", write_replay)
-        self.assertNotIn("responseNetwork_in", write_replay)
+        self.assertIn("out_msg.DataBlk:=tbe.DmaDataBlk;", full_write_replay)
 
-        # A Data response contains the current owner line. Overlay the saved
-        # DMA byte range before the full-line writeback; sending sparse TBE
-        # bytes alone would erase untouched dirty owner data.
-        self.assertIn("DataBlockmerged_data:=in_msg.DataBlk;", owner_write)
-        self.assertIn(
-            "merged_data.copyPartial(tbe.DataBlk,"
-            "getOffset(tbe.PhysicalAddress),tbe.Len);",
-            owner_write,
-        )
-        self.assertIn("out_msg.addr:=address;", owner_write)
-        self.assertIn("out_msg.DataBlk:=merged_data;", owner_write)
-        self.assertIn("out_msg.Len:=0;", owner_write)
+        for merge in (owner_write, memory_write):
+            self.assertIn("tbe.DataBlkValid.fillMask();", merge)
+            self.assertIn(
+                "tbe.DataBlk.copyPartial(tbe.DmaDataBlk,"
+                "tbe.DmaAccessMask);",
+                merge,
+            )
+            self.assertIn("assert(tbe.DataBlkValid.isFull());", merge)
+            self.assertIn("out_msg.DataBlk:=tbe.DataBlk;", merge)
+            self.assertIn("out_msg.Len:=0;", merge)
+        self.assertIn("tbe.DataBlk:=in_msg.DataBlk;", owner_write)
         self.assertIn("out_msg.Sender:=in_msg.Sender;", owner_write)
+        self.assertIn("tbe.DataBlk:=in_msg.DataBlk;", memory_write)
 
-        # ACK is terminal for a clean owner replacement. It must be consumed,
-        # not recycled, while the saved DMA operation continues in the normal
-        # memory-response state with its TBE still live.
         self.assertIn(
             "transition(M_DRD,CleanReplacement,ID){a_sendAck;"
             "qft_queueMemoryFetchRequestDMATBE;"
@@ -462,14 +535,17 @@ class MESIDMARoutingTest(unittest.TestCase):
         )
         self.assertIn(
             "transition(M_DWR,CleanReplacement,ID_W){a_sendAck;"
-            "qwt_queueMemoryWBRequestDMATBE;"
+            "qwf_queueSavedFullDMAWrite;"
+            "k_popIncomingResponseQueue;}",
+            compact,
+        )
+        self.assertIn(
+            "transition(M_DWR,CleanReplacementPartial,ID_WF){a_sendAck;"
+            "qft_queueMemoryFetchRequestDMATBE;"
             "k_popIncomingResponseQueue;}",
             compact,
         )
 
-        # The owner's Data and CleanReplacement responses are mutually
-        # exclusive. Each branch issues one memory operation, and only its
-        # immediate memory-response successor completes the DMA.
         for transition in (
             "transition(M_DRD,Data,M_DRDI){drp_sendDMAData;"
             "w_deallocateTBE;qw_queueMemoryWBRequest;"
@@ -478,8 +554,9 @@ class MESIDMARoutingTest(unittest.TestCase):
             "l_popMemQueue;kd_wakeUpDependents;}",
             "transition(ID,Memory_Data,I){dr_sendDMAData;"
             "w_deallocateTBE;l_popMemQueue;kd_wakeUpDependents;}",
-            "transition(M_DWR,Data,M_DWRI){"
-            "qw_queueMemoryWBRequest_partialTBE;"
+            "transition(ID_WF,Memory_Data,ID_W){"
+            "qmm_mergeMemoryDataAndWrite;l_popMemQueue;}",
+            "transition(M_DWR,Data,M_DWRI){qw_mergeOwnerDataAndWrite;"
             "k_popIncomingResponseQueue;}",
             "transition(M_DWRI,Memory_Ack,I){aa_sendAck;da_sendDMAAck;"
             "w_deallocateTBE;l_popMemQueue;kd_wakeUpDependents;}",

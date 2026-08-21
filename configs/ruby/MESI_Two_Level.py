@@ -221,7 +221,10 @@ def create_system(
     for i, dma_port in enumerate(dma_ports):
         # Create the Ruby objects associated with the dma controller
         dma_seq = DMASequencer(
-            version=i, ruby_system=ruby_system, in_ports=dma_port
+            version=i,
+            ruby_system=ruby_system,
+            in_ports=dma_port,
+            supports_masked_writes=True,
         )
 
         dma_cntrl = DMA_Controller(
@@ -248,7 +251,11 @@ def create_system(
 
     # Create the io controller and the sequencer
     if full_system:
-        io_seq = DMASequencer(version=len(dma_ports), ruby_system=ruby_system)
+        io_seq = DMASequencer(
+            version=len(dma_ports),
+            ruby_system=ruby_system,
+            supports_masked_writes=True,
+        )
         ruby_system._io_port = io_seq
         io_controller = DMA_Controller(
             version=len(dma_ports),

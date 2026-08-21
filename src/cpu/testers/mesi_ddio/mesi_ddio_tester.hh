@@ -63,6 +63,7 @@ class MESIDDIODirectedTester : public ClockedObject
         Request::Flags flags;
         std::vector<uint8_t> data;
         std::string label;
+        std::vector<bool> byteEnable;
 
         PacketPtr packet = nullptr;
         bool issued = false;
@@ -109,6 +110,11 @@ class MESIDDIODirectedTester : public ClockedObject
     void addWrite(PortKind port, unsigned cpu, Addr address,
                   Request::Flags flags, const std::vector<uint8_t> &data,
                   const std::string &label);
+    void addMaskedWrite(PortKind port, unsigned cpu, Addr address,
+                        Request::Flags flags,
+                        const std::vector<uint8_t> &data,
+                        const std::vector<bool> &byte_enable,
+                        const std::string &label);
     void addReadAt(unsigned phase, unsigned issue_delay, PortKind port,
                    unsigned cpu, Addr address, Request::Flags flags,
                    const std::vector<uint8_t> &expected,
@@ -117,6 +123,12 @@ class MESIDDIODirectedTester : public ClockedObject
                     unsigned cpu, Addr address, Request::Flags flags,
                     const std::vector<uint8_t> &data,
                     const std::string &label);
+    void addMaskedWriteAt(unsigned phase, unsigned issue_delay,
+                          PortKind port, unsigned cpu, Addr address,
+                          Request::Flags flags,
+                          const std::vector<uint8_t> &data,
+                          const std::vector<bool> &byte_enable,
+                          const std::string &label);
 
     std::vector<uint8_t> bytes(unsigned size, uint8_t seed) const;
     std::vector<uint8_t> pattern(uint8_t seed) const;

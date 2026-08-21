@@ -49,7 +49,8 @@ namespace ruby
 struct DMARequest
 {
     DMARequest(uint64_t start_paddr, int len, bool write, int bytes_completed,
-               int bytes_issued, uint8_t *data, PacketPtr pkt);
+               int bytes_issued, uint8_t *data, PacketPtr pkt,
+               std::vector<bool> byte_enable);
 
     uint64_t start_paddr;
     int len;
@@ -59,6 +60,7 @@ struct DMARequest
     uint8_t *data;
     PacketPtr pkt;
     RequestPtr seqReq;
+    std::vector<bool> byteEnable;
 };
 
 class DMASequencer : public RubyPort
@@ -84,6 +86,9 @@ class DMASequencer : public RubyPort
 
   private:
     void issueNext(const Addr &addr);
+    void issueRequestFragment(const Addr &addr);
+    void completeRequest(const Addr &addr);
+    void completeZeroEnabledRequest(PacketPtr pkt);
     Addr requestAddressForCallback(const Addr &addr) const;
 
     uint64_t m_data_block_mask;
@@ -94,6 +99,7 @@ class DMASequencer : public RubyPort
 
     int m_outstanding_count;
     int m_max_outstanding_requests;
+    const bool m_supports_masked_writes;
 };
 
 } // namespace ruby

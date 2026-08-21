@@ -46,7 +46,8 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     // Base states
     I, AccessPermission:Read_Write, desc="dir is the owner and memory is up-to-date, all other copies are Invalid";
     ID, AccessPermission:Busy, desc="Intermediate state for DMA_READ when in I";
-    ID_W, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in I";
+    ID_WF, AccessPermission:Busy, desc="DMA_WRITE fetching an authoritative memory line";
+    ID_W, AccessPermission:Busy, desc="DMA_WRITE waiting for merged memory write acknowledgement";
 
     M, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
     IM, AccessPermission:Busy, desc="Intermediate State I>M";
@@ -65,9 +66,11 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     Memory_Ack, desc="Writeback Ack from memory arrives";
 //added by SS for dma
     DMA_READ, desc="A DMA Read memory request";
-    DMA_WRITE, desc="A DMA Write memory request";
-    DDIO_WRITE, desc="An L2 claims ownership of a retained full NIC line";
+    DMA_WRITE_FULL, desc="A complete-line DMA Write memory request";
+    DMA_WRITE_PARTIAL, desc="A masked DMA Write requiring coherent merge";
+    DDIO_WRITE, desc="An L2 claims ownership of a retained NIC line";
     CleanReplacement, desc="Clean Replacement in L2 cache";
+    CleanReplacementPartial, desc="Clean replacement while a masked DMA write waits";
 
   }
 
@@ -83,8 +86,13 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   structure(TBE, desc="TBE entries for outstanding DMA requests") {
     Addr PhysicalAddress, desc="physical address";
     State TBEState,        desc="Transient State";
-    DataBlock DataBlk,     desc="Data to be written (DMA write only)";
-    int Len,               desc="...";
+    DataBlock DataBlk,     desc="Authoritative or merged complete line";
+    WriteMask DataBlkValid, desc="Bytes valid in authoritative line data";
+    bool DmaWrite, default="false", desc="TBE belongs to a DMA write";
+    DataBlock DmaDataBlk,  desc="Incoming DMA write bytes";
+    WriteMask DmaAccessMask, desc="Exact incoming DMA write byte mask";
+    Addr AccessAddress,    desc="Physical address of the DMA fragment";
+    int AccessSize,        desc="Geometric size of the DMA fragment";
     MachineID Requestor,   desc="The DMA engine that sent the request";
   }
 
@@ -209,8 +217,14 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
           trigger(Event:DMA_READ, makeLineAddress(in_msg.addr),
                   TBEs[makeLineAddress(in_msg.addr)]);
         } else if (in_msg.Type == CoherenceRequestType:DMA_WRITE) {
-          trigger(Event:DMA_WRITE, makeLineAddress(in_msg.addr),
-                  TBEs[makeLineAddress(in_msg.addr)]);
+          assert(in_msg.accessMask.isEmpty() == false);
+          if (in_msg.accessMask.isFull()) {
+            trigger(Event:DMA_WRITE_FULL, makeLineAddress(in_msg.addr),
+                    TBEs[makeLineAddress(in_msg.addr)]);
+          } else {
+            trigger(Event:DMA_WRITE_PARTIAL, makeLineAddress(in_msg.addr),
+                    TBEs[makeLineAddress(in_msg.addr)]);
+          }
         } else if (in_msg.Type == CoherenceRequestType:DDIO_WRITE) {
           assert(machineIDToMachineType(in_msg.Requestor) ==
                  MachineType:L2Cache);
@@ -231,7 +245,14 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
         if (in_msg.Type == CoherenceResponseType:MEMORY_DATA) {
           trigger(Event:Data, in_msg.addr, TBEs[in_msg.addr]);
         } else if (in_msg.Type == CoherenceResponseType:ACK) {
-          trigger(Event:CleanReplacement, in_msg.addr, TBEs[in_msg.addr]);
+          TBE tbe := TBEs[in_msg.addr];
+          if (is_valid(tbe) && tbe.DmaWrite &&
+              tbe.DmaAccessMask.isEmpty() == false &&
+              tbe.DmaAccessMask.isFull() == false) {
+            trigger(Event:CleanReplacementPartial, in_msg.addr, tbe);
+          } else {
+            trigger(Event:CleanReplacement, in_msg.addr, tbe);
+          }
         } else {
           DPRINTF(RubySlicc, "%s\n", in_msg.Type);
           error("Invalid message");
@@ -412,16 +433,17 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     }
   }
 
-  action(qw_queueMemoryWBRequest_partial, "qwp",
-         desc="Queue off-chip writeback request") {
+  action(qw_queueMemoryWBRequestDMAFull, "qwp",
+         desc="Write a complete DMA line directly to current memory") {
     peek(requestNetwork_in, RequestMsg) {
+      assert(in_msg.accessMask.isFull());
       enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
-        out_msg.addr := in_msg.addr;
+        out_msg.addr := address;
         out_msg.Type := MemoryRequestType:MEMORY_WB;
         out_msg.Sender := machineID;
         out_msg.MessageSize := MessageSizeType:Writeback_Data;
         out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.Len := in_msg.Len;
+        out_msg.Len := 0;
       }
     }
   }
@@ -470,45 +492,74 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     }
   }
 
-  action(v_allocateTBE, "v", desc="Allocate TBE") {
+  action(v_allocateTBE, "v",
+         desc="Keep incoming DMA bytes separate from authoritative data") {
     peek(requestNetwork_in, RequestMsg) {
       TBEs.allocate(address);
       set_tbe(TBEs[address]);
-      tbe.DataBlk := in_msg.DataBlk;
-      tbe.PhysicalAddress := in_msg.addr;
-      tbe.Len := in_msg.Len;
+      tbe.DataBlkValid.clear();
+      tbe.DmaWrite := in_msg.Type == CoherenceRequestType:DMA_WRITE;
+      tbe.DmaDataBlk := in_msg.DataBlk;
+      tbe.DmaAccessMask := in_msg.accessMask;
+      if (tbe.DmaWrite && tbe.DmaAccessMask.isFull()) {
+        tbe.DataBlk := tbe.DmaDataBlk;
+        tbe.DataBlkValid.fillMask();
+      }
+      tbe.AccessAddress := in_msg.accessAddr;
+      tbe.AccessSize := in_msg.accessSize;
       tbe.Requestor := in_msg.Requestor;
     }
   }
 
-  action(qw_queueMemoryWBRequest_partialTBE, "qwt",
-         desc="Merge a saved DMA write into current owner data") {
-    peek(responseNetwork_in, ResponseMsg) {
+  action(qmm_mergeMemoryDataAndWrite, "qmm",
+         desc="Merge DMA bytes into a complete current memory line") {
+    peek(memQueue_in, MemoryMsg) {
       assert(is_valid(tbe));
-      DataBlock merged_data := in_msg.DataBlk;
-      merged_data.copyPartial(tbe.DataBlk,
-                              getOffset(tbe.PhysicalAddress), tbe.Len);
+      tbe.DataBlk := in_msg.DataBlk;
+      tbe.DataBlkValid.fillMask();
+      tbe.DataBlk.copyPartial(tbe.DmaDataBlk, tbe.DmaAccessMask);
+      assert(tbe.DataBlkValid.isFull());
       enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
         out_msg.addr := address;
         out_msg.Type := MemoryRequestType:MEMORY_WB;
-        out_msg.Sender := in_msg.Sender;
+        out_msg.Sender := machineID;
         out_msg.MessageSize := MessageSizeType:Writeback_Data;
-        out_msg.DataBlk := merged_data;
+        out_msg.DataBlk := tbe.DataBlk;
         out_msg.Len := 0;
       }
     }
   }
 
-  action(qwt_queueMemoryWBRequestDMATBE, "qwtd",
-         desc="Queue saved DMA write after a clean owner replacement") {
+  action(qw_mergeOwnerDataAndWrite, "qwt",
+         desc="Merge DMA bytes into authoritative dirty-owner data") {
+    peek(responseNetwork_in, ResponseMsg) {
+      assert(is_valid(tbe));
+      tbe.DataBlk := in_msg.DataBlk;
+      tbe.DataBlkValid.fillMask();
+      tbe.DataBlk.copyPartial(tbe.DmaDataBlk, tbe.DmaAccessMask);
+      assert(tbe.DataBlkValid.isFull());
+      enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_WB;
+        out_msg.Sender := in_msg.Sender;
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.Len := 0;
+      }
+    }
+  }
+
+  action(qwf_queueSavedFullDMAWrite, "qwf",
+         desc="Publish a saved complete DMA line after clean replacement") {
     assert(is_valid(tbe));
+    assert(tbe.DmaAccessMask.isFull());
     enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
-      out_msg.addr := tbe.PhysicalAddress;
+      out_msg.addr := address;
       out_msg.Type := MemoryRequestType:MEMORY_WB;
-      out_msg.Sender := tbe.Requestor;
+      out_msg.Sender := machineID;
       out_msg.MessageSize := MessageSizeType:Writeback_Data;
-      out_msg.DataBlk := tbe.DataBlk;
-      out_msg.Len := tbe.Len;
+      out_msg.DataBlk := tbe.DmaDataBlk;
+      out_msg.Len := 0;
     }
   }
 
@@ -569,7 +620,7 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     j_popIncomingRequestQueue;
   }
 
-  transition({ID, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI},
+  transition({ID, ID_WF, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI},
              DDIO_WRITE) {
     zz_recycleDMAQueue;
   }
@@ -589,10 +640,21 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     kd_wakeUpDependents;
   }
 
-  transition(I, DMA_WRITE, ID_W) {
+  transition(I, DMA_WRITE_FULL, ID_W) {
     v_allocateTBE;
-    qw_queueMemoryWBRequest_partial;
+    qw_queueMemoryWBRequestDMAFull;
     j_popIncomingRequestQueue;
+  }
+
+  transition(I, DMA_WRITE_PARTIAL, ID_WF) {
+    v_allocateTBE;
+    qf_queueMemoryFetchRequestDMA;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(ID_WF, Memory_Data, ID_W) {
+    qmm_mergeMemoryDataAndWrite;
+    l_popMemQueue;
   }
 
   transition(ID_W, Memory_Ack, I) {
@@ -602,11 +664,13 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     kd_wakeUpDependents;
   }
 
-  transition({ID, ID_W, M_DRDI, M_DWRI, IM, MI}, {Fetch, Data} ) {
+  transition({ID, ID_WF, ID_W, M_DRDI, M_DWRI, IM, MI},
+             {Fetch, Data}) {
     z_stallAndWaitRequest;
   }
 
-  transition({ID, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI}, {DMA_WRITE, DMA_READ} ) {
+  transition({ID, ID_WF, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI},
+             {DMA_WRITE_FULL, DMA_WRITE_PARTIAL, DMA_READ}) {
     zz_recycleDMAQueue;
   }
 
@@ -639,23 +703,28 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     kd_wakeUpDependents;
   }
 
-  transition(M, DMA_WRITE, M_DWR) {
+  transition(M, {DMA_WRITE_FULL, DMA_WRITE_PARTIAL}, M_DWR) {
     v_allocateTBE;
     inv_sendCacheInvalidate;
     j_popIncomingRequestQueue;
   }
 
   transition(M_DWR, Data, M_DWRI) {
-    qw_queueMemoryWBRequest_partialTBE;
+    qw_mergeOwnerDataAndWrite;
     k_popIncomingResponseQueue;
   }
 
-  // As for the read race, do not recycle the clean replacement: its L2 is
-  // waiting for this ACK. Replay the original DMA write from the TBE and let
-  // ID_W produce the sole DMA completion after memory commits it.
+  // A clean owner supplied no data because memory is current. Full requests
+  // can publish directly; masked requests must fetch the untouched bytes.
   transition(M_DWR, CleanReplacement, ID_W) {
     a_sendAck;
-    qwt_queueMemoryWBRequestDMATBE;
+    qwf_queueSavedFullDMAWrite;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(M_DWR, CleanReplacementPartial, ID_WF) {
+    a_sendAck;
+    qft_queueMemoryFetchRequestDMATBE;
     k_popIncomingResponseQueue;
   }
 

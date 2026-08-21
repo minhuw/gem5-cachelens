@@ -187,6 +187,7 @@ class MESITwoLevelCacheHierarchy(
                     version=i,
                     in_ports=port,
                     ruby_system=self.ruby_system,
+                    supports_masked_writes=True,
                 )
                 self._dma_controllers.append(ctrl)
                 ctrl.ruby_system = self.ruby_system

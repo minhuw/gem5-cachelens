@@ -26,8 +26,6 @@
 
 import os
 import re
-import subprocess
-from pathlib import Path
 
 from testlib import *
 from testlib import test_util
@@ -42,10 +40,35 @@ _CONFIG = joinpath(
     "mesi_ddio_directed.py",
 )
 _PREFIX = "system.ruby.l2_cntrl0.L2cache."
-_PARTIAL_REJECTION = (
-    "MESI DDIO classified NIC DMA writes require one aligned full cache "
-    "line; partial writes are unsupported until Plan 004"
-)
+
+
+class DMASequencerCapabilityVerifier(verifier.Verifier):
+    def test(self, params):
+        tempdir = params.fixtures[constants.tempdir_fixture_name].path
+        config_path = joinpath(tempdir, constants.gem5_simulation_config_ini)
+        if not os.path.isfile(config_path):
+            test_util.fail(f"Could not find gem5 config file: {config_path}")
+
+        with open(config_path, encoding="utf-8") as config_file:
+            config_text = config_file.read()
+        sections = re.findall(
+            r"(?ms)^\[([^]]+)\]\n(.*?)(?=^\[|\Z)", config_text
+        )
+        dma_sections = {
+            name: body
+            for name, body in sections
+            if re.search(r"(?m)^type=DMASequencer$", body)
+        }
+        if not dma_sections:
+            test_util.fail("MESI_Two_Level config has no DMASequencer")
+        for name, body in dma_sections.items():
+            if not re.search(
+                r"(?m)^supports_masked_writes=true$", body
+            ):
+                test_util.fail(
+                    f"MESI_Two_Level DMASequencer {name} did not "
+                    "explicitly enable masked writes"
+                )
 
 
 class MESIDDIOStatsVerifier(verifier.Verifier):
@@ -130,6 +153,7 @@ def _register(
                     rf".*MESI DDIO directed scenario '{scenario}' passed"
                 )
             ),
+            DMASequencerCapabilityVerifier(),
             MESIDDIOStatsVerifier(expected, minimum, runtime_expected),
         ),
         config=_CONFIG,
@@ -143,66 +167,6 @@ def _register(
         length=constants.quick_tag,
         protocol="MESI_Two_Level",
     )
-
-
-def _register_partial_rejection(name, scenario):
-    def run_rejection(params):
-        tempdir = Path(
-            params.fixtures[constants.tempdir_fixture_name].path
-        )
-        gem5 = params.fixtures[constants.gem5_binary_fixture_name].path
-        output_dir = tempdir / scenario
-        result = subprocess.run(
-            (
-                gem5,
-                "-d",
-                output_dir.as_posix(),
-                _CONFIG,
-                f"--scenario={scenario}",
-                "--ddio-way-part=1",
-                "--abs-max-tick=10000000",
-            ),
-            cwd=config.base_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        print(result.stdout)
-        if result.returncode == 0:
-            test_util.fail(
-                f"Classified partial-write scenario {scenario} silently "
-                "completed"
-            )
-        if _PARTIAL_REJECTION not in result.stdout:
-            test_util.fail(
-                f"Scenario {scenario} failed without the deterministic "
-                "Plan 004 partial-write rejection"
-            )
-        if f"directed scenario '{scenario}' passed" in result.stdout:
-            test_util.fail(
-                f"Scenario {scenario} reported completion after rejection"
-            )
-
-    for host in constants.supported_hosts:
-        suite_name = f"{name}-X86-{host}-opt-MESI_Two_Level"
-        TestSuite(
-            name=suite_name,
-            fixtures=(
-                Gem5Fixture(
-                    constants.x86_tag,
-                    constants.opt_tag,
-                    protocol="MESI_Two_Level",
-                ),
-                TempdirFixture(),
-            ),
-            tests=(TestFunction(run_rejection, name=suite_name),),
-            tags=(
-                constants.x86_tag,
-                constants.opt_tag,
-                constants.quick_tag,
-                host,
-            ),
-        )
 
 
 _register(
@@ -440,7 +404,7 @@ _register(
         "system.ruby.DMA_Controller.Data": 1,
         "system.ruby.DMA_Controller.WriteRequest": 2,
         "system.ruby.DMA_Controller.Ack": 2,
-        "system.ruby.Directory_Controller.M.DMA_WRITE": 1,
+        "system.ruby.Directory_Controller.M.DMA_WRITE_PARTIAL": 1,
         "system.ruby.Directory_Controller.M_DWR.Data": 1,
         "system.ruby.Directory_Controller.M_DWR.CleanReplacement": 0,
         "system.ruby.Directory_Controller.M_DWRI.Memory_Ack": 1,
@@ -536,7 +500,7 @@ _register(
         "system.ruby.DMA_Controller.Data": 1,
         "system.ruby.DMA_Controller.WriteRequest": 6,
         "system.ruby.DMA_Controller.Ack": 6,
-        "system.ruby.Directory_Controller.M.DMA_WRITE": 1,
+        "system.ruby.Directory_Controller.M.DMA_WRITE_FULL": 1,
         "system.ruby.Directory_Controller.M_DWR.CleanReplacement": 1,
         "system.ruby.Directory_Controller.M_DWR.Data": 0,
         "system.ruby.Directory_Controller.ID_W.Memory_Ack": 6,
@@ -545,15 +509,359 @@ _register(
     },
 )
 
-_register_partial_rejection(
-    "mesi-ddio-rejects-classified-one-byte-write",
+_register(
+    "mesi-ddio-retained-aligned-one-byte-write",
     "partial_one_byte",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 1,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 0,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::total": 1,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 1,
+        "ddioOwnershipAcks": 1,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 1,
+        "system.ruby.DMA_Controller.Data": 1,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WF.Mem_Data": 1,
+        "system.ruby.L2Cache_Controller.DM_WI.Ddio_Ack": 1,
+        "system.ruby.Directory_Controller.M.DDIO_WRITE": 1,
+    },
 )
-_register_partial_rejection(
-    "mesi-ddio-rejects-classified-unaligned-write",
+
+_register(
+    "mesi-ddio-retained-unaligned-partial-write",
     "partial_unaligned",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 1,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 0,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::total": 1,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 1,
+        "ddioOwnershipAcks": 1,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 1,
+        "system.ruby.DMA_Controller.Data": 1,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WF.Mem_Data": 1,
+        "system.ruby.L2Cache_Controller.DM_WI.Ddio_Ack": 1,
+        "system.ruby.Directory_Controller.M.DDIO_WRITE": 1,
+    },
 )
-_register_partial_rejection(
-    "mesi-ddio-rejects-classified-cross-line-write",
+
+_register(
+    "mesi-ddio-partial-hit-in-l2-m",
+    "partial_l2_m",
+    {
+        "rxPayloadRequests": 2,
+        "rxPayloadHits": 1,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 1,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 0,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::total": 2,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 1,
+        "ddioOwnershipAcks": 1,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 1,
+        "system.ruby.DMA_Controller.Data": 1,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_FULL": 1,
+        "system.ruby.L2Cache_Controller.M.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WI.Ddio_Ack": 1,
+        "system.ruby.Directory_Controller.I.DDIO_WRITE": 1,
+    },
+)
+
+_register(
+    "mesi-ddio-partial-invalidates-ss-sharers",
+    "partial_ss_sharers",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 1,
+        "rxPayloadMisses": 0,
+        "txPayloadRequests": 1,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 0,
+        "ddioWayFill::cpu_other_way0": 1,
+        "ddioWayFill::total": 1,
+        "ddioWayAccess::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::cpu_other_way0": 3,
+        "ddioWayAccess::total": 5,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 0,
+        "ddioOwnershipAcks": 0,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 1,
+        "system.ruby.DMA_Controller.Data": 1,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.SS.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WS.Ack": 1,
+        "system.ruby.L2Cache_Controller.DM_WS.Ack_all": 1,
+        "system.ruby.L2Cache_Controller.DM_WS.WB_Data": 0,
+    },
+)
+
+_register(
+    "mesi-ddio-partial-merges-dirty-private-owner",
+    "partial_dirty_owner",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 1,
+        "rxPayloadMisses": 0,
+        "txPayloadRequests": 1,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 0,
+        "ddioWayFill::cpu_other_way0": 1,
+        "ddioWayFill::total": 1,
+        "ddioWayAccess::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::total": 2,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 0,
+        "ddioOwnershipAcks": 0,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 1,
+        "system.ruby.DMA_Controller.Data": 1,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.MT.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WM.WB_Data": 1,
+        "system.ruby.L2Cache_Controller.DM_WM.Ack_all": 0,
+    },
+)
+
+_register(
+    "mesi-ddio-no-retention-partial-clean-and-dirty-owner",
+    "partial_no_retention",
+    {
+        "rxPayloadRequests": 2,
+        "rxPayloadHits": 1,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 2,
+        "txPayloadHits": 0,
+        "txPayloadMisses": 2,
+        "ddioWayFill::cpu_other_way0": 1,
+        "ddioWayFill::total": 1,
+        "ddioWayAccess::nic_rx_payload_way0": 1,
+        "ddioWayAccess::total": 1,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 4,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 0,
+        "ddioOwnershipAcks": 0,
+    },
+    ddio_way_part=-1,
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 2,
+        "system.ruby.DMA_Controller.Data": 2,
+        "system.ruby.DMA_Controller.WriteRequest": 4,
+        "system.ruby.DMA_Controller.Ack": 4,
+        "system.ruby.Directory_Controller.I.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.Directory_Controller.ID_WF.Memory_Data": 1,
+        "system.ruby.Directory_Controller.M.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.Directory_Controller.M_DWR.Data": 1,
+        "system.ruby.Directory_Controller.M_DWRI.Memory_Ack": 1,
+        "system.ruby.L2Cache_Controller.MT.MEM_Inv": 1,
+    },
+)
+
+_register(
+    "mesi-ddio-contiguous-cross-line-partial-write",
     "partial_cross_line",
+    {
+        "rxPayloadRequests": 2,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 2,
+        "txPayloadRequests": 2,
+        "txPayloadHits": 2,
+        "txPayloadMisses": 0,
+        "ddioWayFill::nic_rx_payload_way0": 2,
+        "ddioWayFill::total": 2,
+        "ddioWayAccess::nic_tx_payload_way0": 2,
+        "ddioWayAccess::total": 2,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 2,
+        "ddioOwnershipAcks": 2,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 2,
+        "system.ruby.DMA_Controller.Data": 2,
+        "system.ruby.DMA_Controller.WriteRequest": 4,
+        "system.ruby.DMA_Controller.Ack": 4,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 2,
+        "system.ruby.L2Cache_Controller.DM_WF.Mem_Data": 2,
+        "system.ruby.L2Cache_Controller.DM_WI.Ddio_Ack": 2,
+        "system.ruby.Directory_Controller.M.DDIO_WRITE": 2,
+    },
+)
+
+_register(
+    "mesi-ddio-sparse-byte-enable-write",
+    "sparse_mask",
+    {
+        "rxPayloadRequests": 3,
+        "rxPayloadHits": 1,
+        "rxPayloadMisses": 2,
+        "txPayloadRequests": 3,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 2,
+        "ddioWayFill::nic_rx_payload_way0": 2,
+        "ddioWayFill::total": 2,
+        "ddioWayAccess::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::total": 2,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 2,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 1,
+        "ddioOwnershipRequests": 2,
+        "ddioOwnershipAcks": 2,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 3,
+        "system.ruby.DMA_Controller.Data": 3,
+        "system.ruby.DMA_Controller.WriteRequest": 6,
+        "system.ruby.DMA_Controller.Ack": 6,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 2,
+        "system.ruby.L2Cache_Controller.M.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WF.Mem_Data": 2,
+        "system.ruby.L2Cache_Controller.DM_WI.Ddio_Ack": 2,
+    },
+)
+
+_register(
+    "mesi-ddio-partial-subset-replacement-race",
+    "partial_subset_race",
+    {
+        "rxPayloadRequests": 3,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 3,
+        "txPayloadRequests": 0,
+        "ddioWayFill::nic_rx_payload_way0": 3,
+        "ddioWayFill::total": 3,
+        "wayDeallocations::way0": 3,
+        "wayDeallocations::total": 3,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 3,
+        "ddioOwnershipRequests": 3,
+        "ddioOwnershipAcks": 3,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 3,
+        "system.ruby.DMA_Controller.Data": 3,
+        "system.ruby.DMA_Controller.WriteRequest": 5,
+        "system.ruby.DMA_Controller.Ack": 5,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 2,
+        "system.ruby.L2Cache_Controller.DM_WF.Mem_Data": 2,
+        "system.ruby.L2Cache_Controller.DM_WI.DDIO_Replacement": 1,
+        "system.ruby.L2Cache_Controller.DM_WI.Ddio_Ack": 3,
+        "system.ruby.Directory_Controller.M.DDIO_WRITE": 2,
+        "system.ruby.Directory_Controller.I.DDIO_WRITE": 1,
+    },
+)
+
+_register(
+    "mesi-ddio-zero-byte-enable-is-no-op",
+    "zero_mask",
+    {
+        "rxPayloadRequests": 0,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 0,
+        "txPayloadRequests": 1,
+        "txPayloadHits": 0,
+        "txPayloadMisses": 1,
+        "ddioWayFill::total": 0,
+        "ddioWayAccess::total": 0,
+        "dmaRoutingProxyRequests": 1,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 0,
+        "ddioOwnershipAcks": 0,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 1,
+        "system.ruby.DMA_Controller.Data": 1,
+        "system.ruby.DMA_Controller.WriteRequest": 1,
+        "system.ruby.DMA_Controller.Ack": 1,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 0,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_FULL": 0,
+    },
+)
+
+_register(
+    "mesi-ddio-generic-partial-write-races-clean-l2-replacement",
+    "clean_replacement_dma_partial_write",
+    {
+        "rxPayloadRequests": 0,
+        "txPayloadRequests": 0,
+        "ddioWayFill::cpu_other_way0": 2,
+        "ddioWayFill::cpu_other_way1": 1,
+        "ddioWayFill::cpu_other_way2": 1,
+        "ddioWayFill::cpu_other_way3": 1,
+        "ddioWayFill::total": 5,
+        "ddioWayAccess::total": 0,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 0,
+        "ddioOwnershipAcks": 0,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 1,
+        "system.ruby.DMA_Controller.Data": 1,
+        "system.ruby.DMA_Controller.WriteRequest": 6,
+        "system.ruby.DMA_Controller.Ack": 6,
+        "system.ruby.Directory_Controller.M.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.Directory_Controller.M_DWR.CleanReplacementPartial": 1,
+        "system.ruby.Directory_Controller.M_DWR.Data": 0,
+        "system.ruby.Directory_Controller.ID_WF.Memory_Data": 1,
+        "system.ruby.Directory_Controller.ID_W.Memory_Ack": 6,
+        "system.ruby.L2Cache_Controller.M.L2_Replacement_clean": 1,
+        "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
+    },
 )

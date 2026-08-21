@@ -40,13 +40,17 @@
 
 #include "mem/ruby/system/DMASequencer.hh"
 
+#include <limits>
 #include <memory>
+#include <utility>
 
+#include "base/logging.hh"
 #include "debug/RubyDma.hh"
 #include "debug/RubyStats.hh"
 #include "mem/ruby/protocol/SequencerMsg.hh"
 #include "mem/ruby/protocol/SequencerRequestType.hh"
 #include "mem/ruby/system/RubySystem.hh"
+#include "sim/eventq.hh"
 
 namespace gem5
 {
@@ -72,16 +76,18 @@ setFragmentMetadata(SequencerMsg &msg, const DMARequestFragment &fragment)
 
 DMARequest::DMARequest(uint64_t start_paddr, int len, bool write,
                        int bytes_completed, int bytes_issued, uint8_t *data,
-                       PacketPtr pkt)
+                       PacketPtr pkt, std::vector<bool> byte_enable)
     : start_paddr(start_paddr), len(len), write(write),
       bytes_completed(bytes_completed), bytes_issued(bytes_issued), data(data),
-      pkt(pkt), seqReq(pkt ? pkt->req : nullptr)
+      pkt(pkt), seqReq(pkt ? pkt->req : nullptr),
+      byteEnable(std::move(byte_enable))
 {
 }
 
 DMASequencer::DMASequencer(const Params &p)
     : RubyPort(p), m_outstanding_count(0),
-      m_max_outstanding_requests(p.max_outstanding_requests)
+      m_max_outstanding_requests(p.max_outstanding_requests),
+      m_supports_masked_writes(p.supports_masked_writes)
 {
 }
 
@@ -95,166 +101,215 @@ DMASequencer::init()
 RequestStatus
 DMASequencer::makeRequest(PacketPtr pkt)
 {
-    if (m_outstanding_count == m_max_outstanding_requests) {
+    const bool is_masked_write = pkt->isMaskedWrite();
+    panic_if(!isSupportedDMARequest(is_masked_write,
+                                    m_supports_masked_writes),
+             "DMASequencer %s rejected a masked DMA write because "
+             "supports_masked_writes is false",
+             name());
+
+    if (m_outstanding_count >= m_max_outstanding_requests) {
         return RequestStatus_BufferFull;
     }
 
-    Addr paddr = pkt->getAddr();
-    int len = pkt->getSize();
-    bool write = pkt->isWrite();
+    const Addr paddr = pkt->getAddr();
+    const int len = pkt->getSize();
+    const bool write = pkt->isWrite();
+    panic_if(len <= 0, "DMA request at %#x has invalid size %d", paddr, len);
+    panic_if(paddr > std::numeric_limits<Addr>::max() -
+                     static_cast<Addr>(len - 1),
+             "DMA request at %#x with size %d wraps the address space",
+             paddr, len);
 
-    // Ruby DMA data/completion handling still assumes contiguous writes.
-    // Preserve the existing rejection until Plan 004 can merge byte enables
-    // without changing generic DMA semantics. Supported fragments still carry
-    // an exact contiguous, cache-line-sized mask below.
-    assert(isSupportedDMARequest(pkt->isMaskedWrite()));
-    uint8_t* data = pkt->getPtr<uint8_t>();
+    std::vector<bool> byte_enable(len, true);
+    if (write) {
+        byte_enable = pkt->req->getByteEnable();
+        panic_if(byte_enable.size() != static_cast<size_t>(len),
+                 "DMA write at %#x has %zu byte enables for %d bytes",
+                 paddr, byte_enable.size(), len);
+    }
+
+    // An all-disabled write is a successful no-op. Complete it on the next
+    // Ruby clock edge so recvTimingReq can return before its response arrives.
+    if (write && !hasEnabledDMABytes(byte_enable)) {
+        ++m_outstanding_count;
+        schedule(new EventFunctionWrapper(
+                     [this, pkt] { completeZeroEnabledRequest(pkt); },
+                     name() + ".zero_enabled_dma", true),
+                 clockEdge(Cycles(1)));
+        return RequestStatus_Issued;
+    }
+
+    uint8_t *data = write
+        ? const_cast<uint8_t *>(pkt->getConstPtr<uint8_t>())
+        : pkt->getPtr<uint8_t>();
 
     assert(m_outstanding_count < m_max_outstanding_requests);
     const int blk_size = m_ruby_system->getBlockSizeBytes();
-    const Addr line_addr = makeLineAddress(paddr);
+    Addr request_address = 0;
 
-    // Reserve the complete line span before admitting the request. RubyPort
-    // will retry an aliased packet after an active request completes.
-    if (!m_lineReservations.tryReserve(paddr, len, blk_size)) {
-        DPRINTF(RubyDma, "DMA aliased: addr %p, len %d\n", line_addr, len);
+    // Reserve exactly the lines carrying enabled bytes before admission.
+    // Reads use an all-enabled mask and retain their existing full-span
+    // reservation behavior.
+    if (!m_lineReservations.tryReserve(
+            paddr, len, blk_size, byte_enable, request_address)) {
+        DPRINTF(RubyDma, "DMA aliased: addr %p, len %d\n",
+                makeLineAddress(paddr), len);
         return RequestStatus_Aliased;
     }
 
-    auto emplace_pair =
-        m_RequestTable.emplace(std::piecewise_construct,
-                               std::forward_as_tuple(line_addr),
-                               std::forward_as_tuple(paddr, len, write, 0,
-                                                     0, data, pkt));
-    assert(emplace_pair.second);
-    DMARequest& active_request = emplace_pair.first->second;
-
-    DPRINTF(RubyDma, "DMA req created: addr %p, len %d\n", line_addr, len);
-
-    std::shared_ptr<SequencerMsg> msg =
-        std::make_shared<SequencerMsg>(clockEdge(), blk_size, m_ruby_system);
-    const auto fragment = makeDMARequestFragment(
-        active_request.start_paddr, active_request.len,
-        active_request.bytes_issued, blk_size, active_request.seqReq);
-    assert(fragment.lineAddress == line_addr);
-    setFragmentMetadata(*msg, fragment);
-
-    if (pkt->req->isAtomic()) {
-        msg->setType(SequencerRequestType_ATOMIC);
-
-        // While regular LD/ST can support DMAs spanning multiple cache lines,
-        // atomic requests are only supported within a single cache line. The
-        // atomic request will end upon atomicCallback and not call issueNext.
-        int block_size = m_ruby_system->getBlockSizeBytes();
-        int atomic_offset = pkt->getAddr() - line_addr;
-        assert(atomic_offset + pkt->getSize() <= block_size);
-
-        std::vector<std::pair<int, AtomicOpFunctor*>> atomic_ops;
-        std::pair<int, AtomicOpFunctor*>
-            atomic_op(atomic_offset, pkt->getAtomicOp());
-
-        atomic_ops.emplace_back(atomic_op);
-        msg->getwriteMask().setAtomicOps(atomic_ops);
-    } else if (write) {
-        msg->setType(SequencerRequestType_ST);
-    } else {
-        assert(pkt->isRead());
-        msg->setType(SequencerRequestType_LD);
+    auto emplace_pair = m_RequestTable.emplace(
+        std::piecewise_construct,
+        std::forward_as_tuple(request_address),
+        std::forward_as_tuple(paddr, len, write, 0, 0, data, pkt,
+                              std::move(byte_enable)));
+    if (!emplace_pair.second) {
+        panic_if(!m_lineReservations.release(request_address),
+                 "DMA request-table collision left invalid reservations");
+        return RequestStatus_Aliased;
     }
 
-    int offset = paddr & m_data_block_mask;
+    DPRINTF(RubyDma, "DMA req created: addr %p, len %d\n",
+            request_address, len);
 
-    if (write && (data != NULL)) {
-        if (active_request.data != NULL) {
-            msg->getDataBlk().setData(data, offset, msg->getLen());
-        }
-    }
-
-    m_outstanding_count++;
-
-    assert(m_mandatory_q_ptr != NULL);
-    m_mandatory_q_ptr->enqueue(msg, clockEdge(), cyclesToTicks(Cycles(1)),
-        m_ruby_system->getRandomization(), m_ruby_system->getWarmupEnabled());
-    active_request.bytes_issued += fragment.len;
-
+    ++m_outstanding_count;
+    issueRequestFragment(request_address);
     return RequestStatus_Issued;
 }
 
 void
-DMASequencer::issueNext(const Addr& address)
+DMASequencer::issueRequestFragment(const Addr &request_address)
 {
-    RequestTable::iterator i = m_RequestTable.find(address);
-    assert(i != m_RequestTable.end());
+    auto request_it = m_RequestTable.find(request_address);
+    assert(request_it != m_RequestTable.end());
+    DMARequest &active_request = request_it->second;
+    const int blk_size = m_ruby_system->getBlockSizeBytes();
 
-    DMARequest &active_request = i->second;
+    int next_offset = active_request.bytes_completed;
+    while (next_offset < active_request.len) {
+        const auto candidate = makeDMARequestFragment(
+            active_request.start_paddr, active_request.len, next_offset,
+            blk_size, active_request.seqReq, active_request.byteEnable);
+        if (candidate.hasEnabledBytes()) {
+            active_request.bytes_completed = candidate.requestOffset;
+            active_request.bytes_issued =
+                candidate.requestOffset + candidate.len;
 
+            auto msg = std::make_shared<SequencerMsg>(
+                clockEdge(), blk_size, m_ruby_system);
+            setFragmentMetadata(*msg, candidate);
+
+            if (active_request.pkt->req->isAtomic()) {
+                msg->setType(SequencerRequestType_ATOMIC);
+
+                // Atomic DMA requests remain single-line operations.
+                const int atomic_offset =
+                    active_request.pkt->getAddr() - candidate.lineAddress;
+                assert(candidate.requestOffset == 0);
+                assert(candidate.len == active_request.len);
+                assert(atomic_offset + active_request.pkt->getSize() <=
+                       blk_size);
+
+                std::vector<std::pair<int, AtomicOpFunctor *>> atomic_ops;
+                atomic_ops.emplace_back(
+                    atomic_offset, active_request.pkt->getAtomicOp());
+                msg->getwriteMask().setAtomicOps(atomic_ops);
+            } else if (active_request.write) {
+                msg->setType(SequencerRequestType_ST);
+            } else {
+                assert(active_request.pkt->isRead());
+                msg->setType(SequencerRequestType_LD);
+            }
+
+            if (active_request.write && active_request.data != nullptr) {
+                setDMARequestFragmentData(
+                    msg->getDataBlk(), candidate, active_request.data);
+            }
+
+            assert(m_mandatory_q_ptr != nullptr);
+            m_mandatory_q_ptr->enqueue(
+                msg, clockEdge(), cyclesToTicks(Cycles(1)),
+                m_ruby_system->getRandomization(),
+                m_ruby_system->getWarmupEnabled());
+
+            DPRINTF(RubyDma,
+                    "DMA fragment issued: request %p, line %p, "
+                    "offset %d, len %d, enabled %d\n",
+                    request_address, candidate.lineAddress,
+                    candidate.requestOffset, candidate.len,
+                    candidate.accessMask.count());
+            return;
+        }
+        next_offset += candidate.len;
+    }
+
+    completeRequest(request_address);
+}
+
+void
+DMASequencer::issueNext(const Addr &request_address)
+{
+    auto request_it = m_RequestTable.find(request_address);
+    assert(request_it != m_RequestTable.end());
+
+    DMARequest &active_request = request_it->second;
     assert(m_outstanding_count <= m_max_outstanding_requests);
     active_request.bytes_completed = active_request.bytes_issued;
-    if (active_request.len == active_request.bytes_completed) {
-        DPRINTF(RubyDma, "DMA request completed: addr %p, size %d\n",
-                address, active_request.len);
-        PacketPtr pkt = active_request.pkt;
-        const bool released = m_lineReservations.release(address);
-        assert(released);
-        m_outstanding_count--;
-        m_RequestTable.erase(i);
-        ruby_hit_callback(pkt);
-        return;
-    }
+    issueRequestFragment(request_address);
+}
 
-    int blk_size = m_ruby_system->getBlockSizeBytes();
+void
+DMASequencer::completeRequest(const Addr &request_address)
+{
+    auto request_it = m_RequestTable.find(request_address);
+    assert(request_it != m_RequestTable.end());
+    DMARequest &active_request = request_it->second;
 
-    std::shared_ptr<SequencerMsg> msg =
-        std::make_shared<SequencerMsg>(clockEdge(), blk_size, m_ruby_system);
-    const auto fragment = makeDMARequestFragment(
-        active_request.start_paddr, active_request.len,
-        active_request.bytes_completed, blk_size, active_request.seqReq);
-    assert((fragment.physicalAddress & m_data_block_mask) == 0);
-    setFragmentMetadata(*msg, fragment);
+    DPRINTF(RubyDma, "DMA request completed: addr %p, size %d\n",
+            request_address, active_request.len);
+    PacketPtr pkt = active_request.pkt;
+    panic_if(!m_lineReservations.release(request_address),
+             "Completed DMA request %#x had no line reservations",
+             request_address);
+    --m_outstanding_count;
+    m_RequestTable.erase(request_it);
+    ruby_hit_callback(pkt);
+    testDrainComplete();
+}
 
-    msg->getType() = (active_request.write ? SequencerRequestType_ST :
-                     SequencerRequestType_LD);
-
-    if (active_request.write) {
-        msg->getDataBlk().
-            setData(&active_request.data[active_request.bytes_completed],
-                    0, fragment.len);
-    }
-
-    assert(m_mandatory_q_ptr != NULL);
-    m_mandatory_q_ptr->enqueue(msg, clockEdge(), cyclesToTicks(Cycles(1)),
-        m_ruby_system->getRandomization(), m_ruby_system->getWarmupEnabled());
-    active_request.bytes_issued += fragment.len;
-    DPRINTF(RubyDma,
-            "DMA request bytes issued %d, bytes completed %d, total len %d\n",
-            active_request.bytes_issued, active_request.bytes_completed,
-            active_request.len);
+void
+DMASequencer::completeZeroEnabledRequest(PacketPtr pkt)
+{
+    assert(m_outstanding_count > 0);
+    --m_outstanding_count;
+    ruby_hit_callback(pkt);
+    testDrainComplete();
 }
 
 Addr
 DMASequencer::requestAddressForCallback(const Addr &address) const
 {
     Addr request_address = 0;
-    const bool found = m_lineReservations.findRequest(
-        address, request_address);
-    assert(found);
+    panic_if(!m_lineReservations.findRequest(address, request_address),
+             "DMA callback for unreserved line %#x", address);
     return request_address;
 }
 
 void
-DMASequencer::dataCallback(const DataBlock & dblk, const Addr& address)
+DMASequencer::dataCallback(const DataBlock &dblk, const Addr &address)
 {
     const Addr request_address = requestAddressForCallback(address);
-    RequestTable::iterator i = m_RequestTable.find(request_address);
-    assert(i != m_RequestTable.end());
+    auto request_it = m_RequestTable.find(request_address);
+    assert(request_it != m_RequestTable.end());
 
-    DMARequest &active_request = i->second;
-    int len = active_request.bytes_issued - active_request.bytes_completed;
-    int offset = 0;
-    if (active_request.bytes_completed == 0)
-        offset = active_request.start_paddr & m_data_block_mask;
+    DMARequest &active_request = request_it->second;
+    const int len =
+        active_request.bytes_issued - active_request.bytes_completed;
+    const Addr fragment_address =
+        active_request.start_paddr + active_request.bytes_completed;
+    const int offset = fragment_address & m_data_block_mask;
     assert(!active_request.write);
-    if (active_request.data != NULL) {
+    if (active_request.data != nullptr) {
         memcpy(&active_request.data[active_request.bytes_completed],
                dblk.getData(offset, len), len);
     }
@@ -262,7 +317,7 @@ DMASequencer::dataCallback(const DataBlock & dblk, const Addr& address)
 }
 
 void
-DMASequencer::ackCallback(const Addr& address)
+DMASequencer::ackCallback(const Addr &address)
 {
     const Addr request_address = requestAddressForCallback(address);
     assert(m_RequestTable.find(request_address) != m_RequestTable.end());
@@ -270,24 +325,26 @@ DMASequencer::ackCallback(const Addr& address)
 }
 
 void
-DMASequencer::atomicCallback(const DataBlock& dblk, const Addr& address)
+DMASequencer::atomicCallback(const DataBlock &dblk, const Addr &address)
 {
     const Addr request_address = requestAddressForCallback(address);
-    RequestTable::iterator i = m_RequestTable.find(request_address);
-    assert(i != m_RequestTable.end());
+    auto request_it = m_RequestTable.find(request_address);
+    assert(request_it != m_RequestTable.end());
 
-    DMARequest &active_request = i->second;
+    DMARequest &active_request = request_it->second;
     PacketPtr pkt = active_request.pkt;
 
-    int offset = active_request.start_paddr & m_data_block_mask;
+    const int offset = active_request.start_paddr & m_data_block_mask;
     memcpy(pkt->getPtr<uint8_t>(), dblk.getData(offset, pkt->getSize()),
            pkt->getSize());
 
-    const bool released = m_lineReservations.release(request_address);
-    assert(released);
-    m_outstanding_count--;
-    m_RequestTable.erase(i);
+    panic_if(!m_lineReservations.release(request_address),
+             "Completed atomic DMA request %#x had no line reservations",
+             request_address);
+    --m_outstanding_count;
+    m_RequestTable.erase(request_it);
     ruby_hit_callback(pkt);
+    testDrainComplete();
 }
 
 void
