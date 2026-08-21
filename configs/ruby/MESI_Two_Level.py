@@ -211,6 +211,7 @@ def create_system(
         dma_cntrl = DMA_Controller(
             version=i,
             dma_sequencer=dma_seq,
+            l2_select_num_bits=l2_bits,
             transitions_per_cycle=options.ports,
             ruby_system=ruby_system,
         )
@@ -236,6 +237,7 @@ def create_system(
         io_controller = DMA_Controller(
             version=len(dma_ports),
             dma_sequencer=io_seq,
+            l2_select_num_bits=l2_bits,
             ruby_system=ruby_system,
         )
         ruby_system.io_controller = io_controller

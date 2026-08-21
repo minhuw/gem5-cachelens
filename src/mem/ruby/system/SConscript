@@ -55,8 +55,7 @@ if env['CONF']['BUILD_GPU']:
 
 Source('CacheRecorder.cc')
 Source('DMASequencer.cc')
-GTest('dma_sequencer.test', 'dma_sequencer.test.cc',
-      '../../../sim/cur_tick.cc')
+GTest('dma_sequencer.test', 'dma_sequencer.test.cc')
 if env['CONF']['BUILD_GPU']:
     Source('GPUCoalescer.cc')
 Source('HTMSequencer.cc')

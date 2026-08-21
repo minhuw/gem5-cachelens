@@ -279,6 +279,12 @@ class CacheMemory : public SimObject
 
           statistics::Vector m_accessModeType;
 
+          // MESI classified-DMA routing telemetry. These counters describe
+          // proxy routing only and are separate from DDIO cache hit
+          // statistics.
+          statistics::Scalar dmaRoutingProxyRequests;
+          statistics::Scalar dmaRoutingTransientRecycles;
+
           // DDIO (NIC RX data DMA write) accounting. A request is a packet
           // data line transaction seen by this cache; a hit means the line
           // was already present at acceptance.
@@ -342,6 +348,15 @@ class CacheMemory : public SimObject
       void profileDemandMiss();
       void profilePrefetchHit();
       void profilePrefetchMiss();
+
+      void profileDmaRoutingProxy()
+      {
+          cacheMemoryStats.dmaRoutingProxyRequests++;
+      }
+      void profileDmaRoutingTransientRecycle()
+      {
+          cacheMemoryStats.dmaRoutingTransientRecycles++;
+      }
 
       // DDIO accounting hooks (called from the CHI home node).
       // profileRxPayload/profileRxHeader count one line transaction and record

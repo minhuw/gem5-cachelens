@@ -326,6 +326,18 @@ getRequestorID(RequestPtr req)
     return req->requestorId();
 }
 
+inline bool
+isNicDmaRead(RequestPtr req)
+{
+    return req && req->isNicDmaRead();
+}
+
+inline bool
+isNicDmaWrite(RequestPtr req)
+{
+    return req && req->isNicDmaWrite();
+}
+
 } // namespace ruby
 } // namespace gem5
 

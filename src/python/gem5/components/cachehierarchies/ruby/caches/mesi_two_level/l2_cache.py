@@ -43,7 +43,12 @@ class L2Cache(MESI_Two_Level_L2Cache_Controller):
         return cls._version - 1
 
     def __init__(
-        self, l2_size, l2_assoc, network, num_l2Caches, cache_line_size
+        self,
+        l2_size,
+        l2_assoc,
+        network,
+        l2_select_num_bits,
+        cache_line_size,
     ):
         super().__init__()
 
@@ -55,15 +60,13 @@ class L2Cache(MESI_Two_Level_L2Cache_Controller):
         self.L2cache = RubyCache(
             size=l2_size,
             assoc=l2_assoc,
-            start_index_bit=self.getIndexBit(num_l2Caches),
+            start_index_bit=self.getIndexBit(l2_select_num_bits),
         )
 
         self.transitions_per_cycle = 4
 
-    def getIndexBit(self, num_l2caches):
-        l2_bits = int(math.log(num_l2caches, 2))
-        bits = int(math.log(self._cache_line_size, 2)) + l2_bits
-        return bits
+    def getIndexBit(self, l2_select_num_bits):
+        return int(math.log(self._cache_line_size, 2)) + l2_select_num_bits
 
     def connectQueues(self, network):
         self.DirRequestFromL2Cache = MessageBuffer()

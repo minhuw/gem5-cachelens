@@ -29,6 +29,7 @@
 
 machine(MachineType:DMA, "DMA Controller")
 : DMASequencer * dma_sequencer;
+  int l2_select_num_bits;
   Cycles request_latency := 6;
 
   MessageBuffer * responseFromDir, network="From", virtual_network="1",
@@ -68,8 +69,31 @@ machine(MachineType:DMA, "DMA Controller")
 
   TBETable TBEs, template="<DMA_TBE>", constructor="m_number_of_TBEs";
 
+  int l2_select_low_bit, default="m_ruby_system->getBlockSizeBits()";
+
   Tick clockEdge();
   MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
+  MachineID mapDMARequestToMachine(Addr addr, RequestPtr seq_req,
+                                   bool is_seq_req_valid, bool is_read) {
+    if (is_seq_req_valid) {
+      if (is_read) {
+        if (isNicDmaRead(seq_req)) {
+          return mapAddressToRange(addr, MachineType:L2Cache,
+                                   l2_select_low_bit, l2_select_num_bits,
+                                   intToID(0));
+        }
+      } else {
+        if (isNicDmaWrite(seq_req)) {
+          return mapAddressToRange(addr, MachineType:L2Cache,
+                                   l2_select_low_bit, l2_select_num_bits,
+                                   intToID(0));
+        }
+      }
+    }
+
+    return mapAddressToMachine(addr, MachineType:Directory);
+  }
 
   State getState(TBE tbe, Addr addr) {
     if (is_valid(tbe)) {
@@ -145,7 +169,8 @@ machine(MachineType:DMA, "DMA Controller")
         out_msg.accessMask := in_msg.writeMask;
         out_msg.seqReq := in_msg.seqReq;
         out_msg.isSeqReqValid := in_msg.isSeqReqValid;
-        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.Destination.add(mapDMARequestToMachine(
+            address, in_msg.seqReq, in_msg.isSeqReqValid, true));
         out_msg.MessageSize := MessageSizeType:Writeback_Control;
       }
     }
@@ -164,7 +189,8 @@ machine(MachineType:DMA, "DMA Controller")
           out_msg.accessMask := in_msg.writeMask;
           out_msg.seqReq := in_msg.seqReq;
           out_msg.isSeqReqValid := in_msg.isSeqReqValid;
-          out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+          out_msg.Destination.add(mapDMARequestToMachine(
+              address, in_msg.seqReq, in_msg.isSeqReqValid, false));
           out_msg.MessageSize := MessageSizeType:Writeback_Control;
         }
       }

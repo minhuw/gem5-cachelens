@@ -241,7 +241,8 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
         if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
           trigger(Event:Memory_Data, in_msg.addr, TBEs[in_msg.addr]);
         } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
-          trigger(Event:Memory_Ack, in_msg.addr, TBEs[in_msg.addr]);
+          Addr line_addr := makeLineAddress(in_msg.addr);
+          trigger(Event:Memory_Ack, line_addr, TBEs[line_addr]);
         } else {
           DPRINTF(RubySlicc, "%s\n", in_msg.Type);
           error("Invalid message");

@@ -108,6 +108,10 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     L1_PUTX,                 desc="L1 replacing data";
     L1_PUTX_old,             desc="L1 replacing data, but no longer sharer";
 
+    // events initiated by a classified DMA request
+    DMA_READ,                desc="NIC DMA read to proxy to the directory";
+    DMA_WRITE,               desc="NIC DMA write to proxy to the directory";
+
     // events initiated by this L2
     L2_Replacement,     desc="L2 Replacement", format="!r";
     L2_Replacement_clean,     desc="L2 Replacement, but data is clean", format="!r";
@@ -367,40 +371,54 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     }  // if not ready, do nothing
   }
 
-  // L1 Request
+  // Requests from L1 caches and classified DMA controllers
   in_port(L1RequestL2Network_in, RequestMsg, L1RequestToL2Cache, rank = 0) {
     if(L1RequestL2Network_in.isReady(clockEdge())) {
       peek(L1RequestL2Network_in,  RequestMsg) {
-        Entry cache_entry := getCacheEntry(in_msg.addr);
-        TBE tbe := TBEs[in_msg.addr];
+        Addr line_addr := makeLineAddress(in_msg.addr);
+        Entry cache_entry := getCacheEntry(line_addr);
+        TBE tbe := TBEs[line_addr];
 
         DPRINTF(RubySlicc, "Addr: %#x State: %s Req: %s Type: %s Dest: %s\n",
-                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.addr, getState(tbe, cache_entry, line_addr),
                 in_msg.Requestor, in_msg.Type, in_msg.Destination);
 
-        assert(machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache);
         assert(in_msg.Destination.isElement(machineID));
 
-        if (is_valid(cache_entry)) {
-          // The L2 contains the block, so proceeded with handling the request
-          trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
-                                                in_msg.Requestor, cache_entry),
-                  in_msg.addr, cache_entry, tbe);
+        if (in_msg.Type == CoherenceRequestType:DMA_READ) {
+          assert(machineIDToMachineType(in_msg.Requestor) == MachineType:DMA);
+          trigger(Event:DMA_READ, line_addr, cache_entry, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:DMA_WRITE) {
+          assert(machineIDToMachineType(in_msg.Requestor) == MachineType:DMA);
+          trigger(Event:DMA_WRITE, line_addr, cache_entry, tbe);
         } else {
-          if (L2cache.cacheAvail(in_msg.addr)) {
-            // L2 does't have the line, but we have space for it in the L2
-            trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
-                                                  in_msg.Requestor, cache_entry),
-                    in_msg.addr, cache_entry, tbe);
+          assert(machineIDToMachineType(in_msg.Requestor) ==
+                 MachineType:L1Cache);
+
+          if (is_valid(cache_entry)) {
+            // The L2 contains the block, so proceed with handling the request.
+            trigger(L1Cache_request_type_to_event(in_msg.Type, line_addr,
+                                                  in_msg.Requestor,
+                                                  cache_entry),
+                    line_addr, cache_entry, tbe);
           } else {
-            // No room in the L2, so we need to make room before handling the request
-            Addr victim := L2cache.cacheProbe(in_msg.addr);
-            Entry L2cache_entry := getCacheEntry(victim);
-            if (isDirty(L2cache_entry)) {
-              trigger(Event:L2_Replacement, victim, L2cache_entry, TBEs[victim]);
+            if (L2cache.cacheAvail(line_addr)) {
+              // The line is absent, but this bank has room for an L1 fill.
+              trigger(L1Cache_request_type_to_event(in_msg.Type, line_addr,
+                                                    in_msg.Requestor,
+                                                    cache_entry),
+                      line_addr, cache_entry, tbe);
             } else {
-              trigger(Event:L2_Replacement_clean,
-                      victim, L2cache_entry, TBEs[victim]);
+              // L1 traffic needs a victim before its requested line can fill.
+              Addr victim := L2cache.cacheProbe(line_addr);
+              Entry L2cache_entry := getCacheEntry(victim);
+              if (isDirty(L2cache_entry)) {
+                trigger(Event:L2_Replacement, victim, L2cache_entry,
+                        TBEs[victim]);
+              } else {
+                trigger(Event:L2_Replacement_clean, victim, L2cache_entry,
+                        TBEs[victim]);
+              }
             }
           }
         }
@@ -421,6 +439,19 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
+      }
+    }
+  }
+
+  action(ad_proxyDMARequestToDirectory, "ad",
+         desc="Proxy a classified DMA request without changing it") {
+    L2cache.profileDmaRoutingProxy();
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(DirRequestL2Network_out, RequestMsg, l2_request_latency) {
+        out_msg := in_msg;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(
+            mapAddressToMachine(address, MachineType:Directory));
       }
     }
   }
@@ -798,6 +829,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     responseL2Network_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
   }
 
+  action(zdr_recycleDMARequestQueue, "zdr",
+         desc="retry DMA proxying after the line leaves its transient state") {
+    L2cache.profileDmaRoutingTransientRecycle();
+    L1RequestL2Network_in.recycle(
+        clockEdge(), cyclesToTicks(recycle_latency));
+  }
+
   action(kd_wakeUpDependents, "kd", desc="wake-up dependents") {
     wakeUpBuffers(address);
   }
@@ -806,6 +844,20 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   // TRANSITIONS
   //*****************************************************
 
+
+  // Classified DMA requests are routing-only in Plan 002. Stable lines can
+  // proxy immediately without touching cache state. A request matching an
+  // active L2 transaction is retried deterministically so it cannot overtake
+  // replacement writeback or unblock traffic for that line.
+  transition({NP, SS, M, MT}, {DMA_READ, DMA_WRITE}) {
+    ad_proxyDMARequestToDirectory;
+    jj_popL1RequestQueue;
+  }
+
+  transition({M_I, MT_I, MCT_I, I_I, S_I, ISS, IS, IM, SS_MB, MT_MB,
+              MT_IIB, MT_IB, MT_SB}, {DMA_READ, DMA_WRITE}) {
+    zdr_recycleDMARequestQueue;
+  }
 
   //===============================================
   // BASE STATE - I

@@ -25,6 +25,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
+import math
+
 from m5.objects import (
     DMASequencer,
     RubyPortProxy,
@@ -91,6 +93,7 @@ class MESITwoLevelCacheHierarchy(
     def incorporate_cache(self, board: AbstractBoard) -> None:
         super().incorporate_cache(board)
         cache_line_size = board.get_cache_line_size()
+        l2_select_num_bits = int(math.log(self._num_l2_banks, 2))
 
         self.ruby_system = RubySystem()
 
@@ -109,7 +112,7 @@ class MESITwoLevelCacheHierarchy(
                 self._l1d_assoc,
                 self.ruby_system.network,
                 core,
-                self._num_l2_banks,
+                l2_select_num_bits,
                 cache_line_size,
                 board.processor.get_isa(),
                 board.get_clock_domain(),
@@ -149,7 +152,7 @@ class MESITwoLevelCacheHierarchy(
                 self._l2_size,
                 self._l2_assoc,
                 self.ruby_system.network,
-                self._num_l2_banks,
+                l2_select_num_bits,
                 cache_line_size,
             )
             for _ in range(self._num_l2_banks)
@@ -172,7 +175,11 @@ class MESITwoLevelCacheHierarchy(
         if board.has_dma_ports():
             dma_ports = board.get_dma_ports()
             for i, port in enumerate(dma_ports):
-                ctrl = DMAController(self.ruby_system.network, cache_line_size)
+                ctrl = DMAController(
+                    self.ruby_system.network,
+                    cache_line_size,
+                    l2_select_num_bits,
+                )
                 ctrl.dma_sequencer = DMASequencer(
                     version=i,
                     in_ports=port,

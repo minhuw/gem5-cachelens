@@ -62,3 +62,5 @@ structure(BoolVec, external="yes") {
 }
 int countBoolVec(BoolVec bVec);
 RequestorID getRequestorID(RequestPtr req);
+bool isNicDmaRead(RequestPtr req);
+bool isNicDmaWrite(RequestPtr req);

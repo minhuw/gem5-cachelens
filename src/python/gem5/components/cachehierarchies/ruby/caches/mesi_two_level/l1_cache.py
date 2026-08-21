@@ -24,8 +24,6 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import math
-
 from m5.objects import (
     ClockDomain,
     MESI_Two_Level_L1Cache_Controller,
@@ -55,7 +53,7 @@ class L1Cache(MESI_Two_Level_L1Cache_Controller):
         l1d_assoc,
         network,
         core: AbstractCore,
-        num_l2Caches,
+        l2_select_num_bits,
         cache_line_size,
         target_isa: ISA,
         clk_domain: ClockDomain,
@@ -82,7 +80,7 @@ class L1Cache(MESI_Two_Level_L1Cache_Controller):
             start_index_bit=self._cache_line_size,
             is_icache=False,
         )
-        self.l2_select_num_bits = int(math.log(num_l2Caches, 2))
+        self.l2_select_num_bits = l2_select_num_bits
         self.clk_domain = clk_domain
         self.prefetcher = RubyPrefetcher(block_size=self._cache_line_size)
         self.send_evictions = core.requires_send_evicts()

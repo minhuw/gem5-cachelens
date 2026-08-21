@@ -30,17 +30,23 @@
 
 #include <memory>
 
-#include "base/gtest/cur_tick_fake.hh"
 #include "mem/request.hh"
 #include "mem/ruby/system/DMASequencerUtils.hh"
 
 namespace gem5::ruby
 {
 
-GTestTickHandler tickHandler;
-
 namespace
 {
+
+RequestPtr
+makeRequest(Addr address, Request::Flags flags)
+{
+    auto request = std::make_shared<Request>();
+    request->setPaddr(address);
+    request->setFlags(flags);
+    return request;
+}
 
 void
 expectContiguousMask(const WriteMask &mask, int offset, int len)
@@ -59,8 +65,7 @@ TEST(DMASequencerFragmentTest, SplitsCrossLineAccessExactly)
     constexpr Addr Start = 0x103c;
     constexpr int Length = 70;
     constexpr int BlockSize = 64;
-    auto request = std::make_shared<Request>(
-        Start, Length, Request::NIC_RX_PAYLOAD_WRITE, 0);
+    auto request = makeRequest(Start, Request::NIC_RX_PAYLOAD_WRITE);
 
     auto first = makeDMARequestFragment(Start, Length, 0, BlockSize, request);
     EXPECT_EQ(first.physicalAddress, Start);
@@ -92,36 +97,31 @@ TEST(DMASequencerFragmentTest, PreservesNicAndGenericProvenance)
     constexpr int Length = 80;
     constexpr int BlockSize = 64;
 
-    auto payload = std::make_shared<Request>(
-        Address, Length, Request::NIC_RX_PAYLOAD_WRITE, 0);
+    auto payload = makeRequest(Address, Request::NIC_RX_PAYLOAD_WRITE);
     auto payload_fragment = makeDMARequestFragment(
         Address, Length, 61, BlockSize, payload);
     ASSERT_EQ(payload_fragment.seqReq, payload);
     EXPECT_TRUE(payload_fragment.seqReq->isNicRxPayloadWrite());
 
-    auto header = std::make_shared<Request>(
-        Address, Length, Request::NIC_RX_HEADER_WRITE, 0);
+    auto header = makeRequest(Address, Request::NIC_RX_HEADER_WRITE);
     auto header_fragment = makeDMARequestFragment(
         Address, Length, 61, BlockSize, header);
     ASSERT_EQ(header_fragment.seqReq, header);
     EXPECT_TRUE(header_fragment.seqReq->isNicRxHeaderWrite());
 
-    auto tx_payload = std::make_shared<Request>(
-        Address, Length, Request::NIC_TX_PAYLOAD_READ, 0);
+    auto tx_payload = makeRequest(Address, Request::NIC_TX_PAYLOAD_READ);
     auto tx_fragment = makeDMARequestFragment(
         Address, Length, 61, BlockSize, tx_payload);
     ASSERT_EQ(tx_fragment.seqReq, tx_payload);
     EXPECT_TRUE(tx_fragment.seqReq->isNicTxPayloadRead());
 
-    auto descriptor = std::make_shared<Request>(
-        Address, Length, Request::NIC_TX_DESC_WRITEBACK, 0);
+    auto descriptor = makeRequest(Address, Request::NIC_TX_DESC_WRITEBACK);
     auto descriptor_fragment = makeDMARequestFragment(
         Address, Length, 61, BlockSize, descriptor);
     ASSERT_EQ(descriptor_fragment.seqReq, descriptor);
     EXPECT_TRUE(descriptor_fragment.seqReq->isNicDescDma());
 
-    auto generic = std::make_shared<Request>(
-        Address, Length, Request::UNCACHEABLE, 0);
+    auto generic = makeRequest(Address, Request::UNCACHEABLE);
     auto generic_fragment = makeDMARequestFragment(
         Address, Length, 61, BlockSize, generic);
     ASSERT_EQ(generic_fragment.seqReq, generic);

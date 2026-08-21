@@ -80,10 +80,7 @@ class MESIDMAProvenanceTest(unittest.TestCase):
                         compact_body,
                     )
 
-                destination = (
-                    "out_msg.Destination.add(mapAddressToMachine("
-                    "address,MachineType:Directory));"
-                )
+                destination = "out_msg.Destination.add(mapDMARequestToMachine("
                 self.assertEqual(
                     compact_body.count("out_msg.Destination.add("), 1
                 )

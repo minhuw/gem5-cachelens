@@ -131,6 +131,14 @@ class CacheMemoryTest : public testing::Test
     {
         return cache->cacheMemoryStats.rxHeaderMisses.value();
     }
+    Counter dmaRoutingProxies() const
+    {
+        return cache->cacheMemoryStats.dmaRoutingProxyRequests.value();
+    }
+    Counter dmaRoutingRecycles() const
+    {
+        return cache->cacheMemoryStats.dmaRoutingTransientRecycles.value();
+    }
     void setSlot(int set, int way, AbstractCacheEntry *entry)
     {
         cache->m_cache[set][way] = entry;
@@ -287,6 +295,23 @@ TEST_F(CacheMemoryTest, PayloadAllocationHistogramIsPayloadOnly)
     // exercising the source-specific request classification above.
     EXPECT_EQ(payloadAllocAt(wayOf(0)), 0);
     EXPECT_EQ(ddioAllocAt(wayOf(0)), 1);
+}
+
+TEST_F(CacheMemoryTest, DMARoutingTelemetryIsIndependentAndResettable)
+{
+    makeCache(2);
+    cache->profileDmaRoutingProxy();
+    cache->profileDmaRoutingProxy();
+    cache->profileDmaRoutingTransientRecycle();
+
+    EXPECT_EQ(dmaRoutingProxies(), 2);
+    EXPECT_EQ(dmaRoutingRecycles(), 1);
+    EXPECT_EQ(payloadRequests(), 0);
+    EXPECT_EQ(headerRequests(), 0);
+
+    cache->resetStats();
+    EXPECT_EQ(dmaRoutingProxies(), 0);
+    EXPECT_EQ(dmaRoutingRecycles(), 0);
 }
 
 TEST_F(CacheMemoryTest, DDIOWritePreparationPreservesSnoopData)

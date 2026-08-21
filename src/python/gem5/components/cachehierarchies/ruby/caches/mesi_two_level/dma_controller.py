@@ -39,10 +39,11 @@ class DMAController(MESI_Two_Level_DMA_Controller):
         cls._version += 1  # Use count for this particular type
         return cls._version - 1
 
-    def __init__(self, network, cache_line_size):
+    def __init__(self, network, cache_line_size, l2_select_num_bits):
         super().__init__()
         self.version = self.versionCount()
         self._cache_line_size = cache_line_size
+        self.l2_select_num_bits = l2_select_num_bits
         self.connectQueues(network)
 
     def connectQueues(self, network):
