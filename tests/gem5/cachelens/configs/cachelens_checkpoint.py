@@ -12,15 +12,11 @@ import m5
 
 from gem5.coherence_protocol import CoherenceProtocol
 from gem5.components.boards.simple_board import SimpleBoard
-from gem5.components.cachehierarchies.chi.private_l1_cache_hierarchy import (
-    PrivateL1CacheHierarchy,
-)
 from gem5.components.cachehierarchies.classic.no_cache import NoCache
 from gem5.components.memory import SingleChannelDDR3_1600
 from gem5.components.processors.cpu_types import CPUTypes
 from gem5.components.processors.simple_processor import SimpleProcessor
 from gem5.isas import ISA
-from gem5.prebuilt.cachelens.cache_hierarchy import CacheLensCHIHierarchy
 from gem5.resources.resource import BinaryResource
 from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
@@ -28,43 +24,83 @@ from gem5.utils.requires import requires
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--isa", choices=("arm", "x86"), required=True)
+parser.add_argument(
+    "--coherence-protocol",
+    choices=("chi", "mesi-two-level"),
+    default="chi",
+)
 parser.add_argument("--phase", choices=("save", "restore"), required=True)
 parser.add_argument(
     "--hierarchy", choices=("cachelens", "generic", "none"), required=True
 )
-parser.add_argument(
-    "--cpu-type", choices=("atomic", "timing"), required=True
-)
+parser.add_argument("--cpu-type", choices=("atomic", "timing"), required=True)
 parser.add_argument("--binary", type=Path, required=True)
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--max-ticks", type=int, default=m5.MaxTick)
 args = parser.parse_args()
 
 isa = ISA.ARM if args.isa == "arm" else ISA.X86
-requires(
-    isa_required=isa,
-    coherence_protocol_required=CoherenceProtocol.CHI,
+protocol = (
+    CoherenceProtocol.CHI
+    if args.coherence_protocol == "chi"
+    else CoherenceProtocol.MESI_TWO_LEVEL
 )
+requires(isa_required=isa, coherence_protocol_required=protocol)
+if args.coherence_protocol == "mesi-two-level" and isa != ISA.X86:
+    parser.error("The CacheLens MESI checkpoint probe is x86-only.")
 
 if args.hierarchy == "cachelens":
-    cache_hierarchy = CacheLensCHIHierarchy(
-        l1i_size="16KiB",
-        l1d_size="16KiB",
-        l2_size="32KiB",
-        hnf_size="64KiB",
-        hnf_assoc=4,
-        model_profile=(
-            "arm-generic" if isa == ISA.ARM else "x86-generic"
-        ),
-    )
+    if args.coherence_protocol == "chi":
+        from gem5.prebuilt.cachelens.cache_hierarchy import (
+            CacheLensCHIHierarchy,
+        )
+
+        cache_hierarchy = CacheLensCHIHierarchy(
+            l1i_size="16KiB",
+            l1d_size="16KiB",
+            l2_size="32KiB",
+            hnf_size="64KiB",
+            hnf_assoc=4,
+            model_profile=("arm-generic" if isa == ISA.ARM else "x86-generic"),
+        )
+    else:
+        from gem5.prebuilt.cachelens.mesi_two_level_cache_hierarchy import (
+            CacheLensMESITwoLevelHierarchy,
+        )
+
+        cache_hierarchy = CacheLensMESITwoLevelHierarchy(
+            l1i_size="16KiB",
+            l2_size="32KiB",
+            l2_assoc=4,
+            hnf_size="64KiB",
+            hnf_assoc=4,
+            model_profile="x86-generic",
+        )
 elif args.hierarchy == "generic":
-    cache_hierarchy = PrivateL1CacheHierarchy(size="32KiB", assoc=4)
+    if args.coherence_protocol == "chi":
+        from gem5.components.cachehierarchies.chi.private_l1_cache_hierarchy import (
+            PrivateL1CacheHierarchy,
+        )
+
+        cache_hierarchy = PrivateL1CacheHierarchy(size="32KiB", assoc=4)
+    else:
+        from gem5.components.cachehierarchies.ruby.mesi_two_level_cache_hierarchy import (
+            MESITwoLevelCacheHierarchy,
+        )
+
+        cache_hierarchy = MESITwoLevelCacheHierarchy(
+            l1i_size="16KiB",
+            l1i_assoc=2,
+            l1d_size="32KiB",
+            l1d_assoc=4,
+            l2_size="64KiB",
+            l2_assoc=4,
+            num_l2_banks=1,
+        )
 else:
     cache_hierarchy = NoCache()
 
-cpu_type = (
-    CPUTypes.ATOMIC if args.cpu_type == "atomic" else CPUTypes.TIMING
-)
+cpu_type = CPUTypes.ATOMIC if args.cpu_type == "atomic" else CPUTypes.TIMING
 processor = SimpleProcessor(cpu_type=cpu_type, isa=isa, num_cores=1)
 board = SimpleBoard(
     clk_freq="2GHz",
@@ -83,7 +119,8 @@ def save_checkpoint():
     m5.checkpoint(args.checkpoint.as_posix())
     print(
         "CACHELENS_CHECKPOINT_SAVED "
-        f"isa={args.isa} cpu={args.cpu_type} hierarchy={args.hierarchy}"
+        f"isa={args.isa} protocol={protocol.value} "
+        f"cpu={args.cpu_type} hierarchy={args.hierarchy}"
     )
     yield True
 
@@ -102,5 +139,6 @@ simulator.run()
 if args.phase == "restore":
     print(
         "CACHELENS_CHECKPOINT_RESTORED "
-        f"isa={args.isa} cpu={args.cpu_type} hierarchy={args.hierarchy}"
+        f"isa={args.isa} protocol={protocol.value} "
+        f"cpu={args.cpu_type} hierarchy={args.hierarchy}"
     )

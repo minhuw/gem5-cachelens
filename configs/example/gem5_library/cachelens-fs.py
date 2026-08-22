@@ -5,11 +5,12 @@
 
 """Run CacheLens ARM or x86 full-system experiments with the gem5 stdlib.
 
-Build with ``build/ARM/gem5.opt`` or ``build/X86_CHI/gem5.opt``. The x86
-8 GiB layout contains 3 GiB below the PCI hole and 5 GiB beginning at 4 GiB;
-the memory component packs both ranges behind the original dual-channel DDR.
-Timing and O3 CacheLens restores are explicitly cold-cache restores, not
-cache-continuous continuations of the checkpointed run.
+Build CHI runs with ``build/ARM/gem5.opt`` or ``build/X86_CHI/gem5.opt`` and
+MESI runs with ``build/X86_MESI_Two_Level/gem5.opt``. The x86 8 GiB layout
+contains 3 GiB below the PCI hole and 5 GiB beginning at 4 GiB; the memory
+component packs both ranges behind the original dual-channel DDR. Timing and
+O3 CacheLens restores are explicitly cold-cache restores, not cache-continuous
+continuations of the checkpointed run.
 """
 
 import argparse
@@ -18,17 +19,18 @@ from pathlib import Path
 import m5
 from m5.util.convert import toMemorySize
 
+from gem5.coherence_protocol import CoherenceProtocol
 from gem5.components.cachehierarchies.classic.no_cache import NoCache
 from gem5.components.memory import DualChannelDDR4_2400
 from gem5.components.processors.cpu_types import CPUTypes
 from gem5.components.processors.simple_processor import SimpleProcessor
 from gem5.isas import ISA
-from gem5.prebuilt.cachelens.cache_hierarchy import CacheLensCHIHierarchy
 from gem5.resources.resource import (
     BootloaderResource,
     DiskImageResource,
     KernelResource,
 )
+from gem5.runtime import get_supported_protocols
 from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
 from gem5.utils.requires import requires
@@ -39,6 +41,15 @@ def _create_parser() -> argparse.ArgumentParser:
         description="Run a modern CacheLens full-system experiment."
     )
     parser.add_argument("--isa", choices=("arm", "x86"), required=True)
+    parser.add_argument(
+        "--coherence-protocol",
+        choices=("chi", "mesi-two-level"),
+        default="chi",
+        help=(
+            "Timing/O3 hierarchy to build. Atomic checkpoint preparation "
+            "always uses NoCache (default: chi)."
+        ),
+    )
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--disk-image", type=Path, required=True)
     parser.add_argument("--bootloader", type=Path)
@@ -148,7 +159,11 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hnf-inclusion",
         choices=("noninclusive", "inclusive"),
-        default="noninclusive",
+        default=None,
+        help=(
+            "CHI HNF policy (default: noninclusive). MESI_Two_Level is "
+            "inclusive by protocol and only accepts an explicit inclusive."
+        ),
     )
     parser.add_argument(
         "--indexing-policy",
@@ -185,6 +200,33 @@ def _create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _selected_protocol(args) -> CoherenceProtocol:
+    return (
+        CoherenceProtocol.CHI
+        if args.coherence_protocol == "chi"
+        else CoherenceProtocol.MESI_TWO_LEVEL
+    )
+
+
+def _require_selected_protocol(parser, args) -> None:
+    required = _selected_protocol(args)
+    supported = get_supported_protocols()
+    if required in supported:
+        return
+
+    available = ", ".join(sorted(protocol.value for protocol in supported))
+    target = (
+        "build/X86_CHI/gem5.opt"
+        if required == CoherenceProtocol.CHI
+        else "build/X86_MESI_Two_Level/gem5.opt"
+    )
+    parser.error(
+        f"--coherence-protocol {args.coherence_protocol} requires the "
+        f"compiled Ruby protocol {required.value}, but this binary provides "
+        f"{available or 'none'}. Use {target} (or a multi-protocol build)."
+    )
+
+
 def _validate_args(parser, args) -> None:
     for name in ("kernel", "disk_image"):
         path = getattr(args, name)
@@ -199,6 +241,11 @@ def _validate_args(parser, args) -> None:
     elif args.bootloader is not None:
         parser.error("--bootloader is not valid for x86.")
 
+    if args.coherence_protocol == "mesi-two-level" and args.isa != "x86":
+        parser.error(
+            "--coherence-protocol mesi-two-level is currently supported "
+            "only for x86 CacheLens runs."
+        )
     if args.model_profile == "intel-ddio" and args.isa == "arm":
         parser.error("--model-profile intel-ddio is only valid for x86.")
     if args.model_profile == "arm-generic" and args.isa != "arm":
@@ -220,10 +267,7 @@ def _validate_args(parser, args) -> None:
         parser.error("Network latencies must be positive.")
     if args.network_buffer_size <= 0:
         parser.error("--network-buffer-size must be positive.")
-    if (
-        args.loadgen_type == "Pcap"
-        and args.loadgen_pcap_max_packet_size < 14
-    ):
+    if args.loadgen_type == "Pcap" and args.loadgen_pcap_max_packet_size < 14:
         parser.error(
             "--loadgen-pcap-max-packet-size must allow at least the 14-byte "
             "full L2 Ethernet header."
@@ -236,6 +280,29 @@ def _validate_args(parser, args) -> None:
         ):
             parser.error("--addr-hash conflicts with --indexing-policy.")
         args.indexing_policy = compatibility_policy
+
+    if args.coherence_protocol == "mesi-two-level":
+        if args.hnf_inclusion not in (None, "inclusive"):
+            parser.error(
+                "MESI_Two_Level is inclusive by protocol; "
+                "--hnf-inclusion noninclusive is invalid."
+            )
+        if args.indexing_policy != "linear":
+            parser.error(
+                "MESI_Two_Level supports only the linear indexing policy."
+            )
+        if args.dealloc_on_unique:
+            parser.error(
+                "--dealloc-on-unique is CHI-only and cannot be enabled for "
+                "MESI_Two_Level."
+            )
+        if args.l1d_size != "64KiB" or args.l1d_assoc != 2:
+            parser.error(
+                "MESI_Two_Level has no separate CacheLens L1D/private-L2 "
+                "pair. Leave --l1d-size=64KiB and --l1d-assoc=2 at their "
+                "compatibility defaults; --l2-size/--l2-assoc configure the "
+                "MESI private data cache."
+            )
 
     memory_size = toMemorySize(args.mem_size)
     if memory_size <= 0 or memory_size > toMemorySize("8GiB"):
@@ -295,13 +362,176 @@ def _continue_work_items_handler():
         yield False
 
 
+def _create_cache_hierarchy(args, isa: ISA):
+    if args.cpu_type == "atomic":
+        # Checkpoint preparation must not use Ruby's atomic_noncaching mode.
+        # Device DMA can stall behind an atomic Ruby requestor. Prepare the
+        # architectural/device state uncached, then build the selected cold
+        # Ruby hierarchy only in the Timing/O3 restore process.
+        return NoCache(), "no-cache-checkpoint-prep"
+
+    model_profile = args.model_profile or (
+        "arm-generic" if isa == ISA.ARM else "x86-generic"
+    )
+    common = {
+        "l1i_size": args.l1i_size,
+        "l1i_assoc": args.l1i_assoc,
+        "l2_size": args.l2_size,
+        "l2_assoc": args.l2_assoc,
+        "hnf_size": args.hnf_size,
+        "hnf_assoc": args.hnf_assoc,
+        "num_hnfs": args.num_hnfs,
+        "ddio_way_part": args.ddio_way_part,
+        "model_profile": model_profile,
+        "core_clock": args.clock,
+        "link_latency": args.link_latency,
+        "router_latency": args.router_latency,
+        "network_buffer_size": args.network_buffer_size,
+    }
+    if args.coherence_protocol == "chi":
+        from gem5.prebuilt.cachelens.cache_hierarchy import (
+            CacheLensCHIHierarchy,
+        )
+
+        return (
+            CacheLensCHIHierarchy(
+                l1d_size=args.l1d_size,
+                l1d_assoc=args.l1d_assoc,
+                indexing_policy=args.indexing_policy,
+                addr_hash=args.addr_hash,
+                dealloc_on_unique=args.dealloc_on_unique,
+                hnf_inclusion=args.hnf_inclusion or "noninclusive",
+                **common,
+            ),
+            "cachelens-chi",
+        )
+
+    from gem5.prebuilt.cachelens.mesi_two_level_cache_hierarchy import (
+        CacheLensMESITwoLevelHierarchy,
+    )
+
+    return CacheLensMESITwoLevelHierarchy(**common), "cachelens-mesi-two-level"
+
+
+def _checkpoint_prep_configuration(args):
+    if _selected_protocol(args) == CoherenceProtocol.MESI_TWO_LEVEL:
+        private_mapping = (
+            "inactive during NoCache checkpoint preparation; timing restore "
+            "will map l2_* to private MESI data cache and hnf_* to inclusive "
+            "shared L2"
+        )
+        hnf_inclusion = "deferred-to-inclusive-timing-restore"
+    else:
+        private_mapping = (
+            "inactive during NoCache checkpoint preparation; timing restore "
+            "will map l1d_* to private CHI L1D, l2_* to private CHI L2, and "
+            "hnf_* to shared CHI HNF"
+        )
+        hnf_inclusion = "deferred-to-timing-restore"
+
+    return {
+        "coherence_protocol": _selected_protocol(args).value,
+        "topology": "uncached-checkpoint-preparation",
+        "model_profile": "checkpoint-prep",
+        "private_data_mapping": private_mapping,
+        "private_data_size": "inactive",
+        "private_data_assoc": "deferred",
+        "hnf_inclusion": hnf_inclusion,
+        "llc_inclusion_source": "selected timing protocol",
+        "indexing_policy": "inactive/deferred",
+        "num_hnfs": "inactive/deferred",
+        "hnf_size_per_hnf": "inactive/deferred",
+        "hnf_assoc": "inactive/deferred",
+        "total_hnf_capacity_bytes": "inactive/deferred",
+        "ddio_way_part": "inactive/deferred",
+        "llc_replacement_policy": "inactive/deferred",
+        "cache_state_restore_policy": "n/a",
+        "cache_state_continuity": False,
+    }
+
+
+def _format_configuration_banner(
+    args, board, cache_hierarchy, hierarchy_name: str
+) -> str:
+    if args.cpu_type == "atomic":
+        hierarchy_config = _checkpoint_prep_configuration(args)
+    else:
+        hierarchy_config = (
+            cache_hierarchy.get_configuration()
+            if hasattr(cache_hierarchy, "get_configuration")
+            else {}
+        )
+    reported_ddio = hierarchy_config.get(
+        "ddio_way_part",
+        getattr(cache_hierarchy, "_ddio_way_part", args.ddio_way_part),
+    )
+    protocol = hierarchy_config.get(
+        "coherence_protocol",
+        _selected_protocol(args).value,
+    )
+    topology = hierarchy_config.get(
+        "topology",
+        (
+            "chi-private-l1-private-l2-shared-hnf"
+            if args.cpu_type != "atomic"
+            else "uncached-checkpoint-preparation"
+        ),
+    )
+    private_mapping = hierarchy_config.get(
+        "private_data_mapping",
+        (
+            "CacheLens l2_size/l2_assoc -> MESI_Two_Level L1D"
+            if _selected_protocol(args) == CoherenceProtocol.MESI_TWO_LEVEL
+            else "native CHI private L1D and L2"
+        ),
+    )
+    hnf_inclusion = hierarchy_config.get(
+        "hnf_inclusion",
+        "n/a" if args.cpu_type == "atomic" else "noninclusive",
+    )
+    inclusion_source = hierarchy_config.get("llc_inclusion_source", "option")
+    return (
+        "CacheLens FS: "
+        f"isa={args.isa} cpu={args.cpu_type} cores={args.num_cores} "
+        f"hierarchy={hierarchy_name} protocol={protocol} "
+        f"topology={topology!r} memory={args.mem_size} "
+        f"profile={hierarchy_config.get('model_profile', 'checkpoint-prep')} "
+        f"private_data_mapping={private_mapping!r} "
+        "private_data="
+        f"{hierarchy_config.get('private_data_size', args.l2_size)}/"
+        f"{hierarchy_config.get('private_data_assoc', args.l2_assoc)} "
+        f"hnf_inclusion={hnf_inclusion} inclusion_source={inclusion_source!r} "
+        f"indexing={hierarchy_config.get('indexing_policy', 'n/a')} "
+        f"hnfs={hierarchy_config.get('num_hnfs', args.num_hnfs)} "
+        "hnf_size_per_bank="
+        f"{hierarchy_config.get('hnf_size_per_hnf', args.hnf_size)} "
+        f"hnf_assoc={hierarchy_config.get('hnf_assoc', args.hnf_assoc)} "
+        f"hnf_capacity={hierarchy_config.get('total_hnf_capacity_bytes', 'n/a')} "
+        f"ddio_way_part={reported_ddio} "
+        "llc_replacement="
+        f"{hierarchy_config.get('llc_replacement_policy', 'protocol-default')} "
+        f"network=link:{args.link_latency},"
+        f"router:{args.router_latency},buffer:{args.network_buffer_size} "
+        f"nics={','.join(board.get_nic_bdfs()) or 'none'} "
+        f"restore={args.checkpoint or 'none'} "
+        "cache_restore_policy="
+        f"{hierarchy_config.get('cache_state_restore_policy', 'n/a')} "
+        "cache_continuity="
+        f"{str(hierarchy_config.get('cache_state_continuity', False)).lower()}"
+    )
+
+
 def main() -> None:
     parser = _create_parser()
     args = parser.parse_args()
+    _require_selected_protocol(parser, args)
     _validate_args(parser, args)
 
     isa = ISA.ARM if args.isa == "arm" else ISA.X86
-    requires(isa_required=isa)
+    requires(
+        isa_required=isa,
+        coherence_protocol_required=_selected_protocol(args),
+    )
     cpu_type = {
         "atomic": CPUTypes.ATOMIC,
         "timing": CPUTypes.TIMING,
@@ -312,9 +542,9 @@ def main() -> None:
         isa=isa,
         num_cores=args.num_cores,
     )
-    # CacheLensCHIHierarchy assigns the measurement CPU cores and private
-    # caches to one explicit core clock domain. Atomic preparation keeps the
-    # traditional independent CPU clock assignment below.
+    # The selected CacheLens timing hierarchy assigns the measurement CPU
+    # cores and their private cache side to one explicit clock domain. Atomic
+    # checkpoint preparation keeps the traditional independent assignment.
     if args.cpu_type == "atomic":
         from m5.objects import (
             SrcClockDomain,
@@ -327,41 +557,7 @@ def main() -> None:
                 clock=args.clock, voltage_domain=cpu_voltage
             )
     memory = DualChannelDDR4_2400(size=args.mem_size)
-    if args.cpu_type == "atomic":
-        # Checkpoint preparation must not use Ruby's atomic_noncaching mode.
-        # In particular, e1000 PMD initialization performs device DMA which
-        # can stall behind an atomic CHI RNI. Like gem5's established FS
-        # checkpoint workflow, prepare architectural/device state with a
-        # modern uncached hierarchy, then restore it into CacheLens CHI with
-        # Timing cores for measurement.
-        cache_hierarchy = NoCache()
-        hierarchy_name = "no-cache-checkpoint-prep"
-    else:
-        model_profile = args.model_profile or (
-            "arm-generic" if isa == ISA.ARM else "x86-generic"
-        )
-        cache_hierarchy = CacheLensCHIHierarchy(
-            l1i_size=args.l1i_size,
-            l1i_assoc=args.l1i_assoc,
-            l1d_size=args.l1d_size,
-            l1d_assoc=args.l1d_assoc,
-            l2_size=args.l2_size,
-            l2_assoc=args.l2_assoc,
-            hnf_size=args.hnf_size,
-            hnf_assoc=args.hnf_assoc,
-            num_hnfs=args.num_hnfs,
-            ddio_way_part=args.ddio_way_part,
-            indexing_policy=args.indexing_policy,
-            addr_hash=args.addr_hash,
-            dealloc_on_unique=args.dealloc_on_unique,
-            hnf_inclusion=args.hnf_inclusion,
-            model_profile=model_profile,
-            core_clock=args.clock,
-            link_latency=args.link_latency,
-            router_latency=args.router_latency,
-            network_buffer_size=args.network_buffer_size,
-        )
-        hierarchy_name = "cachelens-chi"
+    cache_hierarchy, hierarchy_name = _create_cache_hierarchy(args, isa)
 
     network_options = _network_options(args)
     if args.cpu_type == "atomic":
@@ -408,32 +604,10 @@ def main() -> None:
         checkpoint=args.checkpoint,
     )
 
-    reported_ddio = getattr(
-        cache_hierarchy, "_ddio_way_part", args.ddio_way_part
-    )
-    hierarchy_config = (
-        cache_hierarchy.get_configuration()
-        if hasattr(cache_hierarchy, "get_configuration")
-        else {}
-    )
     print(
-        "CacheLens FS: "
-        f"isa={args.isa} cpu={args.cpu_type} cores={args.num_cores} "
-        f"hierarchy={hierarchy_name} memory={args.mem_size} "
-        f"profile={hierarchy_config.get('model_profile', 'checkpoint-prep')} "
-        f"hnf_inclusion={hierarchy_config.get('hnf_inclusion', 'n/a')} "
-        f"indexing={hierarchy_config.get('indexing_policy', 'n/a')} "
-        f"hnfs={args.num_hnfs} "
-        f"hnf_capacity={hierarchy_config.get('total_hnf_capacity_bytes', 'n/a')} "
-        f"ddio_way_part={reported_ddio} "
-        f"network=link:{args.link_latency},"
-        f"router:{args.router_latency},buffer:{args.network_buffer_size} "
-        f"nics={','.join(board.get_nic_bdfs()) or 'none'} "
-        f"restore={args.checkpoint or 'none'} "
-        "cache_restore_policy="
-        f"{hierarchy_config.get('cache_state_restore_policy', 'n/a')} "
-        "cache_continuity="
-        f"{str(hierarchy_config.get('cache_state_continuity', False)).lower()}"
+        _format_configuration_banner(
+            args, board, cache_hierarchy, hierarchy_name
+        )
     )
 
     exit_handlers = {

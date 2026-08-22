@@ -85,8 +85,16 @@ class MESITwoLevelCacheHierarchy(
             l2_assoc=l2_assoc,
         )
 
+        if num_l2_banks <= 0 or num_l2_banks & (num_l2_banks - 1):
+            raise ValueError("num_l2_banks must be a positive power of two.")
+        if ddio_way_part != -1 and not 1 <= ddio_way_part <= int(l2_assoc):
+            raise ValueError(
+                "ddio_way_part must be -1 or between 1 and l2_assoc."
+            )
+
         self._num_l2_banks = num_l2_banks
         self._ddio_way_part = ddio_way_part
+        self._l2_select_num_bits = int(math.log2(num_l2_banks))
 
     @overrides(AbstractCacheHierarchy)
     def get_coherence_protocol(self):
@@ -95,15 +103,16 @@ class MESITwoLevelCacheHierarchy(
     def incorporate_cache(self, board: AbstractBoard) -> None:
         super().incorporate_cache(board)
         cache_line_size = board.get_cache_line_size()
-        l2_select_num_bits = int(math.log(self._num_l2_banks, 2))
+        l2_select_num_bits = self._l2_select_num_bits
 
-        self.ruby_system = RubySystem()
+        self.ruby_system = self._create_ruby_system()
 
         # MESI_Two_Level needs 3 virtual networks
         self.ruby_system.number_of_virtual_networks = 3
 
-        self.ruby_system.network = SimplePt2Pt(self.ruby_system)
+        self.ruby_system.network = self._create_network()
         self.ruby_system.network.number_of_virtual_networks = 3
+        core_clock_domain = self._get_core_clock_domain(board)
 
         self._l1_controllers = []
         for i, core in enumerate(board.get_processor().get_cores()):
@@ -117,13 +126,13 @@ class MESITwoLevelCacheHierarchy(
                 l2_select_num_bits,
                 cache_line_size,
                 board.processor.get_isa(),
-                board.get_clock_domain(),
+                core_clock_domain,
             )
 
             cache.sequencer = RubySequencer(
                 version=i,
                 dcache=cache.L1Dcache,
-                clk_domain=cache.clk_domain,
+                clk_domain=core_clock_domain,
                 ruby_system=self.ruby_system,
             )
 
@@ -217,6 +226,18 @@ class MESITwoLevelCacheHierarchy(
             ruby_system=self.ruby_system
         )
         board.connect_system_port(self.ruby_system.sys_port_proxy.in_ports)
+
+    def _create_ruby_system(self) -> RubySystem:
+        """Create Ruby with stock checkpoint cache-trace replay semantics."""
+        return RubySystem()
+
+    def _create_network(self) -> SimplePt2Pt:
+        """Create the stock point-to-point MESI network."""
+        return SimplePt2Pt(self.ruby_system)
+
+    def _get_core_clock_domain(self, board: AbstractBoard):
+        """Return the stock board clock domain used by cores' cache side."""
+        return board.get_clock_domain()
 
     @overrides(AbstractRubyCacheHierarchy)
     def _reset_version_numbers(self):

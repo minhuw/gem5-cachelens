@@ -121,7 +121,7 @@ class MESIDMARoutingTest(unittest.TestCase):
         stdlib = _compact(_STDLIB.read_text(encoding="utf-8"))
         self.assertEqual(
             stdlib.count(
-                "l2_select_num_bits=int(math.log(self._num_l2_banks,2))"
+                "self._l2_select_num_bits=int(math.log2(num_l2_banks))"
             ),
             1,
         )
@@ -138,8 +138,8 @@ class MESIDMARoutingTest(unittest.TestCase):
         self.assertIn(
             "self.l2_select_num_bits=l2_select_num_bits", stdlib_dma
         )
-        self.assertNotIn("math.log", stdlib_l1)
-        self.assertNotIn("math.log", stdlib_dma)
+        self.assertNotIn("l2_select_num_bits=int(math.log", stdlib_l1)
+        self.assertNotIn("l2_select_num_bits=int(math.log", stdlib_dma)
 
     def test_masked_dma_capability_is_default_off_and_mesi_only(self) -> None:
         sequencer = _compact(

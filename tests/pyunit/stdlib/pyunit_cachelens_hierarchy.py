@@ -8,6 +8,7 @@ import unittest
 from m5.objects import RubySystem
 
 from gem5.isas import ISA
+from gem5.prebuilt import cachelens
 from gem5.prebuilt.cachelens.cache_hierarchy import CacheLensCHIHierarchy
 from gem5.prebuilt.cachelens.topology import SimpleCrossbar
 
@@ -24,9 +25,7 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
             CacheLensCHIHierarchy(hnf_assoc=8, ddio_way_part=9)
         for profile in ("arm-generic", "x86-generic"):
             with self.assertRaisesRegex(ValueError, "Positive ddio_way_part"):
-                CacheLensCHIHierarchy(
-                    ddio_way_part=2, model_profile=profile
-                )
+                CacheLensCHIHierarchy(ddio_way_part=2, model_profile=profile)
 
     def test_hnf_count_validation(self) -> None:
         CacheLensCHIHierarchy(num_hnfs=1)
@@ -52,8 +51,15 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
                     CacheLensCHIHierarchy(hnf_inclusion=mode)
 
     def test_default_model_is_bounded_and_explicit(self) -> None:
+        self.assertIn("CacheLensCHIHierarchy", cachelens.__all__)
         hierarchy = CacheLensCHIHierarchy(num_hnfs=4, hnf_size="2MiB")
         configuration = hierarchy.get_configuration()
+        self.assertEqual("CHI", configuration["coherence_protocol"])
+        self.assertTrue(configuration["topology_matches_chi_three_level"])
+        self.assertEqual(
+            "native CHI private L1D and L2",
+            configuration["private_data_mapping"],
+        )
         self.assertEqual("abstract", hierarchy.get_model_profile())
         self.assertEqual("linear", hierarchy.get_indexing_policy())
         self.assertEqual("noninclusive", configuration["hnf_inclusion"])
@@ -76,9 +82,7 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
 
     def test_profile_architecture_validation(self) -> None:
         hierarchy = CacheLensCHIHierarchy(model_profile="intel-ddio")
-        self.assertTrue(
-            hierarchy.get_configuration()["nic_read_no_allocate"]
-        )
+        self.assertTrue(hierarchy.get_configuration()["nic_read_no_allocate"])
         with self.assertRaisesRegex(ValueError, "only valid for x86"):
             hierarchy.validate_architecture(ISA.ARM)
         hierarchy.validate_architecture(ISA.X86)

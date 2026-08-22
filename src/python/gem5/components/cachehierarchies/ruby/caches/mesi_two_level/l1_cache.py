@@ -24,6 +24,8 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import math
+
 from m5.objects import (
     ClockDomain,
     MESI_Two_Level_L1Cache_Controller,
@@ -68,16 +70,17 @@ class L1Cache(MESI_Two_Level_L1Cache_Controller):
         self.connectQueues(network)
 
         # This is the cache memory object that stores the cache data and tags
+        start_index_bit = int(math.log2(self._cache_line_size))
         self.L1Icache = RubyCache(
             size=l1i_size,
             assoc=l1i_assoc,
-            start_index_bit=self._cache_line_size,
+            start_index_bit=start_index_bit,
             is_icache=True,
         )
         self.L1Dcache = RubyCache(
             size=l1d_size,
             assoc=l1d_assoc,
-            start_index_bit=self._cache_line_size,
+            start_index_bit=start_index_bit,
             is_icache=False,
         )
         self.l2_select_num_bits = l2_select_num_bits

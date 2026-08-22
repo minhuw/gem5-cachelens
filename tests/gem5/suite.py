@@ -70,6 +70,7 @@ def gem5_verify_config(
     valid_hosts=constants.supported_hosts,
     protocol=None,
     uses_kvm=False,
+    gem5_fixture_factory=None,
 ):
     """
     Helper class to generate common gem5 tests using verifiers.
@@ -98,6 +99,10 @@ def gem5_verify_config(
 
     :param uses_kvm: States if this verifier uses KVM. If so, the "kvm" tag
         will be included.
+
+    :param gem5_fixture_factory: An optional callable accepting ``isa``,
+        ``variant``, and ``protocol`` and returning the gem5 build fixture.
+        The normal :class:`Gem5Fixture` behavior is used by default.
     """
     fixtures = list(fixtures)
     testsuites = []
@@ -140,7 +145,8 @@ def gem5_verify_config(
                 # Create the gem5 target for the specific architecture and
                 # variant.
                 _fixtures = copy.copy(fixtures)
-                _fixtures.append(Gem5Fixture(isa, opt, protocol))
+                fixture_factory = gem5_fixture_factory or Gem5Fixture
+                _fixtures.append(fixture_factory(isa, opt, protocol))
                 _fixtures.append(tempdir)
                 _fixtures.append(gem5_returncode)
 
