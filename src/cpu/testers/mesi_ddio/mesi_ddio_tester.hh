@@ -57,7 +57,7 @@ class MESIDDIODirectedTester : public ClockedObject
         unsigned phase;
         unsigned issueDelay;
         PortKind port;
-        unsigned cpu;
+        unsigned portIndex;
         bool read;
         Addr address;
         Request::Flags flags;
@@ -104,27 +104,27 @@ class MESIDDIODirectedTester : public ClockedObject
     void timeout();
 
     unsigned reservePhase();
-    void addRead(PortKind port, unsigned cpu, Addr address,
+    void addRead(PortKind port, unsigned port_index, Addr address,
                  Request::Flags flags, const std::vector<uint8_t> &expected,
                  const std::string &label);
-    void addWrite(PortKind port, unsigned cpu, Addr address,
+    void addWrite(PortKind port, unsigned port_index, Addr address,
                   Request::Flags flags, const std::vector<uint8_t> &data,
                   const std::string &label);
-    void addMaskedWrite(PortKind port, unsigned cpu, Addr address,
+    void addMaskedWrite(PortKind port, unsigned port_index, Addr address,
                         Request::Flags flags,
                         const std::vector<uint8_t> &data,
                         const std::vector<bool> &byte_enable,
                         const std::string &label);
     void addReadAt(unsigned phase, unsigned issue_delay, PortKind port,
-                   unsigned cpu, Addr address, Request::Flags flags,
+                   unsigned port_index, Addr address, Request::Flags flags,
                    const std::vector<uint8_t> &expected,
                    const std::string &label);
     void addWriteAt(unsigned phase, unsigned issue_delay, PortKind port,
-                    unsigned cpu, Addr address, Request::Flags flags,
+                    unsigned port_index, Addr address, Request::Flags flags,
                     const std::vector<uint8_t> &data,
                     const std::string &label);
     void addMaskedWriteAt(unsigned phase, unsigned issue_delay,
-                          PortKind port, unsigned cpu, Addr address,
+                          PortKind port, unsigned port_index, Addr address,
                           Request::Flags flags,
                           const std::vector<uint8_t> &data,
                           const std::vector<bool> &byte_enable,
@@ -144,6 +144,7 @@ class MESIDDIODirectedTester : public ClockedObject
 
     std::vector<TestPort *> cpuPorts;
     TestPort dmaPort;
+    TestPort dmaRacePort;
     std::vector<Operation> operations;
     std::vector<RetryState> retries;
     unsigned phaseCount = 0;

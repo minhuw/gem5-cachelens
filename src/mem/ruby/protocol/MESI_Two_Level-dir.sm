@@ -620,8 +620,21 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     j_popIncomingRequestQueue;
   }
 
-  transition({ID, ID_WF, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI},
-             DDIO_WRITE) {
+  // A generic DMA may invalidate the L2 after its partial retained miss has
+  // made that L2 the recorded owner, but before the ownership claim arrives.
+  // Commit that already-recorded claim without disturbing the pending DMA or
+  // its TBE. Popping the claim guarantees one ownership ACK; the L2 can then
+  // leave DM_WI and service the outstanding invalidate.
+  transition({M_DRD, M_DWR}, DDIO_WRITE) {
+    do_assertDdioOwner;
+    do_sendDdioOwnershipAck;
+    j_popIncomingRequestQueue;
+  }
+
+  // The other transient states either have no current L2 owner or have
+  // already consumed the invalidation response and started the memory commit.
+  // A DDIO ownership claim cannot be serialized safely in those states.
+  transition({ID, ID_WF, ID_W, M_DRDI, M_DWRI, IM, MI}, DDIO_WRITE) {
     zz_recycleDMAQueue;
   }
 

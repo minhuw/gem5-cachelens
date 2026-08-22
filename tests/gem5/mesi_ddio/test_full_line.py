@@ -43,6 +43,10 @@ _PREFIX = "system.ruby.l2_cntrl0.L2cache."
 
 
 class DMASequencerCapabilityVerifier(verifier.Verifier):
+    def __init__(self, expected_count=1):
+        super().__init__()
+        self._expected_count = expected_count
+
     def test(self, params):
         tempdir = params.fixtures[constants.tempdir_fixture_name].path
         config_path = joinpath(tempdir, constants.gem5_simulation_config_ini)
@@ -59,8 +63,12 @@ class DMASequencerCapabilityVerifier(verifier.Verifier):
             for name, body in sections
             if re.search(r"(?m)^type=DMASequencer$", body)
         }
-        if not dma_sections:
-            test_util.fail("MESI_Two_Level config has no DMASequencer")
+        if len(dma_sections) != self._expected_count:
+            test_util.fail(
+                "MESI_Two_Level config has an unexpected number of "
+                f"DMASequencers: observed={len(dma_sections)}, "
+                f"expected={self._expected_count}"
+            )
         for name, body in dma_sections.items():
             if not re.search(
                 r"(?m)^supports_masked_writes=true$", body
@@ -77,28 +85,41 @@ class MESIDDIOStatsVerifier(verifier.Verifier):
         expected,
         minimum=None,
         runtime_expected=None,
+        runtime_vector_expected=None,
         runtime_absent=None,
     ):
         super().__init__()
         self._expected = expected
         self._minimum = minimum or {}
         self._runtime_expected = runtime_expected or {}
+        self._runtime_vector_expected = runtime_vector_expected or {}
         self._runtime_absent = runtime_absent or ()
 
     @staticmethod
     def _read_stats(path):
         stats = {}
+        vector_stats = {}
         with open(path, encoding="utf-8") as stats_file:
             for line in stats_file:
                 fields = line.split()
                 if len(fields) < 2:
+                    continue
+                if fields[1] == "|":
+                    values = re.findall(
+                        r"\|\s+([-+]?(?:\d+(?:\.\d*)?|\.\d+)"
+                        r"(?:[eE][-+]?\d+)?)",
+                        line,
+                    )
+                    vector_stats[fields[0]] = tuple(
+                        float(value) for value in values
+                    )
                     continue
                 try:
                     value = float(fields[1])
                 except ValueError:
                     continue
                 stats[fields[0]] = value
-        return stats
+        return stats, vector_stats
 
     def test(self, params):
         tempdir = params.fixtures[constants.tempdir_fixture_name].path
@@ -106,7 +127,7 @@ class MESIDDIOStatsVerifier(verifier.Verifier):
         if not os.path.isfile(stats_path):
             test_util.fail(f"Could not find gem5 stats file: {stats_path}")
 
-        stats = self._read_stats(stats_path)
+        stats, vector_stats = self._read_stats(stats_path)
         for suffix, expected in self._expected.items():
             name = _PREFIX + suffix
             if name not in stats:
@@ -143,6 +164,18 @@ class MESIDDIOStatsVerifier(verifier.Verifier):
                     f"observed={observed}, expected={expected}"
                 )
 
+        for name, expected in self._runtime_vector_expected.items():
+            if name not in vector_stats:
+                test_util.fail(
+                    f"Missing required runtime vector statistic {name}"
+                )
+            observed = vector_stats[name]
+            if observed != tuple(expected):
+                test_util.fail(
+                    f"Unexpected runtime vector statistic {name}: "
+                    f"observed={observed}, expected={tuple(expected)}"
+                )
+
         # gem5 omits protocol transition statistics with zero occurrences.
         # Absence is therefore an explicit expectation, not an implicit zero.
         for name in self._runtime_absent:
@@ -160,7 +193,9 @@ def _register(
     ddio_way_part=1,
     minimum=None,
     runtime_expected=None,
+    runtime_vector_expected=None,
     runtime_absent=None,
+    dma_controllers=1,
 ):
     gem5_verify_config(
         name=name,
@@ -171,9 +206,13 @@ def _register(
                     rf".*MESI DDIO directed scenario '{scenario}' passed"
                 )
             ),
-            DMASequencerCapabilityVerifier(),
+            DMASequencerCapabilityVerifier(dma_controllers),
             MESIDDIOStatsVerifier(
-                expected, minimum, runtime_expected, runtime_absent
+                expected,
+                minimum,
+                runtime_expected,
+                runtime_vector_expected,
+                runtime_absent,
             ),
         ),
         config=_CONFIG,
@@ -778,6 +817,110 @@ _register(
         "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
     },
     runtime_absent=("system.ruby.Directory_Controller.M_DWR.Data",),
+)
+
+_register(
+    "mesi-ddio-partial-claim-races-generic-dma-read",
+    "partial_claim_dma_read_race",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 0,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayFill::total": 1,
+        "ddioWayAccess::total": 0,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 1,
+        "ddioOwnershipAcks": 1,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest::total": 2,
+        "system.ruby.DMA_Controller.Data::total": 2,
+        "system.ruby.DMA_Controller.WriteRequest::total": 2,
+        "system.ruby.DMA_Controller.Ack::total": 2,
+        "system.ruby.Directory_Controller.M.DMA_READ": 1,
+        "system.ruby.Directory_Controller.M_DRD.DDIO_WRITE": 1,
+        "system.ruby.Directory_Controller.M_DRD.Data": 1,
+        "system.ruby.Directory_Controller.M_DRDI.Memory_Ack": 1,
+        "system.ruby.Directory_Controller.I.DMA_READ": 1,
+        "system.ruby.Directory_Controller.ID.Memory_Data": 1,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WF.Mem_Data": 1,
+        "system.ruby.L2Cache_Controller.DM_WI.MEM_Inv": 2,
+        "system.ruby.L2Cache_Controller.DM_WI.Ddio_Ack": 1,
+        "system.ruby.L2Cache_Controller.M.MEM_Inv": 1,
+        "system.ruby.L2Cache_Controller.M_I.MEM_Inv": 1,
+        "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
+    },
+    runtime_vector_expected={
+        "system.ruby.DMA_Controller.ReadRequest": (0, 2),
+        "system.ruby.DMA_Controller.Data": (0, 2),
+        "system.ruby.DMA_Controller.WriteRequest": (1, 1),
+        "system.ruby.DMA_Controller.Ack": (1, 1),
+    },
+    runtime_absent=(
+        "system.ruby.Directory_Controller.I.DDIO_WRITE",
+        "system.ruby.Directory_Controller.M.DDIO_WRITE",
+        "system.ruby.Directory_Controller.M_DWR.DDIO_WRITE",
+    ),
+    dma_controllers=2,
+)
+
+_register(
+    "mesi-ddio-partial-claim-races-generic-dma-write",
+    "partial_claim_dma_write_race",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 0,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayFill::total": 1,
+        "ddioWayAccess::total": 0,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 1,
+        "ddioOwnershipAcks": 1,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest::total": 1,
+        "system.ruby.DMA_Controller.Data::total": 1,
+        "system.ruby.DMA_Controller.WriteRequest::total": 3,
+        "system.ruby.DMA_Controller.Ack::total": 3,
+        "system.ruby.Directory_Controller.M.DMA_WRITE_FULL": 1,
+        "system.ruby.Directory_Controller.M_DWR.DDIO_WRITE": 1,
+        "system.ruby.Directory_Controller.M_DWR.Data": 1,
+        "system.ruby.Directory_Controller.M_DWRI.Memory_Ack": 1,
+        "system.ruby.Directory_Controller.I.DMA_READ": 1,
+        "system.ruby.Directory_Controller.ID.Memory_Data": 1,
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WF.Mem_Data": 1,
+        "system.ruby.L2Cache_Controller.DM_WI.MEM_Inv": 2,
+        "system.ruby.L2Cache_Controller.DM_WI.Ddio_Ack": 1,
+        "system.ruby.L2Cache_Controller.M.MEM_Inv": 1,
+        "system.ruby.L2Cache_Controller.M_I.MEM_Inv": 1,
+        "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
+    },
+    runtime_vector_expected={
+        "system.ruby.DMA_Controller.ReadRequest": (0, 1),
+        "system.ruby.DMA_Controller.Data": (0, 1),
+        "system.ruby.DMA_Controller.WriteRequest": (1, 2),
+        "system.ruby.DMA_Controller.Ack": (1, 2),
+    },
+    runtime_absent=(
+        "system.ruby.Directory_Controller.I.DDIO_WRITE",
+        "system.ruby.Directory_Controller.M.DDIO_WRITE",
+        "system.ruby.Directory_Controller.M_DRD.DDIO_WRITE",
+    ),
+    dma_controllers=2,
 )
 
 _register(

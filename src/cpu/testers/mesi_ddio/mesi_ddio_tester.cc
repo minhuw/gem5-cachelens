@@ -60,6 +60,7 @@ MESIDDIODirectedTester::MESIDDIODirectedTester(const Params &params)
       finishEvent([this] { finish(); }, name() + ".finish"),
       timeoutEvent([this] { timeout(); }, name() + ".timeout"),
       dmaPort(name() + ".dma_port", *this),
+      dmaRacePort(name() + ".dma_race_port", *this),
       scenario(params.scenario),
       baseAddress(params.base_addr),
       setStride(params.set_stride),
@@ -87,10 +88,11 @@ MESIDDIODirectedTester::MESIDDIODirectedTester(const Params &params)
     fatal_if(cpuPorts.size() != 2,
              "MESI DDIO directed scenarios require exactly two CPU ports");
 
-    retries.reserve(cpuPorts.size() + 1);
+    retries.reserve(cpuPorts.size() + 2);
     for (auto *port : cpuPorts)
         retries.push_back({port, nullptr, 0});
     retries.push_back({&dmaPort, nullptr, 0});
+    retries.push_back({&dmaRacePort, nullptr, 0});
 
     buildScenario();
 }
@@ -115,6 +117,8 @@ MESIDDIODirectedTester::getPort(const std::string &if_name, PortID idx)
     }
     if (if_name == "dma_port")
         return dmaPort;
+    if (if_name == "dma_race_port")
+        return dmaRacePort;
     return ClockedObject::getPort(if_name, idx);
 }
 
@@ -148,29 +152,29 @@ MESIDDIODirectedTester::reservePhase()
 
 void
 MESIDDIODirectedTester::addReadAt(
-    unsigned phase, unsigned issue_delay, PortKind port, unsigned cpu,
+    unsigned phase, unsigned issue_delay, PortKind port, unsigned port_index,
     Addr address, Request::Flags flags, const std::vector<uint8_t> &expected,
     const std::string &label)
 {
     fatal_if(expected.empty(),
              "Read operation %s has no expected bytes", label);
-    operations.push_back({phase, issue_delay, port, cpu, true, address, flags,
-                          expected, label, {}});
+    operations.push_back({phase, issue_delay, port, port_index, true, address,
+                          flags, expected, label, {}});
 }
 
 void
 MESIDDIODirectedTester::addWriteAt(
-    unsigned phase, unsigned issue_delay, PortKind port, unsigned cpu,
+    unsigned phase, unsigned issue_delay, PortKind port, unsigned port_index,
     Addr address, Request::Flags flags, const std::vector<uint8_t> &data,
     const std::string &label)
 {
-    addMaskedWriteAt(phase, issue_delay, port, cpu, address, flags, data,
-                     std::vector<bool>(data.size(), true), label);
+    addMaskedWriteAt(phase, issue_delay, port, port_index, address, flags,
+                     data, std::vector<bool>(data.size(), true), label);
 }
 
 void
 MESIDDIODirectedTester::addMaskedWriteAt(
-    unsigned phase, unsigned issue_delay, PortKind port, unsigned cpu,
+    unsigned phase, unsigned issue_delay, PortKind port, unsigned port_index,
     Addr address, Request::Flags flags, const std::vector<uint8_t> &data,
     const std::vector<bool> &byte_enable, const std::string &label)
 {
@@ -178,33 +182,35 @@ MESIDDIODirectedTester::addMaskedWriteAt(
     fatal_if(byte_enable.size() != data.size(),
              "Write operation %s has %zu bytes but %zu byte enables", label,
              data.size(), byte_enable.size());
-    operations.push_back({phase, issue_delay, port, cpu, false, address, flags,
-                          data, label, byte_enable});
+    operations.push_back({phase, issue_delay, port, port_index, false, address,
+                          flags, data, label, byte_enable});
 }
 
 void
 MESIDDIODirectedTester::addRead(
-    PortKind port, unsigned cpu, Addr address, Request::Flags flags,
+    PortKind port, unsigned port_index, Addr address, Request::Flags flags,
     const std::vector<uint8_t> &expected, const std::string &label)
 {
-    addReadAt(reservePhase(), 0, port, cpu, address, flags, expected, label);
+    addReadAt(reservePhase(), 0, port, port_index, address, flags, expected,
+              label);
 }
 
 void
 MESIDDIODirectedTester::addWrite(
-    PortKind port, unsigned cpu, Addr address, Request::Flags flags,
+    PortKind port, unsigned port_index, Addr address, Request::Flags flags,
     const std::vector<uint8_t> &data, const std::string &label)
 {
-    addWriteAt(reservePhase(), 0, port, cpu, address, flags, data, label);
+    addWriteAt(reservePhase(), 0, port, port_index, address, flags, data,
+               label);
 }
 
 void
 MESIDDIODirectedTester::addMaskedWrite(
-    PortKind port, unsigned cpu, Addr address, Request::Flags flags,
+    PortKind port, unsigned port_index, Addr address, Request::Flags flags,
     const std::vector<uint8_t> &data,
     const std::vector<bool> &byte_enable, const std::string &label)
 {
-    addMaskedWriteAt(reservePhase(), 0, port, cpu, address, flags, data,
+    addMaskedWriteAt(reservePhase(), 0, port, port_index, address, flags, data,
                      byte_enable, label);
 }
 
@@ -653,6 +659,35 @@ MESIDDIODirectedTester::buildScenario()
                 "read back first partial replacement target");
         addRead(PortKind::Dma, 0, c, generic, thirdMerged,
                 "read back second partial replacement target");
+    } else if (scenario == "partial_claim_dma_read_race" ||
+               scenario == "partial_claim_dma_write_race") {
+        constexpr unsigned ownershipRaceDelay = 24;
+        auto merged = first;
+        merged[7] = 0xee;
+        addWrite(PortKind::Dma, 1, a, generic, first,
+                 "initialize ownership-race memory line");
+
+        const unsigned phase = reservePhase();
+        addWriteAt(phase, 0, PortKind::Dma, 0, a + 7, rxPayload,
+                   {merged[7]}, "partial retained write awaiting ownership");
+        // The retained miss reaches L2, fetches memory, and records L2 as the
+        // directory owner before its DDIO_WRITE claim arrives. The second
+        // controller starts 24 cycles later so its generic request reaches
+        // the directory in that interval and cannot be hidden by the first
+        // DMASequencer's same-line reservation.
+        if (scenario == "partial_claim_dma_read_race") {
+            addReadAt(phase, ownershipRaceDelay, PortKind::Dma, 1, a,
+                      generic, merged,
+                      "generic read racing retained ownership claim");
+            addRead(PortKind::Dma, 1, a, generic, merged,
+                    "final read after ownership-read race");
+        } else {
+            addWriteAt(phase, ownershipRaceDelay, PortKind::Dma, 1, a,
+                       generic, second,
+                       "generic write racing retained ownership claim");
+            addRead(PortKind::Dma, 1, a, generic, second,
+                    "final read after ownership-write race");
+        }
     } else if (scenario == "masked_rejection") {
         const auto maskedData = bytes(4, 0xe0);
         const std::vector<bool> maskedBytes = {true, false, true, false};
@@ -781,9 +816,17 @@ MESIDDIODirectedTester::buildScenario()
 MESIDDIODirectedTester::TestPort &
 MESIDDIODirectedTester::portFor(const Operation &op)
 {
-    fatal_if(op.port == PortKind::Cpu && op.cpu >= cpuPorts.size(),
-             "Operation %s selects invalid CPU port %u", op.label, op.cpu);
-    return op.port == PortKind::Dma ? dmaPort : *cpuPorts[op.cpu];
+    if (op.port == PortKind::Dma) {
+        fatal_if(op.portIndex > 1,
+                 "Operation %s selects invalid DMA port %u", op.label,
+                 op.portIndex);
+        return op.portIndex == 0 ? dmaPort : dmaRacePort;
+    }
+
+    fatal_if(op.portIndex >= cpuPorts.size(),
+             "Operation %s selects invalid CPU port %u", op.label,
+             op.portIndex);
+    return *cpuPorts[op.portIndex];
 }
 
 size_t
@@ -845,9 +888,10 @@ MESIDDIODirectedTester::issueOperation(size_t index)
     op.packet = pkt;
 
     DPRINTF(MESIDDIOTester,
-            "Issuing phase %u %s at %#x (%zu bytes) via %s\n",
-            op.phase, op.label, op.address, op.data.size(),
-            op.port == PortKind::Dma ? "DMA" : "CPU");
+            "Issuing phase %u %s at %#x (%u bytes) via %s %u\n",
+            op.phase, op.label, op.address,
+            static_cast<unsigned>(op.data.size()),
+            op.port == PortKind::Dma ? "DMA" : "CPU", op.portIndex);
 
     if (!port.sendTimingReq(pkt)) {
         retries[retry_index] = {&port, pkt, index};

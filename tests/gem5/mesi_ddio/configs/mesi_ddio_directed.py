@@ -77,11 +77,18 @@ system.cpu = MESIDDIODirectedTester(
     set_stride=128 * args.num_l2caches,
 )
 
+dma_ports = [system.cpu.dma_port]
+if args.scenario in {
+    "partial_claim_dma_read_race",
+    "partial_claim_dma_write_race",
+}:
+    dma_ports.append(system.cpu.dma_race_port)
+
 Ruby.create_system(
     args,
     False,
     system,
-    dma_ports=[system.cpu.dma_port],
+    dma_ports=dma_ports,
     cpus=[system.cpu] * args.num_cpus,
 )
 system.ruby.clk_domain = SrcClockDomain(

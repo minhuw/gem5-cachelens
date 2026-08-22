@@ -35,7 +35,8 @@ class MESIDDIODirectedTester(ClockedObject):
     cxx_class = "gem5::MESIDDIODirectedTester"
 
     cpu_ports = VectorRequestPort("CPU-side Ruby sequencer ports")
-    dma_port = RequestPort("DMA-side Ruby sequencer port")
+    dma_port = RequestPort("Primary DMA-side Ruby sequencer port")
+    dma_race_port = RequestPort("Racing DMA-side Ruby sequencer port")
 
     scenario = Param.String("Directed MESI DDIO scenario")
     base_addr = Param.Addr(0x10000, "Base address of the test region")
