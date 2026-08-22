@@ -72,11 +72,18 @@ class DMASequencerCapabilityVerifier(verifier.Verifier):
 
 
 class MESIDDIOStatsVerifier(verifier.Verifier):
-    def __init__(self, expected, minimum=None, runtime_expected=None):
+    def __init__(
+        self,
+        expected,
+        minimum=None,
+        runtime_expected=None,
+        runtime_absent=None,
+    ):
         super().__init__()
         self._expected = expected
         self._minimum = minimum or {}
         self._runtime_expected = runtime_expected or {}
+        self._runtime_absent = runtime_absent or ()
 
     @staticmethod
     def _read_stats(path):
@@ -127,12 +134,22 @@ class MESIDDIOStatsVerifier(verifier.Verifier):
                 )
 
         for name, expected in self._runtime_expected.items():
-            # Protocol transition stats with zero occurrences are omitted.
-            observed = stats.get(name, 0)
+            if name not in stats:
+                test_util.fail(f"Missing required runtime statistic {name}")
+            observed = stats[name]
             if observed != expected:
                 test_util.fail(
                     f"Unexpected runtime statistic {name}: "
                     f"observed={observed}, expected={expected}"
+                )
+
+        # gem5 omits protocol transition statistics with zero occurrences.
+        # Absence is therefore an explicit expectation, not an implicit zero.
+        for name in self._runtime_absent:
+            if name in stats:
+                test_util.fail(
+                    f"Runtime statistic {name} was present with value "
+                    f"{stats[name]}, expected it to be omitted"
                 )
 
 
@@ -143,6 +160,7 @@ def _register(
     ddio_way_part=1,
     minimum=None,
     runtime_expected=None,
+    runtime_absent=None,
 ):
     gem5_verify_config(
         name=name,
@@ -154,7 +172,9 @@ def _register(
                 )
             ),
             DMASequencerCapabilityVerifier(),
-            MESIDDIOStatsVerifier(expected, minimum, runtime_expected),
+            MESIDDIOStatsVerifier(
+                expected, minimum, runtime_expected, runtime_absent
+            ),
         ),
         config=_CONFIG,
         config_args=(
@@ -252,6 +272,218 @@ _register(
 )
 
 _register(
+    "mesi-ddio-two-way-subset-lru-victim",
+    "multi_way_subset_lru",
+    {
+        "rxPayloadRequests": 3,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 3,
+        "txPayloadRequests": 4,
+        "txPayloadHits": 3,
+        "txPayloadMisses": 1,
+        "rxPayloadAllocWays::0": 1,
+        "rxPayloadAllocWays::1": 2,
+        "rxPayloadAllocWays::2": 0,
+        "rxPayloadAllocWays::3": 0,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayFill::nic_rx_payload_way1": 2,
+        "ddioWayFill::nic_rx_payload_way2": 0,
+        "ddioWayFill::nic_rx_payload_way3": 0,
+        "ddioWayFill::total": 3,
+        "ddioWayAccess::nic_tx_payload_way0": 2,
+        "ddioWayAccess::nic_tx_payload_way1": 1,
+        "ddioWayAccess::nic_tx_payload_way2": 0,
+        "ddioWayAccess::nic_tx_payload_way3": 0,
+        "ddioWayAccess::total": 3,
+        "wayDeallocations::way0": 0,
+        "wayDeallocations::way1": 1,
+        "wayDeallocations::way2": 0,
+        "wayDeallocations::way3": 0,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 1,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 1,
+        "ddioOwnershipRequests": 3,
+        "ddioOwnershipAcks": 3,
+    },
+    ddio_way_part=2,
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 4,
+        "system.ruby.DMA_Controller.Data": 4,
+        "system.ruby.DMA_Controller.WriteRequest": 3,
+        "system.ruby.DMA_Controller.Ack": 3,
+        "system.ruby.L2Cache_Controller.DDIO_Replacement": 1,
+        "system.ruby.L2Cache_Controller.M.DDIO_Replacement": 1,
+        "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
+    },
+    runtime_absent=(
+        "system.ruby.L2Cache_Controller.DDIO_Replacement_clean",
+        "system.ruby.L2Cache_Controller.M.DDIO_Replacement_clean",
+    ),
+)
+
+_register(
+    "mesi-ddio-clean-ss-subset-replacement",
+    "clean_subset_ss",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 2,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 1,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayFill::cpu_other_way0": 1,
+        "ddioWayFill::total": 2,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::cpu_other_way0": 1,
+        "ddioWayAccess::total": 2,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 1,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 1,
+        "ddioOwnershipRequests": 1,
+        "ddioOwnershipAcks": 1,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 2,
+        "system.ruby.DMA_Controller.Data": 2,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.DDIO_Replacement_clean": 1,
+        "system.ruby.L2Cache_Controller.SS.DDIO_Replacement_clean": 1,
+        "system.ruby.L2Cache_Controller.I_I.Ack": 1,
+        "system.ruby.L2Cache_Controller.I_I.Ack_all": 1,
+        "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
+    },
+    runtime_absent=(
+        "system.ruby.L2Cache_Controller.DDIO_Replacement",
+        "system.ruby.L2Cache_Controller.SS.DDIO_Replacement",
+    ),
+)
+
+_register(
+    "mesi-ddio-clean-m-subset-replacement",
+    "clean_subset_m",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 2,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 1,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayFill::cpu_other_way0": 1,
+        "ddioWayFill::cpu_other_way1": 1,
+        "ddioWayFill::cpu_other_way2": 1,
+        "ddioWayFill::cpu_other_way3": 0,
+        "ddioWayFill::total": 4,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::total": 1,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 1,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 1,
+        "ddioOwnershipRequests": 1,
+        "ddioOwnershipAcks": 1,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 2,
+        "system.ruby.DMA_Controller.Data": 2,
+        "system.ruby.DMA_Controller.WriteRequest": 4,
+        "system.ruby.DMA_Controller.Ack": 4,
+        "system.ruby.L2Cache_Controller.DDIO_Replacement_clean": 1,
+        "system.ruby.L2Cache_Controller.M.DDIO_Replacement_clean": 1,
+        "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
+    },
+    runtime_absent=(
+        "system.ruby.L2Cache_Controller.DDIO_Replacement",
+        "system.ruby.L2Cache_Controller.M.DDIO_Replacement",
+    ),
+)
+
+_register(
+    "mesi-ddio-clean-mt-subset-replacement",
+    "clean_subset_mt",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 1,
+        "txPayloadRequests": 2,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 1,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayFill::cpu_other_way0": 1,
+        "ddioWayFill::total": 2,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::total": 1,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 1,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 1,
+        "ddioOwnershipRequests": 1,
+        "ddioOwnershipAcks": 1,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 2,
+        "system.ruby.DMA_Controller.Data": 2,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.DDIO_Replacement_clean": 1,
+        "system.ruby.L2Cache_Controller.MT.DDIO_Replacement_clean": 1,
+        "system.ruby.L2Cache_Controller.MCT_I.Ack_all": 1,
+        "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
+    },
+    runtime_absent=(
+        "system.ruby.L2Cache_Controller.DDIO_Replacement",
+        "system.ruby.L2Cache_Controller.MT.DDIO_Replacement",
+    ),
+)
+
+_register(
+    "mesi-ddio-dirty-ss-subset-replacement",
+    "dirty_subset_ss",
+    {
+        "rxPayloadRequests": 2,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 2,
+        "txPayloadRequests": 2,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 1,
+        "ddioWayFill::nic_rx_payload_way0": 2,
+        "ddioWayFill::total": 2,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::cpu_other_way0": 2,
+        "ddioWayAccess::total": 3,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 1,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 1,
+        "ddioOwnershipRequests": 2,
+        "ddioOwnershipAcks": 2,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 2,
+        "system.ruby.DMA_Controller.Data": 2,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.DDIO_Replacement": 1,
+        "system.ruby.L2Cache_Controller.SS.DDIO_Replacement": 1,
+        "system.ruby.L2Cache_Controller.S_I.Ack": 1,
+        "system.ruby.L2Cache_Controller.S_I.Ack_all": 1,
+        "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
+    },
+    runtime_absent=(
+        "system.ruby.L2Cache_Controller.DDIO_Replacement_clean",
+        "system.ruby.L2Cache_Controller.SS.DDIO_Replacement_clean",
+    ),
+)
+
+_register(
     "mesi-ddio-invalidates-inclusive-l1-sharers",
     "l1_sharer_invalidation",
     {
@@ -338,6 +570,43 @@ _register(
 )
 
 _register(
+    "mesi-ddio-tx-read-clean-exclusive-owner",
+    "clean_owner_tx",
+    {
+        "rxPayloadRequests": 0,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 0,
+        "txPayloadRequests": 2,
+        "txPayloadHits": 2,
+        "txPayloadMisses": 0,
+        "ddioWayFill::nic_tx_payload_way0": 0,
+        "ddioWayFill::cpu_other_way0": 1,
+        "ddioWayFill::total": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 2,
+        "ddioWayAccess::total": 2,
+        "wayDeallocations::total": 0,
+        "dmaRoutingProxyRequests": 0,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 0,
+        "ddioOwnershipAcks": 0,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 2,
+        "system.ruby.DMA_Controller.Data": 2,
+        "system.ruby.DMA_Controller.WriteRequest": 1,
+        "system.ruby.DMA_Controller.Ack": 1,
+        "system.ruby.L2Cache_Controller.MT.DMA_TX_READ": 1,
+        "system.ruby.L2Cache_Controller.DM_RT.Ack_all": 1,
+        "system.ruby.L2Cache_Controller.M.DMA_TX_READ": 1,
+    },
+    runtime_absent=(
+        "system.ruby.L2Cache_Controller.DM_RT.WB_Data",
+        "system.ruby.L2Cache_Controller.DM_RT.WB_Data_clean",
+    ),
+)
+
+_register(
     "mesi-ddio-telemetry-counts-once",
     "telemetry_exactness",
     {
@@ -406,9 +675,11 @@ _register(
         "system.ruby.DMA_Controller.Ack": 2,
         "system.ruby.Directory_Controller.M.DMA_WRITE_PARTIAL": 1,
         "system.ruby.Directory_Controller.M_DWR.Data": 1,
-        "system.ruby.Directory_Controller.M_DWR.CleanReplacement": 0,
         "system.ruby.Directory_Controller.M_DWRI.Memory_Ack": 1,
     },
+    runtime_absent=(
+        "system.ruby.Directory_Controller.M_DWR.CleanReplacement",
+    ),
 )
 
 _register(
@@ -470,11 +741,11 @@ _register(
         "system.ruby.DMA_Controller.Ack": 5,
         "system.ruby.Directory_Controller.M.DMA_READ": 1,
         "system.ruby.Directory_Controller.M_DRD.CleanReplacement": 1,
-        "system.ruby.Directory_Controller.M_DRD.Data": 0,
         "system.ruby.Directory_Controller.ID.Memory_Data": 1,
         "system.ruby.L2Cache_Controller.M.L2_Replacement_clean": 1,
         "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
     },
+    runtime_absent=("system.ruby.Directory_Controller.M_DRD.Data",),
 )
 
 _register(
@@ -502,11 +773,11 @@ _register(
         "system.ruby.DMA_Controller.Ack": 6,
         "system.ruby.Directory_Controller.M.DMA_WRITE_FULL": 1,
         "system.ruby.Directory_Controller.M_DWR.CleanReplacement": 1,
-        "system.ruby.Directory_Controller.M_DWR.Data": 0,
         "system.ruby.Directory_Controller.ID_W.Memory_Ack": 6,
         "system.ruby.L2Cache_Controller.M.L2_Replacement_clean": 1,
         "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
     },
+    runtime_absent=("system.ruby.Directory_Controller.M_DWR.Data",),
 )
 
 _register(
@@ -633,8 +904,48 @@ _register(
         "system.ruby.L2Cache_Controller.SS.DMA_WRITE_PARTIAL": 1,
         "system.ruby.L2Cache_Controller.DM_WS.Ack": 1,
         "system.ruby.L2Cache_Controller.DM_WS.Ack_all": 1,
-        "system.ruby.L2Cache_Controller.DM_WS.WB_Data": 0,
     },
+    runtime_absent=("system.ruby.L2Cache_Controller.DM_WS.WB_Data",),
+)
+
+_register(
+    "mesi-ddio-partial-write-clean-exclusive-owner",
+    "partial_clean_owner",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 1,
+        "rxPayloadMisses": 0,
+        "txPayloadRequests": 2,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 1,
+        "ddioWayFill::nic_rx_payload_way0": 0,
+        "ddioWayFill::cpu_other_way0": 1,
+        "ddioWayFill::total": 1,
+        "ddioWayAccess::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::total": 2,
+        "wayDeallocations::way0": 1,
+        "wayDeallocations::total": 1,
+        "dmaRoutingProxyRequests": 1,
+        "dmaRoutingTransientRecycles": 0,
+        "ddioReplacementStalls": 0,
+        "ddioOwnershipRequests": 0,
+        "ddioOwnershipAcks": 0,
+    },
+    runtime_expected={
+        "system.ruby.DMA_Controller.ReadRequest": 3,
+        "system.ruby.DMA_Controller.Data": 3,
+        "system.ruby.DMA_Controller.WriteRequest": 2,
+        "system.ruby.DMA_Controller.Ack": 2,
+        "system.ruby.L2Cache_Controller.MT.DMA_WRITE_PARTIAL": 1,
+        "system.ruby.L2Cache_Controller.DM_WM.Ack_all": 1,
+        "system.ruby.L2Cache_Controller.M.DMA_TX_READ": 1,
+        "system.ruby.L2Cache_Controller.NP.DMA_TX_READ": 1,
+    },
+    runtime_absent=(
+        "system.ruby.L2Cache_Controller.DM_WM.WB_Data",
+        "system.ruby.L2Cache_Controller.DM_WM.WB_Data_clean",
+    ),
 )
 
 _register(
@@ -665,8 +976,8 @@ _register(
         "system.ruby.DMA_Controller.Ack": 2,
         "system.ruby.L2Cache_Controller.MT.DMA_WRITE_PARTIAL": 1,
         "system.ruby.L2Cache_Controller.DM_WM.WB_Data": 1,
-        "system.ruby.L2Cache_Controller.DM_WM.Ack_all": 0,
     },
+    runtime_absent=("system.ruby.L2Cache_Controller.DM_WM.Ack_all",),
 )
 
 _register(
@@ -828,9 +1139,11 @@ _register(
         "system.ruby.DMA_Controller.Data": 1,
         "system.ruby.DMA_Controller.WriteRequest": 1,
         "system.ruby.DMA_Controller.Ack": 1,
-        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL": 0,
-        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_FULL": 0,
     },
+    runtime_absent=(
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_PARTIAL",
+        "system.ruby.L2Cache_Controller.NP.DMA_WRITE_FULL",
+    ),
 )
 
 _register(
@@ -858,10 +1171,10 @@ _register(
         "system.ruby.DMA_Controller.Ack": 6,
         "system.ruby.Directory_Controller.M.DMA_WRITE_PARTIAL": 1,
         "system.ruby.Directory_Controller.M_DWR.CleanReplacementPartial": 1,
-        "system.ruby.Directory_Controller.M_DWR.Data": 0,
         "system.ruby.Directory_Controller.ID_WF.Memory_Data": 1,
         "system.ruby.Directory_Controller.ID_W.Memory_Ack": 6,
         "system.ruby.L2Cache_Controller.M.L2_Replacement_clean": 1,
         "system.ruby.L2Cache_Controller.M_I.Mem_Ack": 1,
     },
+    runtime_absent=("system.ruby.Directory_Controller.M_DWR.Data",),
 )

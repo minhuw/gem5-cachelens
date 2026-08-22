@@ -267,6 +267,80 @@ MESIDDIODirectedTester::buildScenario()
                 "read back inclusive dirty victim");
         addRead(PortKind::Dma, 0, b, txPayload, second,
                 "replacement line remains retained");
+    } else if (scenario == "multi_way_subset_lru") {
+        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+                 "fill DDIO subset way zero");
+        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+                 "fill DDIO subset way one");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "make way-zero line most recently used");
+        addWrite(PortKind::Dma, 0, c, rxPayload, third,
+                 "replace least-recently used subset way");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "way-zero line survives subset replacement");
+        addRead(PortKind::Dma, 0, c, txPayload, third,
+                "replacement line occupies evicted subset way");
+        addRead(PortKind::Dma, 0, b, txPayload, second,
+                "evicted subset line is recovered from memory");
+    } else if (scenario == "clean_subset_ss") {
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean shared victim");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "create first clean sharer");
+        addRead(PortKind::Cpu, 1, a + 1, generic, {first[1]},
+                "create clean SS victim");
+        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+                 "replace clean SS subset victim");
+        addRead(PortKind::Dma, 0, b, txPayload, second,
+                "clean SS replacement line remains retained");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "clean SS victim remains correct in memory");
+    } else if (scenario == "clean_subset_m") {
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean M victim");
+        addWrite(PortKind::Dma, 0, b, generic, second,
+                 "initialize first clean M eviction helper");
+        addWrite(PortKind::Dma, 0, c, generic, third,
+                 "initialize second clean M eviction helper");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "fill clean M victim into private L1");
+        addRead(PortKind::Cpu, 0, b, generic, {second[0]},
+                "fill first helper into private L1");
+        addRead(PortKind::Cpu, 0, c, generic, {third[0]},
+                "evict clean victim back to L2 M");
+        addWrite(PortKind::Dma, 0, d, rxPayload, fourth,
+                 "replace clean M subset victim");
+        addRead(PortKind::Dma, 0, d, txPayload, fourth,
+                "clean M replacement line remains retained");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "clean M victim remains correct in memory");
+    } else if (scenario == "clean_subset_mt") {
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean MT victim");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "create clean exclusive L1 owner");
+        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+                 "replace clean MT subset victim");
+        addRead(PortKind::Dma, 0, b, txPayload, second,
+                "clean MT replacement line remains retained");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "clean MT victim remains correct in memory");
+    } else if (scenario == "dirty_subset_ss") {
+        // A retained RX line is dirty in L2. Clean exclusive and shared CPU
+        // reads do not clear that dirty bit, so the resulting SS state can
+        // reach the dirty DDIO-subset replacement transition.
+        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+                 "seed dirty SS victim in retained L2");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "create clean exclusive owner of dirty L2 data");
+        addRead(PortKind::Cpu, 1, a + 1, generic, {first[1]},
+                "downgrade retained dirty data to SS");
+        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+                 "replace dirty SS subset victim");
+        addRead(PortKind::Dma, 0, b, txPayload, second,
+                "dirty SS replacement line remains retained");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "dirty SS victim is written back correctly");
     } else if (scenario == "l1_sharer_invalidation") {
         addWrite(PortKind::Dma, 0, a, generic, first,
                  "initialize shared line");
@@ -324,6 +398,15 @@ MESIDDIODirectedTester::buildScenario()
                 "TX retrieves dirty owner data");
         addRead(PortKind::Dma, 0, a, txPayload, dirty,
                 "retrieved line is retained in L2");
+    } else if (scenario == "clean_owner_tx") {
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean TX-owner line");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "create clean exclusive TX owner");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "TX retrieves data from clean exclusive owner");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "clean-owner TX data remains retained without allocation");
     } else if (scenario == "telemetry_exactness") {
         const Addr txMiss = a + blockSize;
         const Addr header = a + 2 * blockSize;
@@ -435,6 +518,22 @@ MESIDDIODirectedTester::buildScenario()
                 "first CPU observes SS invalidation");
         addRead(PortKind::Cpu, 1, a + 23, generic, {merged[23]},
                 "second CPU observes SS invalidation");
+    } else if (scenario == "partial_clean_owner") {
+        auto merged = first;
+        const auto partial = bytes(3, 0x70);
+        std::copy(partial.begin(), partial.end(), merged.begin() + 2);
+        addWrite(PortKind::Dma, 0, a, generic, first,
+                 "initialize clean-owner partial line");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "create clean exclusive partial-write owner");
+        addWrite(PortKind::Dma, 0, a + 2, rxPayload, partial,
+                 "partial NIC write invalidates clean owner");
+        addRead(PortKind::Dma, 0, a, txPayload, merged,
+                "retained line preserves clean-owner untouched bytes");
+        addRead(PortKind::Dma, 0, a, generic, merged,
+                "generic DMA receives merged retained line");
+        addRead(PortKind::Dma, 0, a, txPayload, merged,
+                "TX miss observes merged memory after L2 invalidation");
     } else if (scenario == "partial_dirty_owner") {
         auto merged = first;
         merged[7] = 0xee;

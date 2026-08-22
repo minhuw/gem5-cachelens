@@ -225,6 +225,68 @@ TEST_F(CacheMemoryTest, DDIOInvalidAllocationsRotate)
     EXPECT_EQ(wayOf(secondAddress), 1);
 }
 
+TEST_F(CacheMemoryTest, DDIOSubsetProbeUsesLRUAndReusesFreedWay)
+{
+    makeCache(2);
+    constexpr Addr firstAddress = 0;
+    const Addr secondAddress = sameSetAddress(firstAddress, 1);
+    const Addr outsideAddress0 = sameSetAddress(firstAddress, 2);
+    const Addr outsideAddress1 = sameSetAddress(firstAddress, 3);
+    const Addr incomingAddress = sameSetAddress(firstAddress, 4);
+
+    // Seed globally older lines outside the DDIO subset. A full-set probe
+    // would choose one of these lines instead of either subset entry.
+    setNextWay(setOf(firstAddress), 2);
+    tick = 1;
+    auto *outside0 = new TestEntry;
+    cache->allocate(outsideAddress0, outside0);
+    outside0->m_Permission = AccessPermission_Read_Write;
+    tick = 2;
+    auto *outside1 = new TestEntry;
+    cache->allocate(outsideAddress1, outside1);
+    outside1->m_Permission = AccessPermission_Read_Write;
+    ASSERT_EQ(wayOf(outsideAddress0), 2);
+    ASSERT_EQ(wayOf(outsideAddress1), 3);
+
+    EXPECT_TRUE(cache->cacheAvailInWays(firstAddress, 2));
+    tick = 3;
+    auto *first = new TestEntry;
+    cache->allocateInWays(firstAddress, first, 2);
+    first->m_Permission = AccessPermission_Read_Write;
+    EXPECT_EQ(wayOf(firstAddress), 0);
+
+    EXPECT_TRUE(cache->cacheAvailInWays(secondAddress, 2));
+    tick = 4;
+    auto *second = new TestEntry;
+    cache->allocateInWays(secondAddress, second, 2);
+    second->m_Permission = AccessPermission_Read_Write;
+    EXPECT_EQ(wayOf(secondAddress), 1);
+    EXPECT_FALSE(cache->cacheAvailInWays(incomingAddress, 2));
+
+    // Explicitly make way 0 most-recently used, so way 1 is the subset LRU.
+    tick = 10;
+    cache->setMRU(secondAddress);
+    tick = 11;
+    cache->setMRU(firstAddress);
+
+    const Addr victim = cache->cacheProbeInWays(incomingAddress, 2);
+    EXPECT_EQ(victim, secondAddress);
+    EXPECT_LT(wayOf(victim), 2);
+    EXPECT_NE(victim, outsideAddress0);
+    EXPECT_NE(victim, outsideAddress1);
+
+    cache->deallocate(victim);
+    EXPECT_TRUE(cache->cacheAvailInWays(incomingAddress, 2));
+    tick = 13;
+    auto *incoming = new TestEntry;
+    cache->allocateInWays(incomingAddress, incoming, 2);
+    incoming->m_Permission = AccessPermission_Read_Write;
+    EXPECT_EQ(wayOf(incomingAddress), 1);
+    EXPECT_EQ(tagCount(secondAddress), 0);
+    EXPECT_EQ(wayOf(outsideAddress0), 2);
+    EXPECT_EQ(wayOf(outsideAddress1), 3);
+}
+
 TEST_F(CacheMemoryTest, LookupRejectsInvalidStaleTagIndex)
 {
     makeCache(2);
