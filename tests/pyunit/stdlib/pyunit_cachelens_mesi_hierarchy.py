@@ -8,6 +8,9 @@ import unittest
 from m5.objects import RubySystem
 
 from gem5.coherence_protocol import CoherenceProtocol
+from gem5.components.cachehierarchies.ruby.mesi_two_level_cache_hierarchy import (
+    MESITwoLevelCacheHierarchy,
+)
 from gem5.isas import ISA
 from gem5.prebuilt import cachelens
 from gem5.prebuilt.cachelens import CacheLensMESITwoLevelHierarchy
@@ -77,6 +80,17 @@ class CacheLensMESIHierarchyTestSuite(unittest.TestCase):
         self.assertEqual(-1, configuration["ddio_way_part"])
         self.assertEqual("TreePLRU", configuration["llc_replacement_policy"])
         self.assertEqual("linear", hierarchy.get_indexing_policy())
+        self.assertEqual("linear", configuration["indexing_policy"])
+        self.assertFalse(hierarchy._l2_addr_hash)
+
+        experimental = CacheLensMESITwoLevelHierarchy(
+            indexing_policy="splitmix64"
+        )
+        self.assertEqual("splitmix64", experimental.get_indexing_policy())
+        self.assertEqual(
+            "splitmix64", experimental.get_configuration()["indexing_policy"]
+        )
+        self.assertTrue(experimental._l2_addr_hash)
 
         ddio = CacheLensMESITwoLevelHierarchy(model_profile="intel-ddio")
         self.assertEqual(2, ddio.get_configuration()["ddio_way_part"])
@@ -103,6 +117,27 @@ class CacheLensMESIHierarchyTestSuite(unittest.TestCase):
             CacheLensMESITwoLevelHierarchy(hnf_size="192KiB", hnf_assoc=8)
         with self.assertRaisesRegex(ValueError, "x86-only"):
             CacheLensMESITwoLevelHierarchy(model_profile="arm-generic")
+        with self.assertRaisesRegex(ValueError, "indexing_policy"):
+            CacheLensMESITwoLevelHierarchy(indexing_policy="xor")
+
+    def test_stock_mesi_shared_l2_hash_is_opt_in(self) -> None:
+        common = {
+            "l1i_size": "16KiB",
+            "l1i_assoc": 2,
+            "l1d_size": "32KiB",
+            "l1d_assoc": 4,
+            "l2_size": "1MiB",
+            "l2_assoc": 8,
+            "num_l2_banks": 2,
+        }
+        self.assertFalse(MESITwoLevelCacheHierarchy(**common)._l2_addr_hash)
+        self.assertTrue(
+            MESITwoLevelCacheHierarchy(
+                **common, l2_addr_hash=True
+            )._l2_addr_hash
+        )
+        with self.assertRaisesRegex(TypeError, "l2_addr_hash"):
+            MESITwoLevelCacheHierarchy(**common, l2_addr_hash=1)
 
     def test_architecture_and_bank_selection(self) -> None:
         hierarchy = CacheLensMESITwoLevelHierarchy(num_hnfs=4)

@@ -47,6 +47,11 @@ parser.add_argument(
     choices=("noninclusive", "inclusive"),
     default="noninclusive",
 )
+parser.add_argument(
+    "--indexing-policy",
+    choices=("linear", "splitmix64"),
+    default="linear",
+)
 args = parser.parse_args()
 
 isa = ISA.ARM if args.isa == "arm" else ISA.X86
@@ -92,7 +97,7 @@ if args.coherence_protocol == "chi":
     hierarchy = CacheLensCHIHierarchy(
         l1d_size="32KiB",
         l1d_assoc=2,
-        indexing_policy="linear",
+        indexing_policy=args.indexing_policy,
         dealloc_on_unique=False,
         hnf_inclusion=args.hnf_inclusion,
         **hierarchy_args,
@@ -104,7 +109,10 @@ else:
 
     if args.hnf_inclusion != "inclusive":
         parser.error("MESI_Two_Level is inclusive by protocol.")
-    hierarchy = CacheLensMESITwoLevelHierarchy(**hierarchy_args)
+    hierarchy = CacheLensMESITwoLevelHierarchy(
+        indexing_policy=args.indexing_policy,
+        **hierarchy_args,
+    )
 processor = SimpleProcessor(
     cpu_type=cpu_type,
     isa=isa,
@@ -182,7 +190,8 @@ simulator.run()
 
 assert all(core.get_type() == cpu_type for core in processor.get_cores())
 configuration = hierarchy.get_configuration()
-assert hierarchy.get_indexing_policy() == "linear"
+assert hierarchy.get_indexing_policy() == args.indexing_policy
+assert configuration["indexing_policy"] == args.indexing_policy
 assert hierarchy.get_model_profile() == model_profile
 assert hierarchy.get_total_hnf_capacity_bytes() == 2 << 20
 assert {hierarchy.hnf_index_for_address(line * 64) for line in range(32)} == {
@@ -205,7 +214,9 @@ if args.coherence_protocol == "chi":
     assert bool(hierarchy.hnfs[0].nic_read_no_allocate) == (
         model_profile == "intel-ddio"
     )
-    assert not bool(hierarchy.hnfs[0].cache.addr_hash)
+    assert bool(hierarchy.hnfs[0].cache.addr_hash) == (
+        args.indexing_policy == "splitmix64"
+    )
     assert len(hierarchy.get_hnf_ranges()) == 2
     hnf = hierarchy.hnfs[0]
     assert bool(hnf.enable_DMT) == (args.hnf_inclusion == "noninclusive")
@@ -246,9 +257,11 @@ else:
         assert int(controller.L1Icache.size) == 16 << 10
         assert int(controller.L1Icache.assoc) == 2
         assert int(controller.L1Icache.start_index_bit) == 6
+        assert not bool(controller.L1Icache.addr_hash)
         assert int(controller.L1Dcache.size) == 512 << 10
         assert int(controller.L1Dcache.assoc) == 4
         assert int(controller.L1Dcache.start_index_bit) == 6
+        assert not bool(controller.L1Dcache.addr_hash)
         assert int(controller.l2_select_num_bits) == 1
 
     assert len(hierarchy.l2_controllers) == 2
@@ -256,6 +269,9 @@ else:
         assert int(controller.L2cache.size) == 1 << 20
         assert int(controller.L2cache.assoc) == 8
         assert int(controller.L2cache.start_index_bit) == 7
+        assert bool(controller.L2cache.addr_hash) == (
+            args.indexing_policy == "splitmix64"
+        )
         assert int(controller.L2cache.ddio_way_part) == 2
         assert type(controller.L2cache.replacement_policy).__name__ == "LRURP"
 

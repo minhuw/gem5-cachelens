@@ -287,10 +287,6 @@ def _validate_args(parser, args) -> None:
                 "MESI_Two_Level is inclusive by protocol; "
                 "--hnf-inclusion noninclusive is invalid."
             )
-        if args.indexing_policy != "linear":
-            parser.error(
-                "MESI_Two_Level supports only the linear indexing policy."
-            )
         if args.dealloc_on_unique:
             parser.error(
                 "--dealloc-on-unique is CHI-only and cannot be enabled for "
@@ -410,7 +406,13 @@ def _create_cache_hierarchy(args, isa: ISA):
         CacheLensMESITwoLevelHierarchy,
     )
 
-    return CacheLensMESITwoLevelHierarchy(**common), "cachelens-mesi-two-level"
+    return (
+        CacheLensMESITwoLevelHierarchy(
+            indexing_policy=args.indexing_policy,
+            **common,
+        ),
+        "cachelens-mesi-two-level",
+    )
 
 
 def _checkpoint_prep_configuration(args):

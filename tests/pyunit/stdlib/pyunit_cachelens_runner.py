@@ -64,9 +64,19 @@ class CacheLensRunnerTestSuite(unittest.TestCase):
             _RUNNER._selected_protocol(args),
         )
 
+        splitmix_args = self._parse(
+            "--coherence-protocol",
+            "mesi-two-level",
+            "--hnf-inclusion",
+            "inclusive",
+            "--indexing-policy",
+            "splitmix64",
+        )
+        _RUNNER._validate_args(parser, splitmix_args)
+        self.assertEqual("splitmix64", splitmix_args.indexing_policy)
+
         for invalid in (
             ("--hnf-inclusion", "noninclusive"),
-            ("--indexing-policy", "splitmix64"),
             ("--dealloc-on-unique",),
             ("--l1d-size", "128KiB"),
         ):

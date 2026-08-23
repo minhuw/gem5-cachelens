@@ -58,7 +58,8 @@ class MESITwoLevelCacheHierarchy(
     """A two level private L1 shared L2 MESI hierarchy.
 
     In addition to the normal two level parameters, you can also change the
-    number of L2 banks in this protocol.
+    number of L2 banks and optionally hash shared-L2 set indices in this
+    protocol. Private L1 caches always retain linear indexing.
 
     The on-chip network is a point-to-point all-to-all simple network.
     """
@@ -73,6 +74,7 @@ class MESITwoLevelCacheHierarchy(
         l2_assoc: str,
         num_l2_banks: int,
         ddio_way_part: int = -1,
+        l2_addr_hash: bool = False,
     ):
         AbstractRubyCacheHierarchy.__init__(self=self)
         AbstractTwoLevelCacheHierarchy.__init__(
@@ -91,9 +93,12 @@ class MESITwoLevelCacheHierarchy(
             raise ValueError(
                 "ddio_way_part must be -1 or between 1 and l2_assoc."
             )
+        if not isinstance(l2_addr_hash, bool):
+            raise TypeError("l2_addr_hash must be a bool.")
 
         self._num_l2_banks = num_l2_banks
         self._ddio_way_part = ddio_way_part
+        self._l2_addr_hash = l2_addr_hash
         self._l2_select_num_bits = int(math.log2(num_l2_banks))
 
     @overrides(AbstractCacheHierarchy)
@@ -166,6 +171,7 @@ class MESITwoLevelCacheHierarchy(
                 l2_select_num_bits,
                 cache_line_size,
                 self._ddio_way_part,
+                addr_hash=self._l2_addr_hash,
             )
             for _ in range(self._num_l2_banks)
         ]

@@ -80,6 +80,7 @@ def cachelens_test(
     model_profile="abstract",
     hnf_inclusion="noninclusive",
     coherence_protocol="chi",
+    indexing_policy="linear",
 ):
     suffix = "config" if max_ticks is not None else "boot"
     config_args = [
@@ -95,6 +96,8 @@ def cachelens_test(
         model_profile,
         "--hnf-inclusion",
         hnf_inclusion,
+        "--indexing-policy",
+        indexing_policy,
     ]
     if max_ticks is not None:
         config_args += ["--max-ticks", str(max_ticks)]
@@ -112,10 +115,13 @@ def cachelens_test(
         )
         fixture_protocol = "CHI" if isa == "x86" else None
 
+    indexing_suffix = (
+        "" if indexing_policy == "linear" else f"-{indexing_policy}"
+    )
     gem5_verify_config(
         name=(
             f"cachelens-modern-{isa}-{coherence_protocol}-{cpu_type}-"
-            f"{model_profile}-{hnf_inclusion}-8gib-{suffix}"
+            f"{model_profile}-{hnf_inclusion}{indexing_suffix}-8gib-{suffix}"
         ),
         fixtures=(),
         verifiers=(
@@ -425,6 +431,16 @@ cachelens_test(
     model_profile="abstract",
     hnf_inclusion="inclusive",
     coherence_protocol="mesi-two-level",
+)
+cachelens_test(
+    isa="x86",
+    length=constants.quick_tag,
+    max_ticks=1,
+    cpu_type="timing",
+    model_profile="abstract",
+    hnf_inclusion="inclusive",
+    coherence_protocol="mesi-two-level",
+    indexing_policy="splitmix64",
 )
 cachelens_test(
     isa="x86",

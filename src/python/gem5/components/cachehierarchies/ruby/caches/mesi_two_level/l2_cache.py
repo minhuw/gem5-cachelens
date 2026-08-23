@@ -52,6 +52,7 @@ class L2Cache(MESI_Two_Level_L2Cache_Controller):
         l2_select_num_bits,
         cache_line_size,
         ddio_way_part=-1,
+        addr_hash=False,
     ):
         super().__init__()
 
@@ -69,6 +70,7 @@ class L2Cache(MESI_Two_Level_L2Cache_Controller):
             size=l2_size,
             assoc=l2_assoc,
             start_index_bit=self.getIndexBit(l2_select_num_bits),
+            addr_hash=addr_hash,
             ddio_way_part=ddio_way_part,
             replacement_policy=(
                 LRURP() if ddio_way_part > 0 else TreePLRURP()

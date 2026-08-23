@@ -48,7 +48,9 @@ class CacheLensMESITwoLevelHierarchy(MESITwoLevelCacheHierarchy):
     This class intentionally wraps the stdlib MESI controllers and point-to-
     point network. The CacheLens ``l2_*`` inputs map to MESI's private L1D
     capacity because this protocol has no separate private L2. The ``hnf_*``
-    inputs map to the inclusive shared MESI L2 banks used as the LLC.
+    inputs map to the inclusive shared MESI L2 banks used as the LLC. Optional
+    SplitMix64 indexing applies only to those shared banks; private L1I/L1D
+    caches and the existing low-bit bank selection remain unchanged.
     """
 
     def __init__(
@@ -62,6 +64,7 @@ class CacheLensMESITwoLevelHierarchy(MESITwoLevelCacheHierarchy):
         hnf_assoc: int = 8,
         num_hnfs: int = 1,
         ddio_way_part: Optional[int] = None,
+        indexing_policy: str = "linear",
         model_profile: str = "abstract",
         core_clock: Optional[str] = None,
         link_latency: int = 1,
@@ -94,6 +97,10 @@ class CacheLensMESITwoLevelHierarchy(MESITwoLevelCacheHierarchy):
             raise ValueError("Network latencies must be positive.")
         if network_buffer_size <= 0:
             raise ValueError("network_buffer_size must be positive.")
+        if indexing_policy not in ("linear", "splitmix64"):
+            raise ValueError(
+                "indexing_policy must be 'linear' or 'splitmix64'."
+            )
 
         if ddio_way_part is None:
             ddio_way_part = MODEL_PROFILES[model_profile][
@@ -132,6 +139,7 @@ class CacheLensMESITwoLevelHierarchy(MESITwoLevelCacheHierarchy):
             l2_assoc=hnf_assoc,
             num_l2_banks=num_hnfs,
             ddio_way_part=ddio_way_part,
+            l2_addr_hash=indexing_policy == "splitmix64",
         )
 
         self._cachelens_l1i_size = l1i_size
@@ -144,6 +152,7 @@ class CacheLensMESITwoLevelHierarchy(MESITwoLevelCacheHierarchy):
         self._hnf_assoc = hnf_assoc
         self._hnf_size_bytes = hnf_size_bytes
         self._num_hnfs = num_hnfs
+        self._indexing_policy = indexing_policy
         self._model_profile = model_profile
         self._core_clock = core_clock
         self._link_latency = link_latency
@@ -224,7 +233,7 @@ class CacheLensMESITwoLevelHierarchy(MESITwoLevelCacheHierarchy):
         return self._model_profile
 
     def get_indexing_policy(self) -> str:
-        return "linear"
+        return self._indexing_policy
 
     def get_cache_state_restore_policy(self) -> str:
         return "cold"
