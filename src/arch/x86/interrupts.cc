@@ -403,10 +403,10 @@ X86ISA::Interrupts::getIntAddrRange() const
 uint32_t
 X86ISA::Interrupts::readReg(ApicRegIndex reg)
 {
-    if (reg >= APIC_TRIGGER_MODE(0) &&
-            reg <= APIC_TRIGGER_MODE(15)) {
-        panic("Local APIC Trigger Mode registers are unimplemented.\n");
-    }
+    // requestInterrupt() maintains the architecturally read-only Trigger Mode
+    // Register bitmap for fixed and lowest-priority interrupts. Linux reads
+    // the TMR while acknowledging level-triggered IO-APIC interrupts, so the
+    // ordinary register-array value must be visible here.
     switch (reg) {
       case APIC_ARBITRATION_PRIORITY:
         panic("Local APIC Arbitration Priority register unimplemented.\n");
