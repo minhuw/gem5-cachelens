@@ -45,14 +45,21 @@ from m5.objects import (
     X86ACPIMadtIntSourceOverride,
     X86ACPIMadtIOAPIC,
     X86ACPIMadtLAPIC,
+    X86ACPIRSDP,
+    X86ACPIRSDT,
+    X86ACPIXSDT,
     X86E820Entry,
+    X86E820Table,
     X86FsLinux,
     X86IntelMPBus,
     X86IntelMPBusHierarchy,
     X86IntelMPIOAPIC,
     X86IntelMPIOIntAssignment,
     X86IntelMPProcessor,
+    X86IntelMPConfigTable,
+    X86IntelMPFloatingPointer,
     X86SMBiosBiosInformation,
+    X86SMBiosSMBiosTable,
 )
 from m5.util.convert import toMemorySize
 
@@ -101,7 +108,20 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
         if self.is_fullsystem():
             self.pc = Pc()
 
-            self.workload = X86FsLinux()
+            # SimObject-valued parameter defaults are shared Python objects.
+            # Allocate every mutable firmware table explicitly so multiple
+            # X86Board instances under one Root cannot append each other's MP,
+            # ACPI, SMBIOS, or E820 records.
+            self.workload = X86FsLinux(
+                smbios_table=X86SMBiosSMBiosTable(),
+                intel_mp_pointer=X86IntelMPFloatingPointer(),
+                intel_mp_table=X86IntelMPConfigTable(),
+                acpi_description_table_pointer=X86ACPIRSDP(
+                    rsdt=X86ACPIRSDT(entries=[]),
+                    xsdt=X86ACPIXSDT(entries=[]),
+                ),
+                e820_table=X86E820Table(entries=[]),
+            )
 
             # North Bridge
             self.iobus = IOXBar()
