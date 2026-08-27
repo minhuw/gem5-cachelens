@@ -19,6 +19,12 @@ SUITE_DIR = joinpath(absdirpath(__file__), "configs", "suites")
 # and Comp messages. TLM integration is built only for Arm, and these tests
 # require a CHI Ruby build.
 SUITES = (
+    (
+        "dma-partial-write-cross-slice",
+        "dma_partial_write_cross_slice.py",
+        2,
+        False,
+    ),
     ("nic-read-no-allocation", "nic_read_no_allocation.py", 1, False),
     ("nic-read-normal-allocation", "nic_read_normal_allocation.py", 1, False),
     ("write-unique-desc-ddio", "write_unique_desc_ddio.py", 3, False),

@@ -148,7 +148,10 @@ def create_system(options, system):
     )
 
     bootmem = None
-    dma_ports = []
+    dma_ports = [
+        generator.port
+        for generator in getattr(system, "dma_generators", [])
+    ]
     (cpu_sequencers, dir_cntrls, topology) = CHI.create_system(
         options, False, system, dma_ports, bootmem, system.ruby, system.cpu
     )
@@ -212,6 +215,10 @@ args.mem_size = "4GiB"
 #
 cpus = [TlmGenerator(cpu_id=i) for i in range(args.num_cpus)]
 suite = suite_importer(args.suite)
+dma_generators = [
+    PyTrafficGen()
+    for _ in range(getattr(suite, "dma_generator_count", 0))
+]
 if hasattr(suite, "ddio_way_part"):
     args.ddio_way_part = suite.ddio_way_part
 
@@ -226,6 +233,8 @@ system = System(
     clk_domain=SrcClockDomain(clock=args.sys_clock),
     mem_ranges=[AddrRange(args.mem_size)],
 )
+if dma_generators:
+    system.dma_generators = dma_generators
 m5.util.addToPath("../common")
 
 # Hooking up the RN-F generation callback
@@ -271,6 +280,9 @@ m5.ticks.setGlobalFrequency("1ns")
 
 # instantiate configuration
 m5.instantiate()
+
+if hasattr(suite, "start_dma"):
+    suite.start_dma(system.dma_generators)
 
 # simulate until program terminates
 exit_event = m5.simulate(args.abs_max_tick)

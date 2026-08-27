@@ -264,6 +264,26 @@ class WriteMask
         return chunks;
     }
 
+    WriteMask
+    extractFirstChunk(int chunk_size)
+    {
+        assert(mSize > 0);
+        assert(chunk_size > 0);
+        assert((mSize % chunk_size) == 0);
+
+        const int first = firstBitSet(true);
+        assert(first < mSize);
+        const int chunk_offset = (first / chunk_size) * chunk_size;
+
+        WriteMask chunk(mSize);
+        for (int byte = chunk_offset;
+             byte < chunk_offset + chunk_size; ++byte) {
+            chunk.mMask[byte] = mMask[byte];
+            mMask[byte] = false;
+        }
+        return chunk;
+    }
+
     void print(std::ostream& out) const;
 
     /*
