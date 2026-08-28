@@ -23,6 +23,7 @@ inline constexpr uint32_t UnsupportedError = 0xffff;
 inline constexpr uint32_t CommandError = 1;
 inline constexpr uint32_t InitialInterruptMask = 0xffffffff;
 inline constexpr uint32_t GidTableEntries = 8;
+inline constexpr uint32_t ObjectTableEntries = 64;
 inline constexpr uint32_t FixedMtu = 1024;
 inline constexpr uint32_t MaxMessageSize = uint32_t{1} << 31;
 inline constexpr uint16_t FullMembershipPkey = 0xffff;
@@ -281,6 +282,31 @@ struct RegisterState
 using GidTable = std::array<Gid, GidTableEntries>;
 using GidValidTable = std::array<uint8_t, GidTableEntries>;
 
+struct UarRange
+{
+    uint64_t start = 0;
+    uint64_t size = 0;
+};
+
+struct ObjectTables
+{
+    std::array<uint32_t, ObjectTableEntries> contextUar{};
+    std::array<uint32_t, ObjectTableEntries> contextPdChildren{};
+    std::array<uint32_t, ObjectTableEntries> pdAllocated{};
+    std::array<uint32_t, ObjectTableEntries> pdParent{};
+    std::array<uint32_t, ObjectTableEntries> pdChildren{};
+
+    void
+    reset()
+    {
+        contextUar = {};
+        contextPdChildren = {};
+        pdAllocated = {};
+        pdParent = {};
+        pdChildren = {};
+    }
+};
+
 struct CommandResult
 {
     bool hasResponse;
@@ -354,6 +380,83 @@ recognizedCommand(uint32_t command)
     return command <= static_cast<uint32_t>(Command::DestroySrq);
 }
 
+template <size_t N>
+inline bool
+allZero(const uint8_t (&bytes)[N])
+{
+    return std::all_of(std::begin(bytes), std::end(bytes),
+                       [](uint8_t byte) { return byte == 0; });
+}
+
+inline bool
+uarIndex(uint64_t pfn, UarRange range, uint32_t &index)
+{
+    if (!range.size || (range.start % UarPageSize) != 0 ||
+        pfn > std::numeric_limits<uint64_t>::max() / UarPageSize)
+        return false;
+
+    const uint64_t address = pfn * UarPageSize;
+    if (address < range.start || range.size < UarPageSize)
+        return false;
+
+    const uint64_t offset = address - range.start;
+    if ((offset % UarPageSize) != 0 || offset > range.size - UarPageSize)
+        return false;
+
+    const uint64_t page = offset / UarPageSize;
+    if (page == 0 || page >= ObjectTableEntries)
+        return false;
+    index = page;
+    return true;
+}
+
+inline bool
+validObjectTables(const ObjectTables &objects, UarRange range)
+{
+    if (objects.contextUar[0] || objects.contextPdChildren[0] ||
+        objects.pdAllocated[0] || objects.pdParent[0] ||
+        objects.pdChildren[0])
+        return false;
+
+    std::array<uint8_t, ObjectTableEntries> ownedUars{};
+    std::array<uint32_t, ObjectTableEntries> pdChildren{};
+    for (uint32_t handle = 1; handle < ObjectTableEntries; ++handle) {
+        const uint32_t uar = objects.contextUar[handle];
+        if (!uar) {
+            if (objects.contextPdChildren[handle])
+                return false;
+            continue;
+        }
+        if (uar >= ObjectTableEntries || ownedUars[uar] ||
+            range.size < UarPageSize ||
+            static_cast<uint64_t>(uar) * UarPageSize >
+                range.size - UarPageSize)
+            return false;
+        ownedUars[uar] = 1;
+    }
+
+    for (uint32_t handle = 1; handle < ObjectTableEntries; ++handle) {
+        if (objects.pdAllocated[handle] > 1)
+            return false;
+        if (!objects.pdAllocated[handle]) {
+            if (objects.pdParent[handle] || objects.pdChildren[handle])
+                return false;
+            continue;
+        }
+        if (objects.pdChildren[handle])
+            return false;
+        const uint32_t parent = objects.pdParent[handle];
+        if (parent) {
+            if (parent >= ObjectTableEntries ||
+                !objects.contextUar[parent])
+                return false;
+            ++pdChildren[parent];
+        }
+    }
+
+    return pdChildren == objects.contextPdChildren;
+}
+
 inline void
 setResponseHeader(ResponseHeader &header, const CommandHeader &request,
                   uint32_t command, uint32_t error)
@@ -420,6 +523,87 @@ createBind(const CommandRequest &request, GidTable &gids,
 }
 
 inline CommandResult
+createUc(const CommandRequest &request, CommandResponse &response,
+         ObjectTables &objects, UarRange range)
+{
+    uint32_t uar = 0;
+    uint32_t handle = 1;
+    const bool valid = letoh(request.header.reserved) == 0 &&
+        uarIndex(letoh(request.createUc.pfn64), range, uar);
+    while (handle < ObjectTableEntries && objects.contextUar[handle])
+        ++handle;
+    const bool duplicate = valid && std::find(objects.contextUar.begin(),
+        objects.contextUar.end(), uar) != objects.contextUar.end();
+    const bool success = valid && !duplicate && handle < ObjectTableEntries;
+    setResponseHeader(response.header, request.header,
+                      static_cast<uint32_t>(Command::CreateUc), !success);
+    if (!success)
+        return {true, CommandError};
+
+    objects.contextUar[handle] = uar;
+    response.createUc.contextHandle = htole(handle);
+    return {true, 0};
+}
+
+inline CommandResult
+destroyUc(const CommandRequest &request, ObjectTables &objects)
+{
+    const uint32_t handle = letoh(request.destroyUc.contextHandle);
+    if (letoh(request.header.reserved) != 0 ||
+        !allZero(request.destroyUc.reserved) || handle == 0 ||
+        handle >= ObjectTableEntries || !objects.contextUar[handle] ||
+        objects.contextPdChildren[handle])
+        return {false, CommandError};
+
+    objects.contextUar[handle] = 0;
+    return {false, 0};
+}
+
+inline CommandResult
+createPd(const CommandRequest &request, CommandResponse &response,
+         ObjectTables &objects)
+{
+    const uint32_t parent = letoh(request.createPd.contextHandle);
+    uint32_t handle = 1;
+    while (handle < ObjectTableEntries && objects.pdAllocated[handle])
+        ++handle;
+    const bool valid = letoh(request.header.reserved) == 0 &&
+        allZero(request.createPd.reserved) &&
+        (parent == 0 || (parent < ObjectTableEntries &&
+                         objects.contextUar[parent])) &&
+        handle < ObjectTableEntries;
+    setResponseHeader(response.header, request.header,
+                      static_cast<uint32_t>(Command::CreatePd), !valid);
+    if (!valid)
+        return {true, CommandError};
+
+    objects.pdAllocated[handle] = 1;
+    objects.pdParent[handle] = parent;
+    if (parent)
+        ++objects.contextPdChildren[parent];
+    response.createPd.pdHandle = htole(handle);
+    return {true, 0};
+}
+
+inline CommandResult
+destroyPd(const CommandRequest &request, ObjectTables &objects)
+{
+    const uint32_t handle = letoh(request.destroyPd.pdHandle);
+    if (letoh(request.header.reserved) != 0 ||
+        !allZero(request.destroyPd.reserved) || handle == 0 ||
+        handle >= ObjectTableEntries || !objects.pdAllocated[handle] ||
+        objects.pdChildren[handle])
+        return {false, CommandError};
+
+    const uint32_t parent = objects.pdParent[handle];
+    if (parent)
+        --objects.contextPdChildren[parent];
+    objects.pdAllocated[handle] = 0;
+    objects.pdParent[handle] = 0;
+    return {false, 0};
+}
+
+inline CommandResult
 destroyBind(const CommandRequest &request, GidTable &gids,
             GidValidTable &gid_valid)
 {
@@ -439,6 +623,12 @@ destroyBind(const CommandRequest &request, GidTable &gids,
 }
 
 } // namespace detail
+
+inline bool
+validObjectTables(const ObjectTables &objects, UarRange range)
+{
+    return detail::validObjectTables(objects, range);
+}
 
 inline DeviceCaps
 makeCapabilities(uint32_t mac_low, uint32_t mac_high)
@@ -488,7 +678,8 @@ validSharedRegion(const DeviceSharedRegion &dsr, uint64_t dsr_address)
 
 inline CommandResult
 processCommand(const CommandRequest &request, CommandResponse &response,
-               GidTable &gids, GidValidTable &gid_valid)
+               GidTable &gids, GidValidTable &gid_valid,
+               ObjectTables &objects, UarRange uar_range)
 {
     response = {};
     const uint32_t command = letoh(request.header.command);
@@ -497,6 +688,14 @@ processCommand(const CommandRequest &request, CommandResponse &response,
         return detail::queryPort(request, response);
       case static_cast<uint32_t>(Command::QueryPkey):
         return detail::queryPkey(request, response);
+      case static_cast<uint32_t>(Command::CreatePd):
+        return detail::createPd(request, response, objects);
+      case static_cast<uint32_t>(Command::DestroyPd):
+        return detail::destroyPd(request, objects);
+      case static_cast<uint32_t>(Command::CreateUc):
+        return detail::createUc(request, response, objects, uar_range);
+      case static_cast<uint32_t>(Command::DestroyUc):
+        return detail::destroyUc(request, objects);
       case static_cast<uint32_t>(Command::CreateBind):
         return detail::createBind(request, gids, gid_valid);
       case static_cast<uint32_t>(Command::DestroyBind):
@@ -537,6 +736,7 @@ class Pvrdma : public PciDevice
     pvrdma::CommandResponse response{};
     pvrdma::GidTable gids{};
     pvrdma::GidValidTable gidValid{};
+    pvrdma::ObjectTables objects{};
     pvrdma::OperationErrorState operationError;
     bool intxAsserted = false;
     const Tick controlCompletionLatency;

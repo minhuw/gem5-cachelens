@@ -229,8 +229,9 @@ Pvrdma::startCommand(uint32_t value)
 void
 Pvrdma::commandReadDone()
 {
-    const auto result = pvrdma::processCommand(command, response, gids,
-                                                gidValid);
+    const auto result = pvrdma::processCommand(
+        command, response, gids, gidValid, objects,
+        {BARs[pvrdma::UarBar]->addr(), BARs[pvrdma::UarBar]->size()});
     operationError.complete(regs.error, result.error);
     panic_if(!pvrdma::finishCommandRead(controlState, result.hasResponse),
              "PVRDMA completed command read in invalid state");
@@ -267,6 +268,7 @@ Pvrdma::resetDevice()
     response = {};
     gids = {};
     gidValid = {};
+    objects.reset();
     operationError.reset();
     if (intxAsserted) {
         intrClear();
@@ -327,6 +329,17 @@ Pvrdma::serialize(CheckpointOut &cp) const
     arrayParamOut(cp, "gids", reinterpret_cast<const uint8_t *>(gids.data()),
                   sizeof(gids));
     arrayParamOut(cp, "gidValid", gidValid.data(), gidValid.size());
+    arrayParamOut(cp, "contextUar", objects.contextUar.data(),
+                  objects.contextUar.size());
+    arrayParamOut(cp, "contextPdChildren",
+                  objects.contextPdChildren.data(),
+                  objects.contextPdChildren.size());
+    arrayParamOut(cp, "pdAllocated", objects.pdAllocated.data(),
+                  objects.pdAllocated.size());
+    arrayParamOut(cp, "pdParent", objects.pdParent.data(),
+                  objects.pdParent.size());
+    arrayParamOut(cp, "pdChildren", objects.pdChildren.data(),
+                  objects.pdChildren.size());
     SERIALIZE_SCALAR(intxAsserted);
 }
 
@@ -352,6 +365,17 @@ Pvrdma::unserialize(CheckpointIn &cp)
     arrayParamIn(cp, "gids", reinterpret_cast<uint8_t *>(gids.data()),
                  sizeof(gids));
     arrayParamIn(cp, "gidValid", gidValid.data(), gidValid.size());
+    arrayParamIn(cp, "contextUar", objects.contextUar.data(),
+                 objects.contextUar.size());
+    arrayParamIn(cp, "contextPdChildren",
+                 objects.contextPdChildren.data(),
+                 objects.contextPdChildren.size());
+    arrayParamIn(cp, "pdAllocated", objects.pdAllocated.data(),
+                 objects.pdAllocated.size());
+    arrayParamIn(cp, "pdParent", objects.pdParent.data(),
+                 objects.pdParent.size());
+    arrayParamIn(cp, "pdChildren", objects.pdChildren.data(),
+                 objects.pdChildren.size());
     UNSERIALIZE_SCALAR(intxAsserted);
     operationError.reset();
 
@@ -360,6 +384,10 @@ Pvrdma::unserialize(CheckpointIn &cp)
     panic_if(pvrdma::interruptPending(
                  regs.pendingCauses, regs.interruptMask) != intxAsserted,
              "PVRDMA checkpoint has inconsistent interrupt state");
+    panic_if(!pvrdma::validObjectTables(
+                 objects, {BARs[pvrdma::UarBar]->addr(),
+                           BARs[pvrdma::UarBar]->size()}),
+             "PVRDMA checkpoint has inconsistent object tables");
     if (controlState == pvrdma::ControlState::Unconfigured) {
         dsrDmaAddress = commandSlotDmaAddress = responseSlotDmaAddress = 0;
     } else {

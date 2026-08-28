@@ -213,21 +213,24 @@ TEST(PvrdmaCommandTest, BuildsResponseHeaderAndRejectsUnsupportedCommands)
     CommandResponse response{};
     GidTable gids{};
     GidValidTable valid{};
+    ObjectTables objects{};
+    UarRange range{0x100000, UarBarSize};
     request.header.response = htole(uint64_t{0x123456789abcdef0});
     request.header.command = htole(
-        static_cast<uint32_t>(Command::CreatePd));
+        static_cast<uint32_t>(Command::CreateMr));
 
-    const auto result = processCommand(request, response, gids, valid);
+    const auto result = processCommand(request, response, gids, valid,
+                                       objects, range);
 
     EXPECT_TRUE(result.hasResponse);
     EXPECT_EQ(result.error, CommandError);
     EXPECT_EQ(response.header.response, request.header.response);
     EXPECT_EQ(letoh(response.header.acknowledgement),
-              responseCommand(Command::CreatePd));
+              responseCommand(Command::CreateMr));
     EXPECT_EQ(response.header.error, CommandError);
 
     request.header.command = htole(uint32_t{99});
-    processCommand(request, response, gids, valid);
+    processCommand(request, response, gids, valid, objects, range);
     EXPECT_EQ(response.header.response, request.header.response);
     EXPECT_EQ(response.header.acknowledgement, 0);
     EXPECT_EQ(response.header.error, CommandError);
@@ -239,11 +242,14 @@ TEST(PvrdmaCommandTest, ValidatesQueryPortAndPkey)
     CommandResponse response{};
     GidTable gids{};
     GidValidTable valid{};
+    ObjectTables objects{};
+    UarRange range{0x100000, UarBarSize};
 
     request.header.command = htole(
         static_cast<uint32_t>(Command::QueryPort));
     request.queryPort.portNumber = 1;
-    auto result = processCommand(request, response, gids, valid);
+    auto result = processCommand(request, response, gids, valid, objects,
+                                 range);
     EXPECT_TRUE(result.hasResponse);
     EXPECT_EQ(result.error, 0);
     EXPECT_EQ(letoh(response.header.acknowledgement),
@@ -263,7 +269,7 @@ TEST(PvrdmaCommandTest, ValidatesQueryPortAndPkey)
     EXPECT_EQ(letoh(response.queryPort.attributes.qkeyViolationCounter), 0);
 
     request.queryPort.portNumber = 2;
-    result = processCommand(request, response, gids, valid);
+    result = processCommand(request, response, gids, valid, objects, range);
     EXPECT_EQ(result.error, CommandError);
     EXPECT_EQ(response.header.error, CommandError);
 
@@ -272,17 +278,17 @@ TEST(PvrdmaCommandTest, ValidatesQueryPortAndPkey)
         static_cast<uint32_t>(Command::QueryPkey));
     request.queryPkey.portNumber = 1;
     request.queryPkey.index = 0;
-    result = processCommand(request, response, gids, valid);
+    result = processCommand(request, response, gids, valid, objects, range);
     EXPECT_EQ(result.error, 0);
     EXPECT_EQ(letoh(response.queryPkey.pkey), FullMembershipPkey);
 
     request.queryPkey.index = 1;
-    EXPECT_EQ(processCommand(request, response, gids, valid).error,
-              CommandError);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
     request.queryPkey.index = 0;
     request.queryPkey.portNumber = 2;
-    EXPECT_EQ(processCommand(request, response, gids, valid).error,
-              CommandError);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
 }
 
 TEST(PvrdmaCommandTest, ValidatesGidBindBoundsMtuTypeAndDestroyMatch)
@@ -291,6 +297,8 @@ TEST(PvrdmaCommandTest, ValidatesGidBindBoundsMtuTypeAndDestroyMatch)
     CommandResponse response{};
     GidTable gids{};
     GidValidTable valid{};
+    ObjectTables objects{};
+    UarRange range{0x100000, UarBarSize};
     const std::array<uint8_t, 16> gid = {
         0xfe, 0x80, 0, 0, 0, 0, 0, 0, 2, 0x11, 0x22, 0xff, 0xfe, 0x33,
         0x44, 0x55,
@@ -302,23 +310,24 @@ TEST(PvrdmaCommandTest, ValidatesGidBindBoundsMtuTypeAndDestroyMatch)
     request.createBind.index = htole(uint32_t{7});
     request.createBind.gidType = GidTypeRoceV1;
     std::copy(gid.begin(), gid.end(), request.createBind.newGid);
-    auto result = processCommand(request, response, gids, valid);
+    auto result = processCommand(request, response, gids, valid, objects,
+                                 range);
     EXPECT_FALSE(result.hasResponse);
     EXPECT_EQ(result.error, 0);
     EXPECT_EQ(valid[7], 1);
     EXPECT_TRUE(std::equal(gid.begin(), gid.end(), gids[7].raw));
 
     request.createBind.index = htole(uint32_t{8});
-    EXPECT_EQ(processCommand(request, response, gids, valid).error,
-              CommandError);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
     request.createBind.index = htole(uint32_t{0});
     request.createBind.mtu = htole(uint32_t{2048});
-    EXPECT_EQ(processCommand(request, response, gids, valid).error,
-              CommandError);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
     request.createBind.mtu = htole(FixedMtu);
     request.createBind.gidType = GidTypeRoceV2;
-    EXPECT_EQ(processCommand(request, response, gids, valid).error,
-              CommandError);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
 
     request = {};
     request.header.command = htole(
@@ -326,19 +335,235 @@ TEST(PvrdmaCommandTest, ValidatesGidBindBoundsMtuTypeAndDestroyMatch)
     request.destroyBind.index = htole(uint32_t{7});
     std::copy(gid.begin(), gid.end(), request.destroyBind.destinationGid);
     request.destroyBind.destinationGid[15] ^= 1;
-    EXPECT_EQ(processCommand(request, response, gids, valid).error,
-              CommandError);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
     EXPECT_EQ(valid[7], 1);
 
     request.destroyBind.destinationGid[15] ^= 1;
-    result = processCommand(request, response, gids, valid);
+    result = processCommand(request, response, gids, valid, objects, range);
     EXPECT_FALSE(result.hasResponse);
     EXPECT_EQ(result.error, 0);
     EXPECT_EQ(valid[7], 0);
     EXPECT_TRUE(std::all_of(std::begin(gids[7].raw), std::end(gids[7].raw),
                             [](uint8_t byte) { return byte == 0; }));
-    EXPECT_EQ(processCommand(request, response, gids, valid).error,
-              CommandError);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+}
+
+TEST(PvrdmaObjectTest, ValidatesBarRelativePfn64AndUarOwnership)
+{
+    CommandRequest request{};
+    CommandResponse response{};
+    GidTable gids{};
+    GidValidTable valid{};
+    ObjectTables objects{};
+    const UarRange range{uint64_t{1} << 44, UarBarSize};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::CreateUc));
+    request.header.response = htole(uint64_t{0x123456789abcdef0});
+
+    request.createUc.pfn64 = htole(range.start / UarPageSize);
+    auto result = processCommand(request, response, gids, valid, objects,
+                                 range);
+    EXPECT_TRUE(result.hasResponse);
+    EXPECT_EQ(result.error, CommandError);
+    EXPECT_EQ(response.header.error, CommandError);
+
+    request.createUc.pfn64 = htole(range.start / UarPageSize + 1);
+    result = processCommand(request, response, gids, valid, objects, range);
+    ASSERT_EQ(result.error, 0);
+    EXPECT_EQ(response.header.response, request.header.response);
+    EXPECT_EQ(letoh(response.header.acknowledgement),
+              responseCommand(Command::CreateUc));
+    EXPECT_EQ(response.header.error, 0);
+    EXPECT_EQ(letoh(response.createUc.contextHandle), 1);
+    EXPECT_EQ(objects.contextUar[1], 1);
+
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    request.createUc.pfn64 = htole(range.start / UarPageSize + 64);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    request.createUc.pfn64 = htole(
+        range.start / UarPageSize + UarBarSize / UarPageSize);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    request.createUc.pfn64 = htole(UINT64_MAX);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    request.header.reserved = htole(uint32_t{1});
+    request.createUc.pfn64 = htole(range.start / UarPageSize + 2);
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+}
+
+TEST(PvrdmaObjectTest, AllocatesExhaustsAndReusesLowestContextHandle)
+{
+    CommandRequest request{};
+    CommandResponse response{};
+    GidTable gids{};
+    GidValidTable valid{};
+    ObjectTables objects{};
+    const UarRange range{0x100000, ObjectTableEntries * UarPageSize};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::CreateUc));
+
+    for (uint32_t handle = 1; handle < ObjectTableEntries; ++handle) {
+        request.createUc.pfn64 = htole(
+            range.start / UarPageSize + handle);
+        ASSERT_EQ(processCommand(request, response, gids, valid, objects,
+                                 range).error, 0);
+        EXPECT_EQ(letoh(response.createUc.contextHandle), handle);
+    }
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyUc));
+    request.destroyUc.contextHandle = htole(uint32_t{17});
+    request.destroyUc.reserved[0] = 1;
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    request.destroyUc.reserved[0] = 0;
+    auto result = processCommand(request, response, gids, valid, objects,
+                                 range);
+    EXPECT_FALSE(result.hasResponse);
+    ASSERT_EQ(result.error, 0);
+    EXPECT_EQ(objects.contextUar[17], 0);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::CreateUc));
+    request.createUc.pfn64 = htole(range.start / UarPageSize + 17);
+    ASSERT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, 0);
+    EXPECT_EQ(letoh(response.createUc.contextHandle), 17);
+}
+
+TEST(PvrdmaObjectTest, EnforcesPdParentsChildrenAndNoResponseDestroy)
+{
+    CommandRequest request{};
+    CommandResponse response{};
+    GidTable gids{};
+    GidValidTable valid{};
+    ObjectTables objects{};
+    const UarRange range{0x100000, ObjectTableEntries * UarPageSize};
+
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::CreateUc));
+    request.createUc.pfn64 = htole(range.start / UarPageSize + 1);
+    ASSERT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, 0);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::CreatePd));
+    request.header.response = htole(uint64_t{0xfedcba9876543210});
+    request.createPd.contextHandle = htole(uint32_t{1});
+    auto result = processCommand(request, response, gids, valid, objects,
+                                 range);
+    ASSERT_TRUE(result.hasResponse);
+    ASSERT_EQ(result.error, 0);
+    EXPECT_EQ(response.header.response, request.header.response);
+    EXPECT_EQ(letoh(response.header.acknowledgement),
+              responseCommand(Command::CreatePd));
+    EXPECT_EQ(letoh(response.createPd.pdHandle), 1);
+    EXPECT_EQ(objects.contextPdChildren[1], 1);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyUc));
+    request.destroyUc.contextHandle = htole(uint32_t{1});
+    result = processCommand(request, response, gids, valid, objects, range);
+    EXPECT_FALSE(result.hasResponse);
+    EXPECT_EQ(result.error, CommandError);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyPd));
+    request.destroyPd.pdHandle = htole(uint32_t{1});
+    request.destroyPd.reserved[0] = 1;
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    request.destroyPd.reserved[0] = 0;
+    objects.pdChildren[1] = 1;
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    objects.pdChildren[1] = 0;
+    result = processCommand(request, response, gids, valid, objects, range);
+    EXPECT_FALSE(result.hasResponse);
+    EXPECT_EQ(result.error, 0);
+    EXPECT_EQ(objects.contextPdChildren[1], 0);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::CreatePd));
+    request.createPd.contextHandle = htole(uint32_t{63});
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    request.createPd.contextHandle = 0;
+    request.createPd.reserved[0] = 1;
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    request.createPd.reserved[0] = 0;
+    for (uint32_t handle = 1; handle < ObjectTableEntries; ++handle) {
+        ASSERT_EQ(processCommand(request, response, gids, valid, objects,
+                                 range).error, 0);
+        EXPECT_EQ(letoh(response.createPd.pdHandle), handle);
+    }
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    EXPECT_EQ(objects.contextPdChildren[1], 0);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyPd));
+    request.destroyPd.pdHandle = htole(uint32_t{17});
+    ASSERT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, 0);
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::CreatePd));
+    ASSERT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, 0);
+    EXPECT_EQ(letoh(response.createPd.pdHandle), 17);
+}
+
+TEST(PvrdmaObjectTest, ResetsAndValidatesRestoreInvariants)
+{
+    ObjectTables objects{};
+    const UarRange range{0x100000, ObjectTableEntries * UarPageSize};
+    objects.contextUar[1] = 1;
+    objects.contextPdChildren[1] = 1;
+    objects.pdAllocated[1] = 1;
+    objects.pdParent[1] = 1;
+    EXPECT_TRUE(validObjectTables(objects, range));
+
+    auto malformed = objects;
+    malformed.contextPdChildren[1] = 0;
+    EXPECT_FALSE(validObjectTables(malformed, range));
+    malformed = objects;
+    malformed.pdParent[1] = 2;
+    EXPECT_FALSE(validObjectTables(malformed, range));
+    malformed = objects;
+    malformed.contextUar[2] = 1;
+    EXPECT_FALSE(validObjectTables(malformed, range));
+    malformed = objects;
+    malformed.contextUar[1] = ObjectTableEntries;
+    EXPECT_FALSE(validObjectTables(malformed, range));
+    malformed = objects;
+    malformed.pdChildren[1] = 1;
+    EXPECT_FALSE(validObjectTables(malformed, range));
+
+    objects.reset();
+    EXPECT_TRUE(validObjectTables(objects, range));
+    EXPECT_TRUE(std::all_of(objects.contextUar.begin(),
+                            objects.contextUar.end(),
+                            [](uint32_t value) { return value == 0; }));
+    EXPECT_TRUE(std::all_of(objects.pdAllocated.begin(),
+                            objects.pdAllocated.end(),
+                            [](uint32_t value) { return value == 0; }));
 }
 
 TEST(PvrdmaControlTest, PreservesNewerRejectionAcrossOlderCompletion)
