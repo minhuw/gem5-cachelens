@@ -28,3 +28,6 @@ class Pvrdma(PciDevice):
     hardware_address = Param.EthernetAddr(
         NextEthernetAddr, "PVRDMA MAC address"
     )
+    control_completion_latency = Param.Latency(
+        "10us", "Conservative DSR and command PIO completion latency"
+    )
