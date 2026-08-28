@@ -150,8 +150,11 @@ Pvrdma::startDsr()
     operationError.begin(regs.error);
     capabilities = pvrdma::makeCapabilities(regs.macLow, regs.macHigh);
     dsrDmaAddress = pciToDma(regs.dsrAddress);
-    dmaRead(dsrDmaAddress, sizeof(dsr), &dsrReadEvent,
+    dmaRead(dsrDmaAddress, sizeof(dsr),
+            sys->isAtomicMode() ? nullptr : &dsrReadEvent,
             reinterpret_cast<uint8_t *>(&dsr));
+    if (sys->isAtomicMode())
+        dsrReadDone();
 }
 
 void
@@ -173,8 +176,11 @@ Pvrdma::dsrReadDone()
     panic_if(!pvrdma::finishDsrRead(controlState, true),
              "PVRDMA completed DSR read in invalid state");
     dmaWrite(dsrDmaAddress + offsetof(pvrdma::DeviceSharedRegion, caps),
-             sizeof(capabilities), &capsWriteEvent,
+             sizeof(capabilities),
+             sys->isAtomicMode() ? nullptr : &capsWriteEvent,
              reinterpret_cast<uint8_t *>(&capabilities));
+    if (sys->isAtomicMode())
+        capsWriteDone();
 }
 
 void
@@ -222,8 +228,11 @@ Pvrdma::startCommand(uint32_t value)
     }
 
     operationError.begin(regs.error);
-    dmaRead(commandSlotDmaAddress, sizeof(command), &commandReadEvent,
+    dmaRead(commandSlotDmaAddress, sizeof(command),
+            sys->isAtomicMode() ? nullptr : &commandReadEvent,
             reinterpret_cast<uint8_t *>(&command));
+    if (sys->isAtomicMode())
+        commandReadDone();
 }
 
 void
@@ -240,8 +249,11 @@ Pvrdma::commandReadDone()
         return;
     }
 
-    dmaWrite(responseSlotDmaAddress, sizeof(response), &responseWriteEvent,
+    dmaWrite(responseSlotDmaAddress, sizeof(response),
+             sys->isAtomicMode() ? nullptr : &responseWriteEvent,
              reinterpret_cast<uint8_t *>(&response));
+    if (sys->isAtomicMode())
+        responseWriteDone();
 }
 
 void

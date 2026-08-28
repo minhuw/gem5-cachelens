@@ -35,3 +35,6 @@ if env['CONF']['USE_TEST_OBJECTS']:
         'SparseHistStatTester',
     ])
     Source('stat_tester.cc')
+
+    SimObject('PvrdmaTester.py', sim_objects=['PvrdmaTester'])
+    Source('pvrdma_tester.cc')
