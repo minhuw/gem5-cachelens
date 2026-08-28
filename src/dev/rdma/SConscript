@@ -3,4 +3,8 @@
 
 Import('*')
 
+SimObject('Pvrdma.py', sim_objects=['Pvrdma'])
+Source('pvrdma.cc')
+
+GTest('pvrdma.test', 'pvrdma.test.cc', with_tag('gem5 trace'))
 GTest('pvrdma_abi.test', 'pvrdma_abi.test.cc')
