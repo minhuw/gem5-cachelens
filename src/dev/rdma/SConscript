@@ -1,0 +1,6 @@
+# -*- mode:python -*-
+# SPDX-License-Identifier: BSD-3-Clause
+
+Import('*')
+
+GTest('pvrdma_abi.test', 'pvrdma_abi.test.cc')
