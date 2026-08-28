@@ -128,7 +128,10 @@ if buildEnv["USE_ARM_ISA"]:
 
 
 if buildEnv["USE_X86_ISA"]:
-    from m5.objects import Port
+    from m5.objects import (
+        Port,
+        Pvrdma,
+    )
 
     from gem5.components.boards.x86_board import X86Board
 
@@ -145,10 +148,16 @@ if buildEnv["USE_X86_ISA"]:
             network_options: Optional[dict] = None,
         ) -> None:
             self._cachelens_network_options = network_options or {}
-            if self._cachelens_network_options.get("num_nics", 0) > 1:
+            num_nics = self._cachelens_network_options.get("num_nics", 0)
+            self._enable_pvrdma = self._cachelens_network_options.get(
+                "enable_pvrdma", False
+            )
+            if num_nics > 1:
                 raise ValueError(
                     "The first CacheLens x86 board version supports one NIC."
                 )
+            if self._enable_pvrdma and num_nics != 1:
+                raise ValueError("PVRDMA requires exactly one CacheLens NIC.")
             super().__init__(
                 clk_freq=clk_freq,
                 processor=processor,
@@ -170,17 +179,23 @@ if buildEnv["USE_X86_ISA"]:
             self._attach_cachelens_network()
 
         def _get_additional_pci_intx_routes(self):
-            return [
+            routes = [
                 (2 + index, 0, 17 + index)
                 for index in range(
                     self._cachelens_network_options.get("num_nics", 0)
                 )
             ]
+            if self._enable_pvrdma:
+                routes.append((2, 1, 18))
+            return routes
 
         def _attach_cachelens_network(self) -> None:
-            network = build_cachelens_network(
-                **self._cachelens_network_options
-            )
+            network_options = dict(self._cachelens_network_options)
+            network_options.pop("enable_pvrdma", None)
+            network = build_cachelens_network(**network_options)
+            if self._enable_pvrdma:
+                nic = network.nics[0]
+                nic.HeaderType = int(nic.HeaderType) | 0x80
             for index, nic in enumerate(network.nics):
                 pci_device = 2 + index
                 io_apic_intin = 17 + index
@@ -194,7 +209,24 @@ if buildEnv["USE_X86_ISA"]:
                 if not self.cache_hierarchy.is_ruby():
                     nic.dma = self.iobus.cpu_side_ports
 
+            rdmas = []
+            if self._enable_pvrdma:
+                rdma = Pvrdma(
+                    hardware_address=str(network.nics[0].hardware_address)
+                )
+                rdma.host = self.pc.pci_host
+                rdma.pci_bus = 0
+                rdma.pci_dev = 2
+                rdma.pci_func = 1
+                rdma.InterruptPin = 2
+                rdma.InterruptLine = 18
+                rdma.pio = self.iobus.mem_side_ports
+                if not self.cache_hierarchy.is_ruby():
+                    rdma.dma = self.iobus.cpu_side_ports
+                rdmas.append(rdma)
+
             _own_vector(self, "nics", network.nics)
+            _own_vector(self, "rdmas", rdmas)
             _own_vector(self, "loadgens", network.loadgens)
             _own_vector(self, "links", network.links)
 
@@ -202,15 +234,24 @@ if buildEnv["USE_X86_ISA"]:
         def get_dma_ports(self) -> Sequence[Port]:
             # Keep IDE and each NIC on distinct CHI requestors. CPU PIO reaches
             # the I/O bus through RubySequencer.connectIOPorts().
-            return [self.pc.south_bridge.ide.dma] + [
-                nic.dma for nic in getattr(self, "nics", [])
-            ]
+            return (
+                [self.pc.south_bridge.ide.dma]
+                + [nic.dma for nic in getattr(self, "nics", [])]
+                + [rdma.dma for rdma in getattr(self, "rdmas", [])]
+            )
 
         def get_nic_bdfs(self) -> List[str]:
             return [
                 f"0000:{int(nic.pci_bus):02x}:{int(nic.pci_dev):02x}."
                 f"{int(nic.pci_func)}"
                 for nic in self.nics
+            ]
+
+        def get_rdma_bdfs(self) -> List[str]:
+            return [
+                f"0000:{int(rdma.pci_bus):02x}:{int(rdma.pci_dev):02x}."
+                f"{int(rdma.pci_func)}"
+                for rdma in getattr(self, "rdmas", [])
             ]
 
         @overrides(KernelDiskWorkload)
