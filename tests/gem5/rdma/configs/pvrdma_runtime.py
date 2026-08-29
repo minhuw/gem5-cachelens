@@ -20,7 +20,12 @@ from m5.objects import (
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--mode",
-    choices=("timing-mr", "checkpoint-save", "checkpoint-restore"),
+    choices=(
+        "timing-mr",
+        "timing-queues",
+        "checkpoint-save",
+        "checkpoint-restore",
+    ),
     required=True,
 )
 parser.add_argument("--checkpoint", type=Path)
@@ -29,7 +34,7 @@ if args.mode.startswith("checkpoint-") and args.checkpoint is None:
     parser.error("checkpoint modes require --checkpoint")
 
 system = System(
-    mem_mode="timing" if args.mode == "timing-mr" else "atomic",
+    mem_mode="timing" if args.mode.startswith("timing-") else "atomic",
     mem_ranges=[AddrRange("64MiB")],
 )
 system.voltage_domain = VoltageDomain()
@@ -71,6 +76,9 @@ exit_event = m5.simulate()
 if args.mode == "timing-mr":
     assert exit_event.getCause() == "PVRDMA timing MR test passed"
     print("PVRDMA_TIMING_MR_OK")
+elif args.mode == "timing-queues":
+    assert exit_event.getCause() == "PVRDMA timing queue test passed"
+    print("PVRDMA_TIMING_QUEUES_OK")
 elif args.mode == "checkpoint-save":
     assert exit_event.getCause() == "PVRDMA checkpoint save ready"
     args.checkpoint.mkdir(parents=True, exist_ok=True)

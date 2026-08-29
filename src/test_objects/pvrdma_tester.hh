@@ -6,6 +6,7 @@
 #include <string>
 
 #include "dev/platform.hh"
+#include "dev/rdma/pvrdma_abi.hh"
 #include "mem/port.hh"
 #include "params/PvrdmaTester.hh"
 #include "sim/eventq.hh"
@@ -40,6 +41,19 @@ class PvrdmaTester : public Platform
         BadMrPio,
         BadMrDone,
         LateMrDone,
+        UserContext,
+        UserPd,
+        Cq,
+        Qp,
+        Init,
+        Rtr,
+        Rts,
+        Query,
+        DestroyQp,
+        BadQp,
+        BadQpEarly,
+        BadQpLate,
+        DestroyCq,
     };
 
     TestPort port;
@@ -68,7 +82,24 @@ class PvrdmaTester : public Platform
     void startMr(uint32_t pages, uint64_t response);
     uint32_t verifyMr(uint64_t response, uint32_t key);
     void destroyMr(uint32_t handle);
+    void prepareQueuePages(Addr directory, Addr table, Addr first_page,
+                           uint32_t pages, bool malformed = false);
+    void startUserContext(uint64_t response);
+    void startUserPd(uint64_t response);
+    void startCq(uint64_t response, uint32_t cqe = 64);
+    void startQp(uint64_t response, bool malformed = false);
+    void startModifyQp(uint64_t response, pvrdma::QpState state,
+                       uint32_t mask, const pvrdma::QpAttr &attributes);
+    void startQueryQp(uint64_t response);
+    pvrdma::CommandResponse verifyResponse(pvrdma::Command command,
+                                           uint64_t response);
+    void destroyQp();
+    void destroyCq();
+    void createUserParentAtomic();
+    void createQueuePairAtomic(uint32_t expected_qpn);
+    void moveQueuePairToRtsAtomic();
     void runTimingMr();
+    void runTimingQueues();
     void testCheckpointSave();
     void testCheckpointRestore();
 

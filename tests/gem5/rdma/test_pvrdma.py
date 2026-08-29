@@ -27,18 +27,22 @@ for name, args, marker in (
     )
 
 
-gem5_verify_config(
-    name="pvrdma-timing-mr-walk",
-    fixtures=(),
-    verifiers=(
-        verifier.MatchRegex(re.compile("PVRDMA_TIMING_MR_OK")),
-    ),
-    config=joinpath(absdirpath(__file__), "configs", "pvrdma_runtime.py"),
-    config_args=("--mode", "timing-mr"),
-    valid_isas=(constants.x86_tag,),
-    valid_hosts=constants.supported_hosts,
-    length=constants.quick_tag,
-)
+for name, mode, marker in (
+    ("mr-walk", "timing-mr", "PVRDMA_TIMING_MR_OK"),
+    ("queue-walk", "timing-queues", "PVRDMA_TIMING_QUEUES_OK"),
+):
+    gem5_verify_config(
+        name=f"pvrdma-timing-{name}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(marker)),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=("--mode", mode),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
 
 
 def pvrdma_checkpoint_test(host):

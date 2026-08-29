@@ -14,10 +14,10 @@ Pvrdma::Pvrdma(const Params &p)
       dsrReadEvent([this] { dsrReadDone(); }, name() + ".dsrRead"),
       capsWriteEvent([this] { capsWriteDone(); }, name() + ".capsWrite"),
       commandReadEvent([this] { commandReadDone(); }, name() + ".commandRead"),
-      mrDirectoryReadEvent([this] { mrDirectoryReadDone(); },
-                           name() + ".mrDirectoryRead"),
-      mrTableReadEvent([this] { mrTableReadDone(); },
-                       name() + ".mrTableRead"),
+      objectDirectoryReadEvent([this] { objectDirectoryReadDone(); },
+                               name() + ".objectDirectoryRead"),
+      objectTableReadEvent([this] { objectTableReadDone(); },
+                           name() + ".objectTableRead"),
       responseWriteEvent([this] { responseWriteDone(); },
                          name() + ".responseWrite")
 {
@@ -242,14 +242,22 @@ Pvrdma::startCommand(uint32_t value)
 void
 Pvrdma::commandReadDone()
 {
-    if (letoh(command.header.command) ==
-        static_cast<uint32_t>(pvrdma::Command::CreateMr)) {
-        startMrCreate();
+    const uint32_t command_id = letoh(command.header.command);
+    if (command_id == static_cast<uint32_t>(pvrdma::Command::CreateMr) ||
+        command_id == static_cast<uint32_t>(pvrdma::Command::CreateCq) ||
+        command_id == static_cast<uint32_t>(pvrdma::Command::CreateQp)) {
+        startObjectCreate(command_id ==
+            static_cast<uint32_t>(pvrdma::Command::CreateMr) ?
+                pvrdma::PendingCreateKind::Mr :
+            command_id == static_cast<uint32_t>(pvrdma::Command::CreateCq) ?
+                pvrdma::PendingCreateKind::Cq :
+                pvrdma::PendingCreateKind::Qp);
         return;
     }
 
     const auto result = pvrdma::processCommand(
         command, response, gids, gidValid, objects, memoryRegions,
+        completionQueues, queuePairs,
         {BARs[pvrdma::UarBar]->addr(), BARs[pvrdma::UarBar]->size()});
     operationError.complete(regs.error, result.error);
     panic_if(!pvrdma::finishCommandRead(controlState, result.hasResponse),
@@ -267,20 +275,45 @@ Pvrdma::commandReadDone()
 }
 
 void
-Pvrdma::startMrCreate()
+Pvrdma::startObjectCreate(pvrdma::PendingCreateKind kind)
 {
     response = {};
+    pendingCreate = kind;
     mrBuild = {};
-    if (!pvrdma::detail::prepareCreateMr(
-            command, objects, memoryRegions, mrBuild)) {
-        pvrdma::detail::setResponseHeader(
-            response.header, command.header,
-            static_cast<uint32_t>(pvrdma::Command::CreateMr),
-            pvrdma::CommandError);
-        response.header.acknowledgement = 0;
+    cqBuild = {};
+    qpBuild = {};
+    bool valid = false;
+    switch (kind) {
+      case pvrdma::PendingCreateKind::Mr:
+        valid = pvrdma::detail::prepareCreateMr(
+            command, objects, memoryRegions, mrBuild);
+        break;
+      case pvrdma::PendingCreateKind::Cq:
+        valid = pvrdma::detail::prepareCreateCq(
+            command, objects, completionQueues, cqBuild);
+        break;
+      case pvrdma::PendingCreateKind::Qp:
+        valid = pvrdma::detail::prepareCreateQp(
+            command, objects, completionQueues, queuePairs, qpBuild);
+        break;
+      case pvrdma::PendingCreateKind::None:
+        break;
+    }
+    if (!valid) {
+        pvrdma::detail::setCreateResponseHeader(
+            response.header, command.header, letoh(command.header.command),
+            false);
         operationError.complete(regs.error, pvrdma::CommandError);
         panic_if(!pvrdma::finishCommandRead(controlState, true),
-                 "PVRDMA rejected MR create in invalid state");
+                 "PVRDMA rejected object create in invalid state");
+        pendingCreate = pvrdma::PendingCreateKind::None;
+        mrBuild = {};
+        cqBuild = {};
+        qpBuild = {};
+        objectDirectory = {};
+        objectTable = {};
+        objectTables.clear();
+        objectTableIndex = 0;
         dmaWrite(responseSlotDmaAddress, sizeof(response),
                  sys->isAtomicMode() ? nullptr : &responseWriteEvent,
                  reinterpret_cast<uint8_t *>(&response));
@@ -289,85 +322,130 @@ Pvrdma::startMrCreate()
         return;
     }
 
-    panic_if(!pvrdma::beginMrDirectory(controlState),
-             "PVRDMA began MR directory read in invalid state");
-    mrDirectory = {};
-    dmaRead(pciToDma(mrBuild.pageDirectoryDma), sizeof(mrDirectory),
-            sys->isAtomicMode() ? nullptr : &mrDirectoryReadEvent,
-            reinterpret_cast<uint8_t *>(mrDirectory.data()));
+    panic_if(!pvrdma::beginObjectDirectory(controlState),
+             "PVRDMA began object directory read in invalid state");
+    objectDirectory = {};
+    auto &build = pendingPageBuild();
+    dmaRead(pciToDma(build.pageDirectoryDma), sizeof(objectDirectory),
+            sys->isAtomicMode() ? nullptr : &objectDirectoryReadEvent,
+            reinterpret_cast<uint8_t *>(objectDirectory.data()));
     if (sys->isAtomicMode())
-        mrDirectoryReadDone();
+        objectDirectoryReadDone();
+}
+
+pvrdma::PageDirectoryBuild &
+Pvrdma::pendingPageBuild()
+{
+    switch (pendingCreate) {
+      case pvrdma::PendingCreateKind::Mr: return mrBuild;
+      case pvrdma::PendingCreateKind::Cq: return cqBuild;
+      case pvrdma::PendingCreateKind::Qp: return qpBuild;
+      case pvrdma::PendingCreateKind::None:
+        panic("PVRDMA has no pending page-backed create");
+    }
+    panic("Invalid PVRDMA pending create kind");
 }
 
 void
-Pvrdma::mrDirectoryReadDone()
+Pvrdma::objectDirectoryReadDone()
 {
-    if (!pvrdma::detail::consumeMrDirectory(
-            mrBuild, mrDirectory, mrTables)) {
-        finishMrCreate(false);
+    if (!pvrdma::detail::consumePageDirectory(
+            pendingPageBuild(), objectDirectory, objectTables)) {
+        finishObjectCreate(false);
         return;
     }
-    panic_if(!pvrdma::beginMrTables(controlState),
-             "PVRDMA completed MR directory read in invalid state");
-    mrTableIndex = 0;
-    startMrTableRead();
+    panic_if(!pvrdma::beginObjectTables(controlState),
+             "PVRDMA completed object directory read in invalid state");
+    objectTableIndex = 0;
+    startObjectTableRead();
 }
 
 void
-Pvrdma::startMrTableRead()
+Pvrdma::startObjectTableRead()
 {
-    panic_if(controlState != pvrdma::ControlState::ReadingMrTable ||
-                 mrTableIndex >= mrTables.size(),
-             "PVRDMA started invalid MR table read");
-    mrTable = {};
-    dmaRead(pciToDma(mrTables[mrTableIndex]), sizeof(mrTable),
-            sys->isAtomicMode() ? nullptr : &mrTableReadEvent,
-            reinterpret_cast<uint8_t *>(mrTable.data()));
+    panic_if(controlState != pvrdma::ControlState::ReadingObjectTable ||
+                 objectTableIndex >= objectTables.size(),
+             "PVRDMA started invalid object table read");
+    objectTable = {};
+    dmaRead(pciToDma(objectTables[objectTableIndex]), sizeof(objectTable),
+            sys->isAtomicMode() ? nullptr : &objectTableReadEvent,
+            reinterpret_cast<uint8_t *>(objectTable.data()));
     if (sys->isAtomicMode())
-        mrTableReadDone();
+        objectTableReadDone();
 }
 
 void
-Pvrdma::mrTableReadDone()
+Pvrdma::objectTableReadDone()
 {
-    if (!pvrdma::detail::consumeMrTable(mrBuild, mrTableIndex, mrTable)) {
-        finishMrCreate(false);
+    if (!pvrdma::detail::consumePageTable(
+            pendingPageBuild(), objectTableIndex, objectTable)) {
+        finishObjectCreate(false);
         return;
     }
-    if (++mrTableIndex < mrTables.size()) {
-        startMrTableRead();
+    if (++objectTableIndex < objectTables.size()) {
+        startObjectTableRead();
         return;
     }
-    finishMrCreate(true);
+    finishObjectCreate(true);
 }
 
 void
-Pvrdma::finishMrCreate(bool success)
+Pvrdma::finishObjectCreate(bool success)
 {
-    if (success)
-        success = memoryRegions.commit(std::move(mrBuild), objects);
-
-    pvrdma::detail::setResponseHeader(
-        response.header, command.header,
-        static_cast<uint32_t>(pvrdma::Command::CreateMr), !success);
+    const auto kind = pendingCreate;
     if (success) {
-        const uint32_t slot = mrBuild.mrHandle & pvrdma::MrSlotMask;
-        const auto &mr = memoryRegions.entries[slot];
+        switch (kind) {
+          case pvrdma::PendingCreateKind::Mr:
+            success = memoryRegions.commit(std::move(mrBuild), objects);
+            break;
+          case pvrdma::PendingCreateKind::Cq:
+            success = completionQueues.commit(std::move(cqBuild), objects);
+            break;
+          case pvrdma::PendingCreateKind::Qp:
+            success = queuePairs.commit(std::move(qpBuild), objects,
+                                        completionQueues);
+            break;
+          case pvrdma::PendingCreateKind::None:
+            success = false;
+            break;
+        }
+    }
+
+    pvrdma::detail::setCreateResponseHeader(
+        response.header, command.header, letoh(command.header.command),
+        success);
+    if (success && kind == pvrdma::PendingCreateKind::Mr) {
+        const auto &mr = memoryRegions.entries[
+            mrBuild.mrHandle & pvrdma::MrSlotMask];
         response.createMr.mrHandle = htole(mr.mrHandle);
         response.createMr.lkey = htole(mr.lkey);
         response.createMr.rkey = htole(mr.rkey);
-    } else {
-        // Linux 6.18 ignores response.header.error. An acknowledgement
-        // mismatch is its only response-path command failure signal.
-        response.header.acknowledgement = 0;
+    } else if (success && kind == pvrdma::PendingCreateKind::Cq) {
+        const auto &cq = completionQueues.entries[cqBuild.slot];
+        response.createCq.cqHandle = htole(cq.cqHandle);
+        response.createCq.cqe = htole(cq.cqe);
+    } else if (success && kind == pvrdma::PendingCreateKind::Qp) {
+        const auto &qp = queuePairs.entries[qpBuild.slot];
+        response.createQpV2.qpn = htole(qp.qpn);
+        response.createQpV2.qpHandle = htole(qp.qpHandle);
+        response.createQpV2.maxSendWr = htole(qp.capabilities.maxSendWr);
+        response.createQpV2.maxRecvWr = htole(qp.capabilities.maxRecvWr);
+        response.createQpV2.maxSendSge = htole(qp.capabilities.maxSendSge);
+        response.createQpV2.maxRecvSge = htole(qp.capabilities.maxRecvSge);
+        response.createQpV2.maxInlineData = 0;
     }
     operationError.complete(regs.error,
                             success ? 0 : pvrdma::CommandError);
-    panic_if(!pvrdma::finishMrWalk(controlState),
-             "PVRDMA finished MR walk in invalid state");
+    panic_if(!pvrdma::finishObjectWalk(controlState),
+             "PVRDMA finished object walk in invalid state");
+    pendingCreate = pvrdma::PendingCreateKind::None;
     mrBuild = {};
-    mrTables.clear();
-    mrTableIndex = 0;
+    cqBuild = {};
+    qpBuild = {};
+    objectDirectory = {};
+    objectTable = {};
+    objectTables.clear();
+    objectTableIndex = 0;
     dmaWrite(responseSlotDmaAddress, sizeof(response),
              sys->isAtomicMode() ? nullptr : &responseWriteEvent,
              reinterpret_cast<uint8_t *>(&response));
@@ -401,11 +479,16 @@ Pvrdma::resetDevice()
     gidValid = {};
     objects.reset();
     memoryRegions.reset();
+    completionQueues.reset();
+    queuePairs.reset();
+    pendingCreate = pvrdma::PendingCreateKind::None;
     mrBuild = {};
-    mrDirectory = {};
-    mrTable = {};
-    mrTables.clear();
-    mrTableIndex = 0;
+    cqBuild = {};
+    qpBuild = {};
+    objectDirectory = {};
+    objectTable = {};
+    objectTables.clear();
+    objectTableIndex = 0;
     operationError.reset();
     if (intxAsserted) {
         intrClear();
@@ -471,6 +554,9 @@ Pvrdma::serialize(CheckpointOut &cp) const
     arrayParamOut(cp, "contextPdChildren",
                   objects.contextPdChildren.data(),
                   objects.contextPdChildren.size());
+    arrayParamOut(cp, "contextCqChildren",
+                  objects.contextCqChildren.data(),
+                  objects.contextCqChildren.size());
     arrayParamOut(cp, "pdAllocated", objects.pdAllocated.data(),
                   objects.pdAllocated.size());
     arrayParamOut(cp, "pdParent", objects.pdParent.data(),
@@ -495,6 +581,53 @@ Pvrdma::serialize(CheckpointOut &cp) const
         paramOut(cp, "length", mr.length);
         paramOut(cp, "end", mr.end);
         arrayParamOut(cp, "pages", mr.pages);
+    }
+    for (uint32_t slot = 1; slot < pvrdma::ObjectTableEntries; ++slot) {
+        const auto &cq = completionQueues.entries[slot];
+        ScopedCheckpointSection sec(cp, csprintf("cq%u", slot));
+        paramOut(cp, "valid", cq.valid);
+        if (!cq.valid)
+            continue;
+        paramOut(cp, "cqHandle", cq.cqHandle);
+        paramOut(cp, "contextHandle", cq.contextHandle);
+        paramOut(cp, "uar", cq.uar);
+        paramOut(cp, "cqe", cq.cqe);
+        paramOut(cp, "qpReferences", cq.qpReferences);
+        paramOut(cp, "armFlags", cq.armFlags);
+        paramOut(cp, "producerTail", cq.producerTail);
+        paramOut(cp, "consumerHead", cq.consumerHead);
+        arrayParamOut(cp, "pages", cq.pages);
+    }
+    for (uint32_t slot = 1; slot < pvrdma::ObjectTableEntries; ++slot) {
+        const auto &qp = queuePairs.entries[slot];
+        ScopedCheckpointSection sec(cp, csprintf("qp%u", slot));
+        paramOut(cp, "valid", qp.valid);
+        paramOut(cp, "generation", qp.generation);
+        if (!qp.valid)
+            continue;
+        paramOut(cp, "qpHandle", qp.qpHandle);
+        paramOut(cp, "qpn", qp.qpn);
+        paramOut(cp, "pdHandle", qp.pdHandle);
+        paramOut(cp, "sendCqHandle", qp.sendCqHandle);
+        paramOut(cp, "recvCqHandle", qp.recvCqHandle);
+        paramOut(cp, "contextHandle", qp.contextHandle);
+        paramOut(cp, "uar", qp.uar);
+        paramOut(cp, "sendChunks", qp.sendChunks);
+        paramOut(cp, "recvChunks", qp.recvChunks);
+        paramOut(cp, "totalChunks", qp.totalChunks);
+        paramOut(cp, "signalAllSendWr", qp.signalAllSendWr);
+        paramOut(cp, "state", static_cast<uint32_t>(qp.state));
+        arrayParamOut(cp, "capabilities",
+                      reinterpret_cast<const uint8_t *>(&qp.capabilities),
+                      sizeof(qp.capabilities));
+        arrayParamOut(cp, "attributes",
+                      reinterpret_cast<const uint8_t *>(&qp.attributes),
+                      sizeof(qp.attributes));
+        paramOut(cp, "sqProducerTail", qp.sqProducerTail);
+        paramOut(cp, "sqConsumerHead", qp.sqConsumerHead);
+        paramOut(cp, "rqProducerTail", qp.rqProducerTail);
+        paramOut(cp, "rqConsumerHead", qp.rqConsumerHead);
+        arrayParamOut(cp, "pages", qp.pages);
     }
 }
 
@@ -525,6 +658,9 @@ Pvrdma::unserialize(CheckpointIn &cp)
     arrayParamIn(cp, "contextPdChildren",
                  objects.contextPdChildren.data(),
                  objects.contextPdChildren.size());
+    arrayParamIn(cp, "contextCqChildren",
+                 objects.contextCqChildren.data(),
+                 objects.contextCqChildren.size());
     arrayParamIn(cp, "pdAllocated", objects.pdAllocated.data(),
                  objects.pdAllocated.size());
     arrayParamIn(cp, "pdParent", objects.pdParent.data(),
@@ -551,6 +687,57 @@ Pvrdma::unserialize(CheckpointIn &cp)
         paramIn(cp, "end", mr.end);
         arrayParamIn(cp, "pages", mr.pages);
     }
+    completionQueues.reset();
+    for (uint32_t slot = 1; slot < pvrdma::ObjectTableEntries; ++slot) {
+        auto &cq = completionQueues.entries[slot];
+        ScopedCheckpointSection sec(cp, csprintf("cq%u", slot));
+        paramIn(cp, "valid", cq.valid);
+        if (!cq.valid)
+            continue;
+        paramIn(cp, "cqHandle", cq.cqHandle);
+        paramIn(cp, "contextHandle", cq.contextHandle);
+        paramIn(cp, "uar", cq.uar);
+        paramIn(cp, "cqe", cq.cqe);
+        paramIn(cp, "qpReferences", cq.qpReferences);
+        paramIn(cp, "armFlags", cq.armFlags);
+        paramIn(cp, "producerTail", cq.producerTail);
+        paramIn(cp, "consumerHead", cq.consumerHead);
+        arrayParamIn(cp, "pages", cq.pages);
+    }
+    queuePairs.reset();
+    for (uint32_t slot = 1; slot < pvrdma::ObjectTableEntries; ++slot) {
+        auto &qp = queuePairs.entries[slot];
+        ScopedCheckpointSection sec(cp, csprintf("qp%u", slot));
+        paramIn(cp, "valid", qp.valid);
+        paramIn(cp, "generation", qp.generation);
+        if (!qp.valid)
+            continue;
+        paramIn(cp, "qpHandle", qp.qpHandle);
+        paramIn(cp, "qpn", qp.qpn);
+        paramIn(cp, "pdHandle", qp.pdHandle);
+        paramIn(cp, "sendCqHandle", qp.sendCqHandle);
+        paramIn(cp, "recvCqHandle", qp.recvCqHandle);
+        paramIn(cp, "contextHandle", qp.contextHandle);
+        paramIn(cp, "uar", qp.uar);
+        paramIn(cp, "sendChunks", qp.sendChunks);
+        paramIn(cp, "recvChunks", qp.recvChunks);
+        paramIn(cp, "totalChunks", qp.totalChunks);
+        paramIn(cp, "signalAllSendWr", qp.signalAllSendWr);
+        uint32_t state = 0;
+        paramIn(cp, "state", state);
+        qp.state = static_cast<pvrdma::QpState>(state);
+        arrayParamIn(cp, "capabilities",
+                     reinterpret_cast<uint8_t *>(&qp.capabilities),
+                     sizeof(qp.capabilities));
+        arrayParamIn(cp, "attributes",
+                     reinterpret_cast<uint8_t *>(&qp.attributes),
+                     sizeof(qp.attributes));
+        paramIn(cp, "sqProducerTail", qp.sqProducerTail);
+        paramIn(cp, "sqConsumerHead", qp.sqConsumerHead);
+        paramIn(cp, "rqProducerTail", qp.rqProducerTail);
+        paramIn(cp, "rqConsumerHead", qp.rqConsumerHead);
+        arrayParamIn(cp, "pages", qp.pages);
+    }
     operationError.reset();
 
     panic_if(!pvrdma::stable(controlState),
@@ -561,13 +748,17 @@ Pvrdma::unserialize(CheckpointIn &cp)
     panic_if(!pvrdma::validObjectTables(
                  objects, {BARs[pvrdma::UarBar]->addr(),
                            BARs[pvrdma::UarBar]->size()}) ||
-                 !pvrdma::detail::validMemoryRegions(memoryRegions, objects),
+                 !pvrdma::validQueueObjects(completionQueues, queuePairs,
+                                            memoryRegions, objects),
              "PVRDMA checkpoint has inconsistent object tables");
+    pendingCreate = pvrdma::PendingCreateKind::None;
     mrBuild = {};
-    mrDirectory = {};
-    mrTable = {};
-    mrTables.clear();
-    mrTableIndex = 0;
+    cqBuild = {};
+    qpBuild = {};
+    objectDirectory = {};
+    objectTable = {};
+    objectTables.clear();
+    objectTableIndex = 0;
     if (controlState == pvrdma::ControlState::Unconfigured) {
         dsrDmaAddress = commandSlotDmaAddress = responseSlotDmaAddress = 0;
     } else {

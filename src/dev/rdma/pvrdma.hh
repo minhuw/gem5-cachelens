@@ -25,12 +25,20 @@ inline constexpr uint32_t CommandError = 1;
 inline constexpr uint32_t InitialInterruptMask = 0xffffffff;
 inline constexpr uint32_t GidTableEntries = 8;
 inline constexpr uint32_t ObjectTableEntries = 64;
-inline constexpr uint32_t MrPageSize = 4096;
-inline constexpr uint32_t MrEntriesPerPage = MrPageSize / sizeof(uint64_t);
-inline constexpr uint32_t MrSlotBits = 6;
-inline constexpr uint32_t MrSlotMask = ObjectTableEntries - 1;
-inline constexpr uint32_t MaxMrGeneration =
-    std::numeric_limits<uint32_t>::max() >> MrSlotBits;
+inline constexpr uint32_t PageSize = 4096;
+inline constexpr uint32_t PageEntries = PageSize / sizeof(uint64_t);
+inline constexpr uint32_t SlotBits = 6;
+inline constexpr uint32_t SlotMask = ObjectTableEntries - 1;
+inline constexpr uint32_t MaxGeneration =
+    std::numeric_limits<uint32_t>::max() >> SlotBits;
+inline constexpr uint32_t MrPageSize = PageSize;
+inline constexpr uint32_t MrEntriesPerPage = PageEntries;
+inline constexpr uint32_t MrSlotBits = SlotBits;
+inline constexpr uint32_t MrSlotMask = SlotMask;
+inline constexpr uint32_t MaxMrGeneration = MaxGeneration;
+inline constexpr uint32_t CqeSize = 64;
+inline constexpr uint32_t SqStride = 128;
+inline constexpr uint32_t RqStride = 32;
 inline constexpr uint32_t SupportedMrAccess = AccessLocalWrite |
     AccessRemoteWrite | AccessRemoteRead | AccessRemoteAtomic;
 inline constexpr uint32_t FixedMtu = 1024;
@@ -60,8 +68,8 @@ enum class ControlState : uint8_t
     ReadingDsr,
     WritingCaps,
     ReadingCommand,
-    ReadingMrDirectory,
-    ReadingMrTable,
+    ReadingObjectDirectory,
+    ReadingObjectTable,
     WritingResponse,
 };
 
@@ -140,28 +148,28 @@ finishCommandRead(ControlState &state, bool has_response)
 }
 
 constexpr bool
-beginMrDirectory(ControlState &state)
+beginObjectDirectory(ControlState &state)
 {
     if (state != ControlState::ReadingCommand)
         return false;
-    state = ControlState::ReadingMrDirectory;
+    state = ControlState::ReadingObjectDirectory;
     return true;
 }
 
 constexpr bool
-beginMrTables(ControlState &state)
+beginObjectTables(ControlState &state)
 {
-    if (state != ControlState::ReadingMrDirectory)
+    if (state != ControlState::ReadingObjectDirectory)
         return false;
-    state = ControlState::ReadingMrTable;
+    state = ControlState::ReadingObjectTable;
     return true;
 }
 
 constexpr bool
-finishMrWalk(ControlState &state)
+finishObjectWalk(ControlState &state)
 {
-    if (state != ControlState::ReadingMrDirectory &&
-        state != ControlState::ReadingMrTable)
+    if (state != ControlState::ReadingObjectDirectory &&
+        state != ControlState::ReadingObjectTable)
         return false;
     state = ControlState::WritingResponse;
     return true;
@@ -331,6 +339,7 @@ struct ObjectTables
 {
     std::array<uint32_t, ObjectTableEntries> contextUar{};
     std::array<uint32_t, ObjectTableEntries> contextPdChildren{};
+    std::array<uint32_t, ObjectTableEntries> contextCqChildren{};
     std::array<uint32_t, ObjectTableEntries> pdAllocated{};
     std::array<uint32_t, ObjectTableEntries> pdParent{};
     std::array<uint32_t, ObjectTableEntries> pdChildren{};
@@ -340,6 +349,7 @@ struct ObjectTables
     {
         contextUar = {};
         contextPdChildren = {};
+        contextCqChildren = {};
         pdAllocated = {};
         pdParent = {};
         pdChildren = {};
@@ -362,19 +372,30 @@ struct MemoryRegion
     std::vector<uint64_t> pages;
 };
 
-struct MemoryRegionBuild
+struct PageDirectoryBuild
+{
+    uint32_t numChunks = 0;
+    uint64_t pageDirectoryDma = 0;
+    std::vector<uint64_t> pages;
+
+    void reset()
+    {
+        numChunks = 0;
+        pageDirectoryDma = 0;
+        pages.clear();
+    }
+};
+
+struct MemoryRegionBuild : PageDirectoryBuild
 {
     uint32_t slot = 0;
     uint32_t generation = 0;
     uint32_t mrHandle = 0;
     uint32_t pdHandle = 0;
     uint32_t accessFlags = 0;
-    uint32_t numChunks = 0;
     uint64_t start = 0;
     uint64_t length = 0;
     uint64_t end = 0;
-    uint64_t pageDirectoryDma = 0;
-    std::vector<uint64_t> pages;
 };
 
 struct DmaChunk
@@ -460,6 +481,259 @@ struct MemoryRegionTable
         entry.generation = generation + 1;
         return true;
     }
+};
+
+struct CompletionQueue
+{
+    bool valid = false;
+    uint32_t cqHandle = 0;
+    uint32_t contextHandle = 0;
+    uint32_t uar = 0;
+    uint32_t cqe = 0;
+    uint32_t qpReferences = 0;
+    uint32_t armFlags = 0;
+    uint32_t producerTail = 0;
+    uint32_t consumerHead = 0;
+    std::vector<uint64_t> pages;
+};
+
+struct CompletionQueueBuild : PageDirectoryBuild
+{
+    uint32_t slot = 0;
+    uint32_t contextHandle = 0;
+    uint32_t cqe = 0;
+};
+
+struct CompletionQueueTable
+{
+    std::array<CompletionQueue, ObjectTableEntries> entries{};
+
+    void reset() { entries = {}; }
+
+    bool allocate(CompletionQueueBuild &build) const
+    {
+        for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+            if (!entries[slot].valid) {
+                build.slot = slot;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool commit(CompletionQueueBuild &&build, ObjectTables &objects)
+    {
+        if (!build.slot || build.slot >= ObjectTableEntries ||
+            !build.contextHandle ||
+            build.contextHandle >= ObjectTableEntries ||
+            !objects.contextUar[build.contextHandle] || !build.cqe ||
+            (build.cqe & (build.cqe - 1)) || build.cqe > 1024 ||
+            build.numChunks != 1 +
+                (uint64_t{build.cqe} * CqeSize + PageSize - 1) / PageSize ||
+            build.pages.size() != build.numChunks ||
+            std::any_of(build.pages.begin(), build.pages.end(),
+                [](uint64_t page) {
+                    return !page || (page % PageSize) != 0;
+                }))
+            return false;
+        auto &entry = entries[build.slot];
+        if (entry.valid)
+            return false;
+        entry.valid = true;
+        entry.cqHandle = build.slot;
+        entry.contextHandle = build.contextHandle;
+        entry.uar = objects.contextUar[build.contextHandle];
+        entry.cqe = build.cqe;
+        entry.pages = std::move(build.pages);
+        ++objects.contextCqChildren[entry.contextHandle];
+        return true;
+    }
+
+    bool destroy(uint32_t handle, ObjectTables &objects)
+    {
+        if (!handle || handle >= ObjectTableEntries)
+            return false;
+        auto &entry = entries[handle];
+        if (!entry.valid || entry.cqHandle != handle ||
+            entry.qpReferences ||
+            !objects.contextCqChildren[entry.contextHandle])
+            return false;
+        --objects.contextCqChildren[entry.contextHandle];
+        entry = {};
+        return true;
+    }
+};
+
+struct QueuePair
+{
+    bool valid = false;
+    uint32_t generation = 0;
+    uint32_t qpHandle = 0;
+    uint32_t qpn = 0;
+    uint32_t pdHandle = 0;
+    uint32_t sendCqHandle = 0;
+    uint32_t recvCqHandle = 0;
+    uint32_t contextHandle = 0;
+    uint32_t uar = 0;
+    uint32_t sendChunks = 0;
+    uint32_t recvChunks = 0;
+    uint32_t totalChunks = 0;
+    bool signalAllSendWr = false;
+    QpState state = QpState::Reset;
+    QpCap capabilities{};
+    QpAttr attributes{};
+    uint32_t sqProducerTail = 0;
+    uint32_t sqConsumerHead = 0;
+    uint32_t rqProducerTail = 0;
+    uint32_t rqConsumerHead = 0;
+    std::vector<uint64_t> pages;
+};
+
+struct QueuePairBuild : PageDirectoryBuild
+{
+    uint32_t slot = 0;
+    uint32_t generation = 0;
+    uint32_t qpn = 0;
+    uint32_t pdHandle = 0;
+    uint32_t sendCqHandle = 0;
+    uint32_t recvCqHandle = 0;
+    uint32_t contextHandle = 0;
+    uint32_t sendChunks = 0;
+    uint32_t recvChunks = 0;
+    bool signalAllSendWr = false;
+    QpCap capabilities{};
+};
+
+struct QueuePairTable
+{
+    std::array<QueuePair, ObjectTableEntries> entries{};
+
+    void reset() { entries = {}; }
+
+    bool allocate(QueuePairBuild &build) const
+    {
+        for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+            const auto &entry = entries[slot];
+            if (!entry.valid && entry.generation <= MaxGeneration) {
+                build.slot = slot;
+                build.generation = entry.generation;
+                build.qpn = (build.generation << SlotBits) | slot;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool commit(QueuePairBuild &&build, ObjectTables &objects,
+                CompletionQueueTable &cqs)
+    {
+        if (!build.slot || build.slot >= ObjectTableEntries ||
+            !build.pdHandle || build.pdHandle >= ObjectTableEntries ||
+            !objects.pdAllocated[build.pdHandle] ||
+            !build.contextHandle ||
+            objects.pdParent[build.pdHandle] != build.contextHandle ||
+            !objects.contextUar[build.contextHandle] ||
+            !build.sendCqHandle ||
+            build.sendCqHandle >= ObjectTableEntries ||
+            !build.recvCqHandle ||
+            build.recvCqHandle >= ObjectTableEntries ||
+            !cqs.entries[build.sendCqHandle].valid ||
+            !cqs.entries[build.recvCqHandle].valid ||
+            cqs.entries[build.sendCqHandle].contextHandle !=
+                build.contextHandle ||
+            cqs.entries[build.recvCqHandle].contextHandle !=
+                build.contextHandle ||
+            !build.capabilities.maxSendWr ||
+            (build.capabilities.maxSendWr &
+             (build.capabilities.maxSendWr - 1)) ||
+            build.capabilities.maxSendWr > 256 ||
+            !build.capabilities.maxRecvWr ||
+            (build.capabilities.maxRecvWr &
+             (build.capabilities.maxRecvWr - 1)) ||
+            build.capabilities.maxRecvWr > 256 ||
+            build.capabilities.maxSendSge != 1 ||
+            build.capabilities.maxRecvSge != 1 ||
+            build.capabilities.maxInlineData ||
+            build.capabilities.reserved ||
+            build.sendChunks !=
+                (uint64_t{build.capabilities.maxSendWr} * SqStride +
+                 PageSize - 1) / PageSize ||
+            build.recvChunks !=
+                (uint64_t{build.capabilities.maxRecvWr} * RqStride +
+                 PageSize - 1) / PageSize ||
+            build.numChunks != 1 + build.sendChunks + build.recvChunks ||
+            build.pages.size() != build.numChunks ||
+            std::any_of(build.pages.begin(), build.pages.end(),
+                [](uint64_t page) {
+                    return !page || (page % PageSize) != 0;
+                }))
+            return false;
+        auto &entry = entries[build.slot];
+        if (entry.valid || entry.generation != build.generation ||
+            build.qpn != ((build.generation << SlotBits) | build.slot))
+            return false;
+        entry.valid = true;
+        entry.generation = build.generation;
+        entry.qpHandle = build.slot;
+        entry.qpn = build.qpn;
+        entry.pdHandle = build.pdHandle;
+        entry.sendCqHandle = build.sendCqHandle;
+        entry.recvCqHandle = build.recvCqHandle;
+        entry.contextHandle = build.contextHandle;
+        entry.uar = objects.contextUar[build.contextHandle];
+        entry.sendChunks = build.sendChunks;
+        entry.recvChunks = build.recvChunks;
+        entry.totalChunks = build.numChunks;
+        entry.signalAllSendWr = build.signalAllSendWr;
+        entry.capabilities = build.capabilities;
+        entry.attributes.qpState = QpState::Reset;
+        entry.attributes.currentQpState = QpState::Reset;
+        entry.attributes.capabilities = build.capabilities;
+        entry.pages = std::move(build.pages);
+        ++objects.pdChildren[entry.pdHandle];
+        ++cqs.entries[entry.sendCqHandle].qpReferences;
+        ++cqs.entries[entry.recvCqHandle].qpReferences;
+        return true;
+    }
+
+    bool destroy(uint32_t handle, ObjectTables &objects,
+                 CompletionQueueTable &cqs)
+    {
+        if (!handle || handle >= ObjectTableEntries)
+            return false;
+        auto &entry = entries[handle];
+        const uint32_t send_refs = entry.sendCqHandle == entry.recvCqHandle ?
+            2 : 1;
+        if (!entry.valid || entry.qpHandle != handle ||
+            !entry.pdHandle || entry.pdHandle >= ObjectTableEntries ||
+            !entry.sendCqHandle ||
+            entry.sendCqHandle >= ObjectTableEntries ||
+            !entry.recvCqHandle ||
+            entry.recvCqHandle >= ObjectTableEntries ||
+            !cqs.entries[entry.sendCqHandle].valid ||
+            !cqs.entries[entry.recvCqHandle].valid ||
+            entry.sqProducerTail != entry.sqConsumerHead ||
+            entry.rqProducerTail != entry.rqConsumerHead ||
+            !objects.pdChildren[entry.pdHandle] ||
+            cqs.entries[entry.sendCqHandle].qpReferences < send_refs ||
+            cqs.entries[entry.recvCqHandle].qpReferences < 1)
+            return false;
+        --objects.pdChildren[entry.pdHandle];
+        --cqs.entries[entry.sendCqHandle].qpReferences;
+        --cqs.entries[entry.recvCqHandle].qpReferences;
+        const uint32_t generation = entry.generation;
+        entry = {};
+        entry.generation = generation + 1;
+        return true;
+    }
+};
+
+enum class PendingCreateKind : uint8_t
+{
+    None,
+    Mr,
+    Cq,
+    Qp,
 };
 
 struct CommandResult
@@ -551,6 +825,105 @@ validMrAccess(uint32_t access)
 }
 
 inline bool
+powerOfTwo(uint32_t value)
+{
+    return value && !(value & (value - 1));
+}
+
+inline uint32_t
+chunksFor(uint32_t entries, uint32_t stride)
+{
+    const uint64_t bytes = static_cast<uint64_t>(entries) * stride;
+    return (bytes + PageSize - 1) / PageSize;
+}
+
+inline bool
+validSupportedState(QpState state)
+{
+    return state == QpState::Reset || state == QpState::Init ||
+        state == QpState::ReadyToReceive ||
+        state == QpState::ReadyToSend;
+}
+
+inline bool
+validAddressVector(const AddressHandleAttr &attr)
+{
+    return attr.globalRoute.sourceGidIndex < GidTableEntries &&
+        attr.portNumber == 1;
+}
+
+inline bool
+zeroAddressVector(const AddressHandleAttr &attr)
+{
+    return std::all_of(std::begin(attr.globalRoute.destinationGid.raw),
+                       std::end(attr.globalRoute.destinationGid.raw),
+                       [](uint8_t byte) { return byte == 0; }) &&
+        !attr.globalRoute.flowLabel && !attr.globalRoute.sourceGidIndex &&
+        !attr.globalRoute.hopLimit && !attr.globalRoute.trafficClass &&
+        !attr.globalRoute.reserved && !attr.destinationLid && !attr.vlanId &&
+        !attr.serviceLevel && !attr.sourcePathBits && !attr.staticRate &&
+        !attr.flags && !attr.portNumber &&
+        std::all_of(std::begin(attr.destinationMac),
+                    std::end(attr.destinationMac),
+                    [](uint8_t byte) { return byte == 0; }) &&
+        !attr.reserved;
+}
+
+inline bool
+validStoredQpAttributes(const QueuePair &qp)
+{
+    const auto &attr = qp.attributes;
+    if (attr.qpState != qp.state || attr.currentQpState != qp.state ||
+        attr.pathMigrationState != MigrationState::Migrated || attr.qkey ||
+        attr.alternatePkeyIndex || attr.enableSqdAsyncNotify ||
+        attr.sendQueueDraining || attr.alternatePortNumber ||
+        attr.alternateTimeout ||
+        std::any_of(std::begin(attr.reserved), std::end(attr.reserved),
+                    [](uint8_t byte) { return byte != 0; }) ||
+        attr.capabilities.maxSendWr != qp.capabilities.maxSendWr ||
+        attr.capabilities.maxRecvWr != qp.capabilities.maxRecvWr ||
+        attr.capabilities.maxSendSge != qp.capabilities.maxSendSge ||
+        attr.capabilities.maxRecvSge != qp.capabilities.maxRecvSge ||
+        attr.capabilities.maxInlineData != qp.capabilities.maxInlineData ||
+        attr.capabilities.reserved ||
+        attr.addressHandle.globalRoute.reserved ||
+        attr.addressHandle.reserved || !zeroAddressVector(
+            attr.alternateAddressHandle))
+        return false;
+
+    if (qp.state == QpState::Reset)
+        return attr.pathMtu == static_cast<Mtu>(0) &&
+            !attr.receivePsn && !attr.sendPsn &&
+            !attr.destinationQpNumber && !attr.qpAccessFlags &&
+            !attr.pkeyIndex && !attr.maxReadAtomic &&
+            !attr.maxDestinationReadAtomic && !attr.minRnrTimer &&
+            !attr.portNumber && !attr.timeout && !attr.retryCount &&
+            !attr.rnrRetry && zeroAddressVector(attr.addressHandle);
+
+    if (!validMrAccess(attr.qpAccessFlags) || attr.pkeyIndex ||
+        attr.portNumber != 1)
+        return false;
+    if (qp.state == QpState::Init)
+        return attr.pathMtu == static_cast<Mtu>(0) &&
+            !attr.receivePsn && !attr.sendPsn &&
+            !attr.destinationQpNumber && !attr.maxReadAtomic &&
+            !attr.maxDestinationReadAtomic && !attr.minRnrTimer &&
+            !attr.timeout && !attr.retryCount && !attr.rnrRetry &&
+            zeroAddressVector(attr.addressHandle);
+
+    if (attr.pathMtu != Mtu::Mtu1024 || !attr.destinationQpNumber ||
+        attr.maxDestinationReadAtomic > 1 || attr.minRnrTimer > 31 ||
+        !validAddressVector(attr.addressHandle))
+        return false;
+    if (qp.state == QpState::ReadyToReceive)
+        return !attr.sendPsn && !attr.maxReadAtomic && !attr.timeout &&
+            !attr.retryCount && !attr.rnrRetry;
+
+    return qp.state == QpState::ReadyToSend && attr.maxReadAtomic <= 1 &&
+        attr.timeout <= 31 && attr.retryCount <= 7 && attr.rnrRetry <= 7;
+}
+
+inline bool
 prepareCreateMr(const CommandRequest &request, const ObjectTables &objects,
                 const MemoryRegionTable &mrs, MemoryRegionBuild &build)
 {
@@ -618,6 +991,117 @@ validMemoryRegions(const MemoryRegionTable &mrs,
 }
 
 inline bool
+validQueueObjects(const CompletionQueueTable &cqs,
+                  const QueuePairTable &qps,
+                  const MemoryRegionTable &mrs,
+                  const ObjectTables &objects)
+{
+    if (cqs.entries[0].valid || qps.entries[0].valid ||
+        qps.entries[0].generation)
+        return false;
+    ObjectTables mr_objects = objects;
+    mr_objects.pdChildren = {};
+    for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+        const auto &mr = mrs.entries[slot];
+        if (mr.valid) {
+            if (!mr.pdHandle || mr.pdHandle >= ObjectTableEntries)
+                return false;
+            ++mr_objects.pdChildren[mr.pdHandle];
+        }
+    }
+    if (!validMemoryRegions(mrs, mr_objects))
+        return false;
+    std::array<uint32_t, ObjectTableEntries> context_cqs{};
+    auto pd_children = mr_objects.pdChildren;
+    std::array<uint32_t, ObjectTableEntries> cq_references{};
+    for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+        const auto &cq = cqs.entries[slot];
+        if (!cq.valid) {
+            if (cq.cqHandle || cq.contextHandle || cq.uar || cq.cqe ||
+                cq.qpReferences || cq.armFlags || cq.producerTail ||
+                cq.consumerHead || !cq.pages.empty())
+                return false;
+        } else {
+            const uint32_t chunks = 1 + chunksFor(cq.cqe, CqeSize);
+            if (cq.cqHandle != slot || !cq.contextHandle ||
+                cq.contextHandle >= ObjectTableEntries ||
+                !objects.contextUar[cq.contextHandle] ||
+                cq.uar != objects.contextUar[cq.contextHandle] ||
+                !powerOfTwo(cq.cqe) || cq.cqe > 1024 || cq.armFlags ||
+                cq.producerTail || cq.consumerHead ||
+                cq.pages.size() != chunks ||
+                std::any_of(cq.pages.begin(), cq.pages.end(),
+                    [](uint64_t page) { return !alignedPage(page); }))
+                return false;
+            ++context_cqs[cq.contextHandle];
+        }
+
+        const auto &qp = qps.entries[slot];
+        if (!qp.valid) {
+            if (qp.generation > MaxGeneration + uint64_t{1} ||
+                qp.qpHandle || qp.qpn || qp.pdHandle ||
+                qp.sendCqHandle || qp.recvCqHandle ||
+                qp.contextHandle || qp.uar || qp.sendChunks ||
+                qp.recvChunks || qp.totalChunks || qp.signalAllSendWr ||
+                qp.state != QpState::Reset ||
+                qp.capabilities.maxSendWr || qp.capabilities.maxRecvWr ||
+                qp.capabilities.maxSendSge || qp.capabilities.maxRecvSge ||
+                qp.capabilities.maxInlineData ||
+                qp.capabilities.reserved ||
+                !validStoredQpAttributes(qp) ||
+                qp.sqProducerTail || qp.sqConsumerHead ||
+                qp.rqProducerTail || qp.rqConsumerHead ||
+                !qp.pages.empty())
+                return false;
+            continue;
+        }
+        if (qp.generation > MaxGeneration || qp.qpHandle != slot ||
+            qp.qpn != ((qp.generation << SlotBits) | slot) ||
+            !qp.pdHandle || qp.pdHandle >= ObjectTableEntries ||
+            !objects.pdAllocated[qp.pdHandle] || !qp.contextHandle ||
+            objects.pdParent[qp.pdHandle] != qp.contextHandle ||
+            !objects.contextUar[qp.contextHandle] ||
+            qp.uar != objects.contextUar[qp.contextHandle] ||
+            !qp.sendCqHandle || qp.sendCqHandle >= ObjectTableEntries ||
+            !qp.recvCqHandle || qp.recvCqHandle >= ObjectTableEntries ||
+            !cqs.entries[qp.sendCqHandle].valid ||
+            !cqs.entries[qp.recvCqHandle].valid ||
+            cqs.entries[qp.sendCqHandle].contextHandle !=
+                qp.contextHandle ||
+            cqs.entries[qp.recvCqHandle].contextHandle !=
+                qp.contextHandle ||
+            !powerOfTwo(qp.capabilities.maxSendWr) ||
+            qp.capabilities.maxSendWr > 256 ||
+            !powerOfTwo(qp.capabilities.maxRecvWr) ||
+            qp.capabilities.maxRecvWr > 256 ||
+            qp.capabilities.maxSendSge != 1 ||
+            qp.capabilities.maxRecvSge != 1 ||
+            qp.capabilities.maxInlineData || qp.capabilities.reserved ||
+            qp.sendChunks != chunksFor(qp.capabilities.maxSendWr,
+                                        SqStride) ||
+            qp.recvChunks != chunksFor(qp.capabilities.maxRecvWr,
+                                        RqStride) ||
+            qp.totalChunks != 1 + qp.sendChunks + qp.recvChunks ||
+            qp.pages.size() != qp.totalChunks ||
+            !validSupportedState(qp.state) ||
+            !validStoredQpAttributes(qp) || qp.sqProducerTail ||
+            qp.sqConsumerHead || qp.rqProducerTail || qp.rqConsumerHead ||
+            std::any_of(qp.pages.begin(), qp.pages.end(),
+                [](uint64_t page) { return !alignedPage(page); }))
+            return false;
+        ++pd_children[qp.pdHandle];
+        ++cq_references[qp.sendCqHandle];
+        ++cq_references[qp.recvCqHandle];
+    }
+    for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+        if (cqs.entries[slot].qpReferences != cq_references[slot])
+            return false;
+    }
+    return context_cqs == objects.contextCqChildren &&
+        pd_children == objects.pdChildren;
+}
+
+inline bool
 translate(const MemoryRegionTable &mrs, MrKeyType key_type, uint32_t key,
           uint64_t address, uint64_t length, uint32_t required_access,
           std::vector<DmaChunk> &chunks)
@@ -662,12 +1146,12 @@ translate(const MemoryRegionTable &mrs, MrKeyType key_type, uint32_t key,
 }
 
 inline bool
-consumeMrDirectory(const MemoryRegionBuild &build,
-                   const std::array<uint64_t, MrEntriesPerPage> &directory,
-                   std::vector<uint64_t> &tables)
+consumePageDirectory(const PageDirectoryBuild &build,
+                     const std::array<uint64_t, PageEntries> &directory,
+                     std::vector<uint64_t> &tables)
 {
-    const uint32_t count = (build.numChunks + MrEntriesPerPage - 1) /
-                           MrEntriesPerPage;
+    const uint32_t count = (build.numChunks + PageEntries - 1) /
+                           PageEntries;
     tables.clear();
     tables.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
@@ -682,15 +1166,15 @@ consumeMrDirectory(const MemoryRegionBuild &build,
 }
 
 inline bool
-consumeMrTable(MemoryRegionBuild &build, uint32_t table_index,
-               const std::array<uint64_t, MrEntriesPerPage> &table)
+consumePageTable(PageDirectoryBuild &build, uint32_t table_index,
+                 const std::array<uint64_t, PageEntries> &table)
 {
-    if (table_index != build.pages.size() / MrEntriesPerPage ||
+    if (table_index != build.pages.size() / PageEntries ||
         build.pages.size() >= build.numChunks)
         return false;
 
     const uint32_t count = std::min<uint32_t>(
-        MrEntriesPerPage, build.numChunks - build.pages.size());
+        PageEntries, build.numChunks - build.pages.size());
     const size_t original_size = build.pages.size();
     for (uint32_t i = 0; i < count; ++i) {
         const uint64_t address = letoh(table[i]);
@@ -703,18 +1187,100 @@ consumeMrTable(MemoryRegionBuild &build, uint32_t table_index,
     return true;
 }
 
-inline bool
-recognizedCommand(uint32_t command)
-{
-    return command <= static_cast<uint32_t>(Command::DestroySrq);
-}
-
 template <size_t N>
 inline bool
 allZero(const uint8_t (&bytes)[N])
 {
     return std::all_of(std::begin(bytes), std::end(bytes),
                        [](uint8_t byte) { return byte == 0; });
+}
+
+inline bool
+prepareCreateCq(const CommandRequest &request, const ObjectTables &objects,
+                const CompletionQueueTable &cqs,
+                CompletionQueueBuild &build)
+{
+    const auto &cmd = request.createCq;
+    const uint32_t context = letoh(cmd.contextHandle);
+    const uint32_t cqe = letoh(cmd.cqe);
+    const uint32_t chunks = letoh(cmd.numChunks);
+    const uint64_t directory = letoh(cmd.pageDirectoryDma);
+    const uint32_t expected = 1 + chunksFor(cqe, CqeSize);
+    if (letoh(request.header.reserved) || !allZero(cmd.reserved) ||
+        !context || context >= ObjectTableEntries ||
+        !objects.contextUar[context] || !powerOfTwo(cqe) || cqe > 1024 ||
+        chunks != expected || !alignedPage(directory) ||
+        !cqs.allocate(build))
+        return false;
+    build.contextHandle = context;
+    build.cqe = cqe;
+    build.numChunks = chunks;
+    build.pageDirectoryDma = directory;
+    build.pages.clear();
+    build.pages.reserve(chunks);
+    return true;
+}
+
+inline bool
+prepareCreateQp(const CommandRequest &request, const ObjectTables &objects,
+                const CompletionQueueTable &cqs,
+                const QueuePairTable &qps, QueuePairBuild &build)
+{
+    const auto &cmd = request.createQp;
+    const uint32_t pd = letoh(cmd.pdHandle);
+    const uint32_t send_cq = letoh(cmd.sendCqHandle);
+    const uint32_t recv_cq = letoh(cmd.recvCqHandle);
+    const uint32_t send_wr = letoh(cmd.maxSendWr);
+    const uint32_t recv_wr = letoh(cmd.maxRecvWr);
+    const uint32_t send_chunks = letoh(cmd.sendChunks);
+    const uint32_t total_chunks = letoh(cmd.totalChunks);
+    const uint32_t expected_send = chunksFor(send_wr, SqStride);
+    const uint32_t recv_chunks = chunksFor(recv_wr, RqStride);
+    const uint32_t context = pd < ObjectTableEntries ?
+        objects.pdParent[pd] : 0;
+    const uint64_t directory = letoh(cmd.pageDirectoryDma);
+    if (letoh(request.header.reserved) || !allZero(cmd.reserved) ||
+        !pd || pd >= ObjectTableEntries || !objects.pdAllocated[pd] ||
+        !context || !objects.contextUar[context] || !send_cq ||
+        send_cq >= ObjectTableEntries || !recv_cq ||
+        recv_cq >= ObjectTableEntries || !cqs.entries[send_cq].valid ||
+        !cqs.entries[recv_cq].valid ||
+        cqs.entries[send_cq].contextHandle != context ||
+        cqs.entries[recv_cq].contextHandle != context ||
+        letoh(cmd.srqHandle) || cmd.isSrq ||
+        cmd.qpType != static_cast<uint8_t>(QpType::Rc) ||
+        !powerOfTwo(send_wr) || send_wr > 256 ||
+        !powerOfTwo(recv_wr) || recv_wr > 256 ||
+        letoh(cmd.maxSendSge) != 1 || letoh(cmd.maxRecvSge) != 1 ||
+        letoh(cmd.maxInlineData) || letoh(cmd.lkey) ||
+        letoh(cmd.accessFlags) != AccessLocalWrite ||
+        letoh(cmd.maxAtomicArgument) || cmd.signalAllSendWr > 1 ||
+        send_chunks != expected_send ||
+        total_chunks != 1 + expected_send + recv_chunks ||
+        !alignedPage(directory) || !qps.allocate(build))
+        return false;
+    build.pdHandle = pd;
+    build.sendCqHandle = send_cq;
+    build.recvCqHandle = recv_cq;
+    build.contextHandle = context;
+    build.sendChunks = expected_send;
+    build.recvChunks = recv_chunks;
+    build.signalAllSendWr = cmd.signalAllSendWr != 0;
+    build.capabilities.maxSendWr = send_wr;
+    build.capabilities.maxRecvWr = recv_wr;
+    build.capabilities.maxSendSge = 1;
+    build.capabilities.maxRecvSge = 1;
+    build.numChunks = total_chunks;
+    build.pageDirectoryDma = directory;
+    build.pages.clear();
+    build.pages.reserve(total_chunks);
+    return true;
+}
+
+inline bool
+recognizedCommand(uint32_t command)
+{
+    return command <= static_cast<uint32_t>(Command::DestroySrq);
 }
 
 inline bool
@@ -743,8 +1309,8 @@ inline bool
 validObjectTables(const ObjectTables &objects, UarRange range)
 {
     if (objects.contextUar[0] || objects.contextPdChildren[0] ||
-        objects.pdAllocated[0] || objects.pdParent[0] ||
-        objects.pdChildren[0])
+        objects.contextCqChildren[0] || objects.pdAllocated[0] ||
+        objects.pdParent[0] || objects.pdChildren[0])
         return false;
 
     std::array<uint8_t, ObjectTableEntries> ownedUars{};
@@ -752,7 +1318,8 @@ validObjectTables(const ObjectTables &objects, UarRange range)
     for (uint32_t handle = 1; handle < ObjectTableEntries; ++handle) {
         const uint32_t uar = objects.contextUar[handle];
         if (!uar) {
-            if (objects.contextPdChildren[handle])
+            if (objects.contextPdChildren[handle] ||
+                objects.contextCqChildren[handle])
                 return false;
             continue;
         }
@@ -793,6 +1360,16 @@ setResponseHeader(ResponseHeader &header, const CommandHeader &request,
     header.acknowledgement = recognizedCommand(command) ?
         htole(responseCommand(static_cast<Command>(command))) : 0;
     header.error = error ? CommandError : 0;
+}
+
+inline void
+setCreateResponseHeader(ResponseHeader &header, const CommandHeader &request,
+                        uint32_t command, bool success)
+{
+    setResponseHeader(header, request, command, !success);
+    // Linux ignores CQ/QP create response errors and checks only the ACK.
+    if (!success)
+        header.acknowledgement = 0;
 }
 
 inline CommandResult
@@ -879,7 +1456,8 @@ destroyUc(const CommandRequest &request, ObjectTables &objects)
     if (letoh(request.header.reserved) != 0 ||
         !allZero(request.destroyUc.reserved) || handle == 0 ||
         handle >= ObjectTableEntries || !objects.contextUar[handle] ||
-        objects.contextPdChildren[handle])
+        objects.contextPdChildren[handle] ||
+        objects.contextCqChildren[handle])
         return {false, CommandError};
 
     objects.contextUar[handle] = 0;
@@ -941,6 +1519,239 @@ destroyMr(const CommandRequest &request, ObjectTables &objects,
     return {false, 0};
 }
 
+inline void
+convertQpCapFromAbi(QpCap &dst, const QpCap &src)
+{
+    dst = src;
+    dst.maxSendWr = letoh(src.maxSendWr);
+    dst.maxRecvWr = letoh(src.maxRecvWr);
+    dst.maxSendSge = letoh(src.maxSendSge);
+    dst.maxRecvSge = letoh(src.maxRecvSge);
+    dst.maxInlineData = letoh(src.maxInlineData);
+    dst.reserved = letoh(src.reserved);
+}
+
+inline void
+convertQpCapToAbi(QpCap &dst, const QpCap &src)
+{
+    dst = src;
+    dst.maxSendWr = htole(src.maxSendWr);
+    dst.maxRecvWr = htole(src.maxRecvWr);
+    dst.maxSendSge = htole(src.maxSendSge);
+    dst.maxRecvSge = htole(src.maxRecvSge);
+    dst.maxInlineData = htole(src.maxInlineData);
+    dst.reserved = htole(src.reserved);
+}
+
+inline void
+convertAhFromAbi(AddressHandleAttr &dst, const AddressHandleAttr &src)
+{
+    dst = src;
+    dst.globalRoute.flowLabel = letoh(src.globalRoute.flowLabel);
+    dst.destinationLid = letoh(src.destinationLid);
+    dst.vlanId = letoh(src.vlanId);
+}
+
+inline void
+convertAhToAbi(AddressHandleAttr &dst, const AddressHandleAttr &src)
+{
+    dst = src;
+    dst.globalRoute.flowLabel = htole(src.globalRoute.flowLabel);
+    dst.destinationLid = htole(src.destinationLid);
+    dst.vlanId = htole(src.vlanId);
+}
+
+inline bool
+convertQpAttrFromAbi(const QpAttr &src, QpAttr &dst)
+{
+    if (!allZero(src.reserved) || src.capabilities.reserved ||
+        src.addressHandle.globalRoute.reserved ||
+        src.addressHandle.reserved ||
+        src.alternateAddressHandle.globalRoute.reserved ||
+        src.alternateAddressHandle.reserved)
+        return false;
+    dst = src;
+    dst.qpState = static_cast<QpState>(
+        letoh(static_cast<uint32_t>(src.qpState)));
+    dst.currentQpState = static_cast<QpState>(
+        letoh(static_cast<uint32_t>(src.currentQpState)));
+    dst.pathMtu = static_cast<Mtu>(
+        letoh(static_cast<uint32_t>(src.pathMtu)));
+    dst.pathMigrationState = static_cast<MigrationState>(
+        letoh(static_cast<uint32_t>(src.pathMigrationState)));
+    dst.qkey = letoh(src.qkey);
+    dst.receivePsn = letoh(src.receivePsn);
+    dst.sendPsn = letoh(src.sendPsn);
+    dst.destinationQpNumber = letoh(src.destinationQpNumber);
+    dst.qpAccessFlags = letoh(src.qpAccessFlags);
+    dst.pkeyIndex = letoh(src.pkeyIndex);
+    dst.alternatePkeyIndex = letoh(src.alternatePkeyIndex);
+    convertQpCapFromAbi(dst.capabilities, src.capabilities);
+    convertAhFromAbi(dst.addressHandle, src.addressHandle);
+    convertAhFromAbi(dst.alternateAddressHandle,
+                     src.alternateAddressHandle);
+    return true;
+}
+
+inline void
+convertQpAttrToAbi(const QpAttr &src, QpAttr &dst)
+{
+    dst = src;
+    dst.qpState = static_cast<QpState>(
+        htole(static_cast<uint32_t>(src.qpState)));
+    dst.currentQpState = static_cast<QpState>(
+        htole(static_cast<uint32_t>(src.currentQpState)));
+    dst.pathMtu = static_cast<Mtu>(
+        htole(static_cast<uint32_t>(src.pathMtu)));
+    dst.pathMigrationState = static_cast<MigrationState>(
+        htole(static_cast<uint32_t>(src.pathMigrationState)));
+    dst.qkey = htole(src.qkey);
+    dst.receivePsn = htole(src.receivePsn);
+    dst.sendPsn = htole(src.sendPsn);
+    dst.destinationQpNumber = htole(src.destinationQpNumber);
+    dst.qpAccessFlags = htole(src.qpAccessFlags);
+    dst.pkeyIndex = htole(src.pkeyIndex);
+    dst.alternatePkeyIndex = htole(src.alternatePkeyIndex);
+    convertQpCapToAbi(dst.capabilities, src.capabilities);
+    convertAhToAbi(dst.addressHandle, src.addressHandle);
+    convertAhToAbi(dst.alternateAddressHandle,
+                   src.alternateAddressHandle);
+}
+
+inline CommandResult
+destroyCq(const CommandRequest &request, ObjectTables &objects,
+          CompletionQueueTable &cqs)
+{
+    if (letoh(request.header.reserved) ||
+        !allZero(request.destroyCq.reserved) ||
+        !cqs.destroy(letoh(request.destroyCq.cqHandle), objects))
+        return {false, CommandError};
+    return {false, 0};
+}
+
+inline CommandResult
+modifyQp(const CommandRequest &request, CommandResponse &response,
+         QueuePairTable &qps)
+{
+    const uint32_t handle = letoh(request.modifyQp.qpHandle);
+    const uint32_t mask = letoh(request.modifyQp.attributeMask);
+    constexpr uint32_t KnownMask = (uint32_t{1} << 21) - 1;
+    constexpr uint32_t InitMask = QpAttrState | QpAttrAccessFlags |
+        QpAttrPkeyIndex | QpAttrPort;
+    constexpr uint32_t RtrMask = QpAttrState | QpAttrAddressVector |
+        QpAttrPathMtu | QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
+        QpAttrMinRnrTimer | QpAttrDestinationQpn;
+    constexpr uint32_t RtsMask = QpAttrState | QpAttrTimeout |
+        QpAttrRetryCount | QpAttrRnrRetry | QpAttrSendPsn |
+        QpAttrMaxQpReadAtomic;
+    QpAttr attrs{};
+    bool success = !letoh(request.header.reserved) && handle &&
+        handle < ObjectTableEntries && qps.entries[handle].valid &&
+        !(mask & ~KnownMask) && (mask & QpAttrState) &&
+        !(mask & (QpAttrEnableSqdAsyncNotify | QpAttrQkey |
+                  QpAttrAlternatePath | QpAttrPathMigrationState |
+                  QpAttrCapabilities)) &&
+        convertQpAttrFromAbi(request.modifyQp.attributes, attrs) &&
+        validSupportedState(attrs.qpState);
+    auto *qp = success ? &qps.entries[handle] : nullptr;
+    if (success && (mask & QpAttrCurrentState))
+        success = validSupportedState(attrs.currentQpState) &&
+            attrs.currentQpState == qp->state;
+    const uint32_t transition_mask = mask & ~QpAttrCurrentState;
+    if (success && attrs.qpState == QpState::Reset) {
+        success = transition_mask == QpAttrState &&
+            qp->sqProducerTail == qp->sqConsumerHead &&
+            qp->rqProducerTail == qp->rqConsumerHead;
+        if (success) {
+            qp->state = QpState::Reset;
+            qp->attributes = {};
+            qp->attributes.capabilities = qp->capabilities;
+            qp->sqProducerTail = qp->sqConsumerHead = 0;
+            qp->rqProducerTail = qp->rqConsumerHead = 0;
+        }
+    } else if (success && qp->state == QpState::Reset &&
+               attrs.qpState == QpState::Init) {
+        success = transition_mask == InitMask && !attrs.pkeyIndex &&
+            attrs.portNumber == 1 && validMrAccess(attrs.qpAccessFlags);
+        if (success) {
+            qp->state = QpState::Init;
+            qp->attributes.qpAccessFlags = attrs.qpAccessFlags;
+            qp->attributes.pkeyIndex = attrs.pkeyIndex;
+            qp->attributes.portNumber = attrs.portNumber;
+        }
+    } else if (success && qp->state == QpState::Init &&
+               attrs.qpState == QpState::ReadyToReceive) {
+        success = transition_mask == RtrMask &&
+            attrs.pathMtu == Mtu::Mtu1024 &&
+            attrs.destinationQpNumber &&
+            attrs.maxDestinationReadAtomic <= 1 &&
+            attrs.minRnrTimer <= 31 &&
+            validAddressVector(attrs.addressHandle);
+        if (success) {
+            qp->state = QpState::ReadyToReceive;
+            qp->attributes.pathMtu = attrs.pathMtu;
+            qp->attributes.destinationQpNumber =
+                attrs.destinationQpNumber;
+            qp->attributes.receivePsn = attrs.receivePsn;
+            qp->attributes.maxDestinationReadAtomic =
+                attrs.maxDestinationReadAtomic;
+            qp->attributes.minRnrTimer = attrs.minRnrTimer;
+            qp->attributes.addressHandle = attrs.addressHandle;
+        }
+    } else if (success && qp->state == QpState::ReadyToReceive &&
+               attrs.qpState == QpState::ReadyToSend) {
+        success = transition_mask == RtsMask &&
+            attrs.maxReadAtomic <= 1 && attrs.timeout <= 31 &&
+            attrs.retryCount <= 7 && attrs.rnrRetry <= 7;
+        if (success) {
+            qp->state = QpState::ReadyToSend;
+            qp->attributes.timeout = attrs.timeout;
+            qp->attributes.retryCount = attrs.retryCount;
+            qp->attributes.rnrRetry = attrs.rnrRetry;
+            qp->attributes.sendPsn = attrs.sendPsn;
+            qp->attributes.maxReadAtomic = attrs.maxReadAtomic;
+        }
+    } else {
+        success = false;
+    }
+    if (success) {
+        qp->attributes.qpState = qp->state;
+        qp->attributes.currentQpState = qp->state;
+    }
+    setResponseHeader(response.header, request.header,
+                      static_cast<uint32_t>(Command::ModifyQp), !success);
+    return {true, success ? 0U : CommandError};
+}
+
+inline CommandResult
+queryQp(const CommandRequest &request, CommandResponse &response,
+        const QueuePairTable &qps)
+{
+    const uint32_t handle = letoh(request.queryQp.qpHandle);
+    const uint32_t mask = letoh(request.queryQp.attributeMask);
+    constexpr uint32_t KnownMask = (uint32_t{1} << 21) - 1;
+    const bool success = !letoh(request.header.reserved) && handle &&
+        handle < ObjectTableEntries && qps.entries[handle].valid &&
+        !(mask & ~KnownMask);
+    setResponseHeader(response.header, request.header,
+                      static_cast<uint32_t>(Command::QueryQp), !success);
+    if (!success)
+        return {true, CommandError};
+    convertQpAttrToAbi(qps.entries[handle].attributes,
+                       response.queryQp.attributes);
+    return {true, 0};
+}
+
+inline CommandResult
+destroyQp(const CommandRequest &request, ObjectTables &objects,
+          CompletionQueueTable &cqs, QueuePairTable &qps)
+{
+    const bool success = !letoh(request.header.reserved) &&
+        allZero(request.destroyQp.reserved) &&
+        qps.destroy(letoh(request.destroyQp.qpHandle), objects, cqs);
+    return {false, success ? 0U : CommandError};
+}
+
 inline CommandResult
 destroyBind(const CommandRequest &request, GidTable &gids,
             GidValidTable &gid_valid)
@@ -980,14 +1791,45 @@ consumeMrDirectory(const MemoryRegionBuild &build,
                    const std::array<uint64_t, MrEntriesPerPage> &directory,
                    std::vector<uint64_t> &tables)
 {
-    return detail::consumeMrDirectory(build, directory, tables);
+    return detail::consumePageDirectory(build, directory, tables);
 }
 
 inline bool
 consumeMrTable(MemoryRegionBuild &build, uint32_t table_index,
                const std::array<uint64_t, MrEntriesPerPage> &table)
 {
-    return detail::consumeMrTable(build, table_index, table);
+    return detail::consumePageTable(build, table_index, table);
+}
+
+inline bool
+prepareCreateCq(const CommandRequest &request, const ObjectTables &objects,
+                const CompletionQueueTable &cqs,
+                CompletionQueueBuild &build)
+{
+    return detail::prepareCreateCq(request, objects, cqs, build);
+}
+
+inline bool
+prepareCreateQp(const CommandRequest &request, const ObjectTables &objects,
+                const CompletionQueueTable &cqs,
+                const QueuePairTable &qps, QueuePairBuild &build)
+{
+    return detail::prepareCreateQp(request, objects, cqs, qps, build);
+}
+
+inline bool
+consumePageDirectory(const PageDirectoryBuild &build,
+                     const std::array<uint64_t, PageEntries> &directory,
+                     std::vector<uint64_t> &tables)
+{
+    return detail::consumePageDirectory(build, directory, tables);
+}
+
+inline bool
+consumePageTable(PageDirectoryBuild &build, uint32_t table_index,
+                 const std::array<uint64_t, PageEntries> &table)
+{
+    return detail::consumePageTable(build, table_index, table);
 }
 
 inline bool
@@ -995,6 +1837,15 @@ validMemoryRegions(const MemoryRegionTable &mrs,
                    const ObjectTables &objects)
 {
     return detail::validMemoryRegions(mrs, objects);
+}
+
+inline bool
+validQueueObjects(const CompletionQueueTable &cqs,
+                  const QueuePairTable &qps,
+                  const MemoryRegionTable &mrs,
+                  const ObjectTables &objects)
+{
+    return detail::validQueueObjects(cqs, qps, mrs, objects);
 }
 
 inline bool
@@ -1056,6 +1907,7 @@ inline CommandResult
 processCommand(const CommandRequest &request, CommandResponse &response,
                GidTable &gids, GidValidTable &gid_valid,
                ObjectTables &objects, MemoryRegionTable &mrs,
+               CompletionQueueTable &cqs, QueuePairTable &qps,
                UarRange uar_range)
 {
     response = {};
@@ -1071,6 +1923,14 @@ processCommand(const CommandRequest &request, CommandResponse &response,
         return detail::destroyPd(request, objects);
       case static_cast<uint32_t>(Command::DestroyMr):
         return detail::destroyMr(request, objects, mrs);
+      case static_cast<uint32_t>(Command::DestroyCq):
+        return detail::destroyCq(request, objects, cqs);
+      case static_cast<uint32_t>(Command::ModifyQp):
+        return detail::modifyQp(request, response, qps);
+      case static_cast<uint32_t>(Command::QueryQp):
+        return detail::queryQp(request, response, qps);
+      case static_cast<uint32_t>(Command::DestroyQp):
+        return detail::destroyQp(request, objects, cqs, qps);
       case static_cast<uint32_t>(Command::CreateUc):
         return detail::createUc(request, response, objects, uar_range);
       case static_cast<uint32_t>(Command::DestroyUc):
@@ -1089,11 +1949,25 @@ processCommand(const CommandRequest &request, CommandResponse &response,
 inline CommandResult
 processCommand(const CommandRequest &request, CommandResponse &response,
                GidTable &gids, GidValidTable &gid_valid,
+               ObjectTables &objects, MemoryRegionTable &mrs,
+               UarRange uar_range)
+{
+    CompletionQueueTable cqs;
+    QueuePairTable qps;
+    return processCommand(request, response, gids, gid_valid, objects, mrs,
+                          cqs, qps, uar_range);
+}
+
+inline CommandResult
+processCommand(const CommandRequest &request, CommandResponse &response,
+               GidTable &gids, GidValidTable &gid_valid,
                ObjectTables &objects, UarRange uar_range)
 {
     MemoryRegionTable mrs;
+    CompletionQueueTable cqs;
+    QueuePairTable qps;
     return processCommand(request, response, gids, gid_valid, objects, mrs,
-                          uar_range);
+                          cqs, qps, uar_range);
 }
 
 } // namespace pvrdma
@@ -1127,11 +2001,17 @@ class Pvrdma : public PciDevice
     pvrdma::GidValidTable gidValid{};
     pvrdma::ObjectTables objects{};
     pvrdma::MemoryRegionTable memoryRegions{};
+    pvrdma::CompletionQueueTable completionQueues{};
+    pvrdma::QueuePairTable queuePairs{};
+    pvrdma::PendingCreateKind pendingCreate =
+        pvrdma::PendingCreateKind::None;
     pvrdma::MemoryRegionBuild mrBuild{};
-    std::array<uint64_t, pvrdma::MrEntriesPerPage> mrDirectory{};
-    std::array<uint64_t, pvrdma::MrEntriesPerPage> mrTable{};
-    std::vector<uint64_t> mrTables;
-    uint32_t mrTableIndex = 0;
+    pvrdma::CompletionQueueBuild cqBuild{};
+    pvrdma::QueuePairBuild qpBuild{};
+    std::array<uint64_t, pvrdma::PageEntries> objectDirectory{};
+    std::array<uint64_t, pvrdma::PageEntries> objectTable{};
+    std::vector<uint64_t> objectTables;
+    uint32_t objectTableIndex = 0;
     pvrdma::OperationErrorState operationError;
     bool intxAsserted = false;
     const Tick controlCompletionLatency;
@@ -1139,8 +2019,8 @@ class Pvrdma : public PciDevice
     EventFunctionWrapper dsrReadEvent;
     EventFunctionWrapper capsWriteEvent;
     EventFunctionWrapper commandReadEvent;
-    EventFunctionWrapper mrDirectoryReadEvent;
-    EventFunctionWrapper mrTableReadEvent;
+    EventFunctionWrapper objectDirectoryReadEvent;
+    EventFunctionWrapper objectTableReadEvent;
     EventFunctionWrapper responseWriteEvent;
 
     void startDsr();
@@ -1148,11 +2028,12 @@ class Pvrdma : public PciDevice
     void capsWriteDone();
     void startCommand(uint32_t value);
     void commandReadDone();
-    void startMrCreate();
-    void mrDirectoryReadDone();
-    void startMrTableRead();
-    void mrTableReadDone();
-    void finishMrCreate(bool success);
+    void startObjectCreate(pvrdma::PendingCreateKind kind);
+    pvrdma::PageDirectoryBuild &pendingPageBuild();
+    void objectDirectoryReadDone();
+    void startObjectTableRead();
+    void objectTableReadDone();
+    void finishObjectCreate(bool success);
     void responseWriteDone();
     void writeControl(uint32_t value);
     void resetDevice();

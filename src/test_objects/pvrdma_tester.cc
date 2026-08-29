@@ -31,7 +31,16 @@ constexpr Addr CommandAddress = 0x2000;
 constexpr Addr ResponseAddress = 0x3000;
 constexpr Addr MrDirectoryAddress = 0x8000;
 constexpr Addr MrTableAddress = 0x9000;
+constexpr Addr CqDirectoryAddress = 0xb000;
+constexpr Addr CqTableAddress = 0xc000;
+constexpr Addr QpDirectoryAddress = 0xd000;
+constexpr Addr QpTableAddress = 0xe000;
+constexpr Addr BadQpDirectoryAddress = 0xf000;
+constexpr Addr BadQpTableAddress = 0x10000;
 constexpr Addr MrLeafAddress = 0x100000;
+constexpr Addr CqLeafAddress = 0x400000;
+constexpr Addr QpLeafAddress = 0x500000;
+constexpr Addr BadQpLeafAddress = 0x600000;
 Tick
 microseconds(uint64_t value)
 {
@@ -259,6 +268,255 @@ PvrdmaTester::destroyMr(uint32_t handle)
 }
 
 void
+PvrdmaTester::prepareQueuePages(Addr directory_addr, Addr table_addr,
+                                Addr first_page, uint32_t pages,
+                                bool malformed)
+{
+    std::array<uint64_t, pvrdma::PageEntries> directory{};
+    std::array<uint64_t, pvrdma::PageEntries> table{};
+    directory[0] = htole(static_cast<uint64_t>(table_addr));
+    for (uint32_t i = 0; i < pages; ++i) {
+        uint64_t page = first_page + uint64_t{i} * pvrdma::PageSize;
+        if (malformed && i + 1 == pages)
+            ++page;
+        table[i] = htole(page);
+    }
+    write(directory_addr, directory);
+    write(table_addr, table);
+}
+
+void
+PvrdmaTester::startUserContext(uint64_t response)
+{
+    pvrdma::CommandRequest request{};
+    request.header.response = htole(response);
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::CreateUc));
+    request.createUc.pfn64 = htole(
+        static_cast<uint64_t>(UarBarAddress / pvrdma::UarPageSize + 1));
+    write(CommandAddress, request);
+    write(RegisterBarAddress + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+}
+
+void
+PvrdmaTester::startUserPd(uint64_t response)
+{
+    pvrdma::CommandRequest request{};
+    request.header.response = htole(response);
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::CreatePd));
+    request.createPd.contextHandle = htole(uint32_t{1});
+    write(CommandAddress, request);
+    write(RegisterBarAddress + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+}
+
+void
+PvrdmaTester::startCq(uint64_t response, uint32_t cqe)
+{
+    const uint32_t pages = 1 + pvrdma::detail::chunksFor(
+        cqe, pvrdma::CqeSize);
+    prepareQueuePages(CqDirectoryAddress, CqTableAddress, CqLeafAddress,
+                      pages);
+    pvrdma::CommandRequest request{};
+    request.header.response = htole(response);
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::CreateCq));
+    request.createCq.pageDirectoryDma = htole(
+        static_cast<uint64_t>(CqDirectoryAddress));
+    request.createCq.contextHandle = htole(uint32_t{1});
+    request.createCq.cqe = htole(cqe);
+    request.createCq.numChunks = htole(pages);
+    write(CommandAddress, request);
+    write(RegisterBarAddress + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+}
+
+void
+PvrdmaTester::startQp(uint64_t response, bool malformed)
+{
+    constexpr uint32_t SendWr = 32;
+    constexpr uint32_t RecvWr = 128;
+    const uint32_t send_chunks = pvrdma::detail::chunksFor(
+        SendWr, pvrdma::SqStride);
+    const uint32_t pages = 1 + send_chunks + pvrdma::detail::chunksFor(
+        RecvWr, pvrdma::RqStride);
+    const Addr directory = malformed ? BadQpDirectoryAddress :
+        QpDirectoryAddress;
+    prepareQueuePages(directory,
+                      malformed ? BadQpTableAddress : QpTableAddress,
+                      malformed ? BadQpLeafAddress : QpLeafAddress,
+                      pages, malformed);
+    pvrdma::CommandRequest request{};
+    request.header.response = htole(response);
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::CreateQp));
+    request.createQp.pageDirectoryDma = htole(
+        static_cast<uint64_t>(directory));
+    request.createQp.pdHandle = htole(uint32_t{1});
+    request.createQp.sendCqHandle = htole(uint32_t{1});
+    request.createQp.recvCqHandle = htole(uint32_t{1});
+    request.createQp.maxSendWr = htole(SendWr);
+    request.createQp.maxRecvWr = htole(RecvWr);
+    request.createQp.maxSendSge = htole(uint32_t{1});
+    request.createQp.maxRecvSge = htole(uint32_t{1});
+    request.createQp.accessFlags = htole(pvrdma::AccessLocalWrite);
+    request.createQp.totalChunks = htole(static_cast<uint16_t>(pages));
+    request.createQp.sendChunks = htole(
+        static_cast<uint16_t>(send_chunks));
+    request.createQp.qpType = static_cast<uint8_t>(pvrdma::QpType::Rc);
+    write(CommandAddress, request);
+    write(RegisterBarAddress + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+}
+
+void
+PvrdmaTester::startModifyQp(uint64_t response, pvrdma::QpState state,
+                            uint32_t mask,
+                            const pvrdma::QpAttr &attributes)
+{
+    pvrdma::CommandRequest request{};
+    request.header.response = htole(response);
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::ModifyQp));
+    request.modifyQp.qpHandle = htole(uint32_t{1});
+    request.modifyQp.attributeMask = htole(mask);
+    request.modifyQp.attributes = attributes;
+    request.modifyQp.attributes.qpState = static_cast<pvrdma::QpState>(
+        htole(static_cast<uint32_t>(state)));
+    write(CommandAddress, request);
+    write(RegisterBarAddress + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+}
+
+void
+PvrdmaTester::startQueryQp(uint64_t response)
+{
+    pvrdma::CommandRequest request{};
+    request.header.response = htole(response);
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::QueryQp));
+    request.queryQp.qpHandle = htole(uint32_t{1});
+    request.queryQp.attributeMask = htole((uint32_t{1} << 21) - 1);
+    write(CommandAddress, request);
+    write(RegisterBarAddress + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+}
+
+pvrdma::CommandResponse
+PvrdmaTester::verifyResponse(pvrdma::Command command, uint64_t token)
+{
+    const auto response = read<pvrdma::CommandResponse>(ResponseAddress);
+    const uint32_t cause = read<uint32_t>(
+        RegisterBarAddress + pvrdma::RegInterruptCause, MmioFlags);
+    panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                            MmioFlags) != 0 ||
+                 !(cause & pvrdma::InterruptCauseResponse) ||
+                 letoh(response.header.response) != token ||
+                 letoh(response.header.acknowledgement) !=
+                     pvrdma::responseCommand(command) ||
+                 response.header.error,
+             "PVRDMA command %u failed", static_cast<uint32_t>(command));
+    return response;
+}
+
+void
+PvrdmaTester::destroyQp()
+{
+    pvrdma::CommandRequest request{};
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::DestroyQp));
+    request.destroyQp.qpHandle = htole(uint32_t{1});
+    write(CommandAddress, request);
+    write(RegisterBarAddress + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+}
+
+void
+PvrdmaTester::destroyCq()
+{
+    pvrdma::CommandRequest request{};
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::DestroyCq));
+    request.destroyCq.cqHandle = htole(uint32_t{1});
+    write(CommandAddress, request);
+    write(RegisterBarAddress + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+}
+
+void
+PvrdmaTester::createUserParentAtomic()
+{
+    startUserContext(0x1001001001001001);
+    auto response = verifyResponse(pvrdma::Command::CreateUc,
+                                   0x1001001001001001);
+    panic_if(letoh(response.createUc.contextHandle) != 1,
+             "PVRDMA CREATE_UC returned wrong handle");
+    startUserPd(0x2002002002002002);
+    response = verifyResponse(pvrdma::Command::CreatePd,
+                              0x2002002002002002);
+    panic_if(letoh(response.createPd.pdHandle) != 1,
+             "PVRDMA user CREATE_PD returned wrong handle");
+}
+
+void
+PvrdmaTester::createQueuePairAtomic(uint32_t expected_qpn)
+{
+    startCq(0x3003003003003003);
+    auto response = verifyResponse(pvrdma::Command::CreateCq,
+                                   0x3003003003003003);
+    panic_if(letoh(response.createCq.cqHandle) != 1 ||
+                 letoh(response.createCq.cqe) != 64,
+             "PVRDMA CREATE_CQ returned wrong geometry");
+    startQp(0x4004004004004004);
+    response = verifyResponse(pvrdma::Command::CreateQp,
+                              0x4004004004004004);
+    panic_if(letoh(response.createQpV2.qpHandle) != 1 ||
+                 letoh(response.createQpV2.qpn) != expected_qpn ||
+                 letoh(response.createQpV2.maxSendWr) != 32 ||
+                 letoh(response.createQpV2.maxRecvWr) != 128,
+             "PVRDMA CREATE_QP V2 returned wrong handle/QPN/capabilities");
+}
+
+void
+PvrdmaTester::moveQueuePairToRtsAtomic()
+{
+    pvrdma::QpAttr attrs{};
+    attrs.qpAccessFlags = htole(pvrdma::AccessLocalWrite);
+    attrs.portNumber = 1;
+    startModifyQp(0x5005005005005005, pvrdma::QpState::Init,
+                  pvrdma::QpAttrState | pvrdma::QpAttrAccessFlags |
+                  pvrdma::QpAttrPkeyIndex | pvrdma::QpAttrPort, attrs);
+    verifyResponse(pvrdma::Command::ModifyQp, 0x5005005005005005);
+
+    attrs = {};
+    attrs.pathMtu = static_cast<pvrdma::Mtu>(
+        htole(static_cast<uint32_t>(pvrdma::Mtu::Mtu1024)));
+    attrs.destinationQpNumber = htole(uint32_t{1});
+    attrs.receivePsn = htole(uint32_t{0x12345});
+    attrs.maxDestinationReadAtomic = 1;
+    attrs.minRnrTimer = 12;
+    attrs.addressHandle.portNumber = 1;
+    startModifyQp(0x6006006006006006,
+                  pvrdma::QpState::ReadyToReceive,
+                  pvrdma::QpAttrState | pvrdma::QpAttrAddressVector |
+                  pvrdma::QpAttrPathMtu | pvrdma::QpAttrReceivePsn |
+                  pvrdma::QpAttrMaxDestReadAtomic |
+                  pvrdma::QpAttrMinRnrTimer |
+                  pvrdma::QpAttrDestinationQpn,
+                  attrs);
+    verifyResponse(pvrdma::Command::ModifyQp, 0x6006006006006006);
+
+    attrs = {};
+    attrs.timeout = 14;
+    attrs.retryCount = 6;
+    attrs.rnrRetry = 7;
+    attrs.sendPsn = htole(uint32_t{0x54321});
+    attrs.maxReadAtomic = 1;
+    startModifyQp(0x7007007007007007,
+                  pvrdma::QpState::ReadyToSend,
+                  pvrdma::QpAttrState | pvrdma::QpAttrTimeout |
+                  pvrdma::QpAttrRetryCount | pvrdma::QpAttrRnrRetry |
+                  pvrdma::QpAttrSendPsn |
+                  pvrdma::QpAttrMaxQpReadAtomic,
+                  attrs);
+    verifyResponse(pvrdma::Command::ModifyQp, 0x7007007007007007);
+}
+
+void
 PvrdmaTester::testCommand()
 {
     panic_if(!dsrConfigured, "PVRDMA command test has no configured DSR");
@@ -385,6 +643,8 @@ PvrdmaTester::runTimingMr()
       }
       case TimingStage::LateMrDone:
         break;
+      default:
+        panic("Invalid PVRDMA timing MR stage");
     }
 
     const auto response = read<pvrdma::CommandResponse>(ResponseAddress);
@@ -407,6 +667,204 @@ PvrdmaTester::runTimingMr()
 }
 
 void
+PvrdmaTester::runTimingQueues()
+{
+    panic_if(system->isAtomicMode(),
+             "PVRDMA timing queue test requires timing mode");
+    const Tick LongDelay = microseconds(40);
+    const Tick ShortDelay = microseconds(10);
+
+    switch (timingStage) {
+      case TimingStage::Configure:
+        configurePci();
+        configureDsr();
+        timingStage = TimingStage::UserContext;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::UserContext:
+        testCapabilities();
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Activate)), MmioFlags);
+        startUserContext(0x1010101010101010);
+        timingStage = TimingStage::UserPd;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::UserPd: {
+        const auto response = verifyResponse(pvrdma::Command::CreateUc,
+                                             0x1010101010101010);
+        panic_if(letoh(response.createUc.contextHandle) != 1,
+                 "PVRDMA timing CREATE_UC returned wrong handle");
+        startUserPd(0x2020202020202020);
+        timingStage = TimingStage::Cq;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Cq: {
+        const auto response = verifyResponse(pvrdma::Command::CreatePd,
+                                             0x2020202020202020);
+        panic_if(letoh(response.createPd.pdHandle) != 1,
+                 "PVRDMA timing CREATE_PD returned wrong handle");
+        startCq(0x3030303030303030);
+        timingStage = TimingStage::Qp;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Qp: {
+        const auto response = verifyResponse(pvrdma::Command::CreateCq,
+                                             0x3030303030303030);
+        panic_if(letoh(response.createCq.cqHandle) != 1 ||
+                     letoh(response.createCq.cqe) != 64,
+                 "PVRDMA timing CREATE_CQ returned wrong response");
+        startQp(0x4040404040404040);
+        timingStage = TimingStage::Init;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Init: {
+        const auto response = verifyResponse(pvrdma::Command::CreateQp,
+                                             0x4040404040404040);
+        panic_if(letoh(response.createQpV2.qpn) != 1 ||
+                     letoh(response.createQpV2.qpHandle) != 1 ||
+                     letoh(response.createQpV2.maxSendWr) != 32 ||
+                     letoh(response.createQpV2.maxRecvWr) != 128,
+                 "PVRDMA timing CREATE_QP V2 returned wrong response");
+        pvrdma::QpAttr attrs{};
+        attrs.qpAccessFlags = htole(pvrdma::AccessLocalWrite);
+        attrs.portNumber = 1;
+        startModifyQp(0x5050505050505050, pvrdma::QpState::Init,
+                      pvrdma::QpAttrState | pvrdma::QpAttrAccessFlags |
+                      pvrdma::QpAttrPkeyIndex | pvrdma::QpAttrPort,
+                      attrs);
+        timingStage = TimingStage::Rtr;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Rtr: {
+        verifyResponse(pvrdma::Command::ModifyQp, 0x5050505050505050);
+        pvrdma::QpAttr attrs{};
+        attrs.pathMtu = static_cast<pvrdma::Mtu>(
+            htole(static_cast<uint32_t>(pvrdma::Mtu::Mtu1024)));
+        attrs.destinationQpNumber = htole(uint32_t{1});
+        attrs.receivePsn = htole(uint32_t{0x12345});
+        attrs.maxDestinationReadAtomic = 1;
+        attrs.minRnrTimer = 12;
+        attrs.addressHandle.portNumber = 1;
+        startModifyQp(0x6060606060606060,
+                      pvrdma::QpState::ReadyToReceive,
+                      pvrdma::QpAttrState | pvrdma::QpAttrAddressVector |
+                      pvrdma::QpAttrPathMtu | pvrdma::QpAttrReceivePsn |
+                      pvrdma::QpAttrMaxDestReadAtomic |
+                      pvrdma::QpAttrMinRnrTimer |
+                      pvrdma::QpAttrDestinationQpn,
+                      attrs);
+        timingStage = TimingStage::Rts;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Rts: {
+        verifyResponse(pvrdma::Command::ModifyQp, 0x6060606060606060);
+        pvrdma::QpAttr attrs{};
+        attrs.timeout = 14;
+        attrs.retryCount = 6;
+        attrs.rnrRetry = 7;
+        attrs.sendPsn = htole(uint32_t{0x54321});
+        attrs.maxReadAtomic = 1;
+        startModifyQp(0x7070707070707070,
+                      pvrdma::QpState::ReadyToSend,
+                      pvrdma::QpAttrState | pvrdma::QpAttrTimeout |
+                      pvrdma::QpAttrRetryCount | pvrdma::QpAttrRnrRetry |
+                      pvrdma::QpAttrSendPsn |
+                      pvrdma::QpAttrMaxQpReadAtomic,
+                      attrs);
+        timingStage = TimingStage::Query;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Query:
+        verifyResponse(pvrdma::Command::ModifyQp, 0x7070707070707070);
+        startQueryQp(0x8080808080808080);
+        timingStage = TimingStage::DestroyQp;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::DestroyQp: {
+        const auto response = verifyResponse(pvrdma::Command::QueryQp,
+                                             0x8080808080808080);
+        const auto &attrs = response.queryQp.attributes;
+        panic_if(letoh(static_cast<uint32_t>(attrs.qpState)) !=
+                         static_cast<uint32_t>(
+                             pvrdma::QpState::ReadyToSend) ||
+                     letoh(attrs.receivePsn) != 0x12345 ||
+                     letoh(attrs.sendPsn) != 0x54321 ||
+                     letoh(attrs.capabilities.maxSendWr) != 32 ||
+                     letoh(attrs.capabilities.maxRecvWr) != 128,
+                 "PVRDMA timing QUERY_QP lost stored attributes");
+        destroyQp();
+        timingStage = TimingStage::BadQp;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::BadQp:
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != 0,
+                 "PVRDMA timing DESTROY_QP failed");
+        startQp(0xbad1bad1bad1bad1, true);
+        timingStage = TimingStage::BadQpEarly;
+        schedule(testEvent, curTick() + ShortDelay);
+        return;
+      case TimingStage::BadQpEarly: {
+        pioError = read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                  MmioFlags);
+        const auto early = read<pvrdma::CommandResponse>(ResponseAddress);
+        const uint32_t cause = read<uint32_t>(
+            RegisterBarAddress + pvrdma::RegInterruptCause, MmioFlags);
+        panic_if(pioError != 0 || cause ||
+                     (letoh(early.header.response) ==
+                          0xbad1bad1bad1bad1 &&
+                      letoh(early.header.acknowledgement) ==
+                          pvrdma::responseCommand(
+                              pvrdma::Command::CreateQp)),
+                 "Linux could accept malformed QP at REQUEST completion");
+        timingStage = TimingStage::BadQpLate;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::BadQpLate: {
+        const auto response = read<pvrdma::CommandResponse>(ResponseAddress);
+        const uint32_t cause = read<uint32_t>(
+            RegisterBarAddress + pvrdma::RegInterruptCause, MmioFlags);
+        const uint32_t final_error = read<uint32_t>(
+            RegisterBarAddress + pvrdma::RegError, MmioFlags);
+        panic_if(pioError != 0 ||
+                     !(cause & pvrdma::InterruptCauseResponse) ||
+                     final_error != pvrdma::CommandError ||
+                     letoh(response.header.response) !=
+                         0xbad1bad1bad1bad1 ||
+                     letoh(response.header.acknowledgement) ==
+                         pvrdma::responseCommand(
+                             pvrdma::Command::CreateQp) ||
+                     response.header.error != pvrdma::CommandError ||
+                     response.createQpV2.qpn ||
+                     response.createQpV2.qpHandle,
+                 "Late malformed QP did not clear acknowledgement");
+        destroyCq();
+        timingStage = TimingStage::DestroyCq;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::DestroyCq:
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != 0,
+                 "PVRDMA timing DESTROY_CQ failed");
+        inform("PVRDMA timing CQ/QP walk and RTS/query test passed");
+        exitSimLoop("PVRDMA timing queue test passed");
+        return;
+      default:
+        panic("Invalid PVRDMA timing queue stage");
+    }
+}
+
+void
 PvrdmaTester::testCheckpointSave()
 {
     panic_if(!system->isAtomicMode(),
@@ -414,8 +872,10 @@ PvrdmaTester::testCheckpointSave()
     configurePci();
     configureDsr();
     testCapabilities();
-    activateAndCreatePd();
-    verifyPd();
+    write(RegisterBarAddress + pvrdma::RegControl,
+          htole(static_cast<uint32_t>(pvrdma::DeviceControl::Activate)),
+          MmioFlags);
+    createUserParentAtomic();
     prepareMrPages(1, false);
     startMr(1, 0xc001c001c001c001);
     verifyMr(0xc001c001c001c001, 1);
@@ -425,7 +885,9 @@ PvrdmaTester::testCheckpointSave()
              "PVRDMA checkpoint generation setup destroy failed");
     startMr(1, 0xc065c065c065c065);
     verifyMr(0xc065c065c065c065, 65);
-    inform("PVRDMA checkpoint live generation-1 MR ready");
+    createQueuePairAtomic(1);
+    moveQueuePairToRtsAtomic();
+    inform("PVRDMA checkpoint live MR/CQ/RTS-QP ready");
     exitSimLoop("PVRDMA checkpoint save ready");
 }
 
@@ -434,13 +896,33 @@ PvrdmaTester::testCheckpointRestore()
 {
     panic_if(!system->isAtomicMode(),
              "PVRDMA checkpoint restore test requires atomic mode");
+    startQueryQp(0xc0dec0dec0dec0de);
+    auto response = verifyResponse(pvrdma::Command::QueryQp,
+                                   0xc0dec0dec0dec0de);
+    panic_if(letoh(static_cast<uint32_t>(
+                 response.queryQp.attributes.qpState)) !=
+                 static_cast<uint32_t>(pvrdma::QpState::ReadyToSend) ||
+                 letoh(response.queryQp.attributes.sendPsn) != 0x54321,
+             "Restored PVRDMA QP lost RTS attributes");
+    destroyQp();
+    panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                            MmioFlags) != 0,
+             "Restored PVRDMA live QP was missing");
+    startQp(0xc041c041c041c041);
+    response = verifyResponse(pvrdma::Command::CreateQp,
+                              0xc041c041c041c041);
+    panic_if(letoh(response.createQpV2.qpHandle) != 1 ||
+                 letoh(response.createQpV2.qpn) != 65,
+             "Restored PVRDMA QPN generation did not advance");
+    destroyQp();
+    destroyCq();
     destroyMr(65);
     panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
                             MmioFlags) != 0,
-             "Restored PVRDMA live MR was missing");
+             "Restored PVRDMA live objects were missing");
     startMr(1, 0xc129c129c129c129);
     verifyMr(0xc129c129c129c129, 129);
-    inform("PVRDMA checkpoint restored live MR and key generation");
+    inform("PVRDMA checkpoint restored live MR/CQ/QP generations");
     exitSimLoop("PVRDMA checkpoint restore test passed");
 }
 
@@ -449,6 +931,10 @@ PvrdmaTester::run()
 {
     if (testMode == "timing-mr") {
         runTimingMr();
+        return;
+    }
+    if (testMode == "timing-queues") {
+        runTimingQueues();
         return;
     }
     if (testMode == "checkpoint-save") {
