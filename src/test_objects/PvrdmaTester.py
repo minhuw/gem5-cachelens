@@ -11,3 +11,4 @@ class PvrdmaTester(Platform):
 
     port = RequestPort("Port used to issue atomic memory and MMIO requests")
     command_test = Param.Bool(False, "Test command response visibility")
+    test_mode = Param.String("atomic", "Focused PVRDMA tester mode")

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "dev/pci/device.hh"
 #include "dev/rdma/pvrdma_abi.hh"
@@ -24,6 +25,14 @@ inline constexpr uint32_t CommandError = 1;
 inline constexpr uint32_t InitialInterruptMask = 0xffffffff;
 inline constexpr uint32_t GidTableEntries = 8;
 inline constexpr uint32_t ObjectTableEntries = 64;
+inline constexpr uint32_t MrPageSize = 4096;
+inline constexpr uint32_t MrEntriesPerPage = MrPageSize / sizeof(uint64_t);
+inline constexpr uint32_t MrSlotBits = 6;
+inline constexpr uint32_t MrSlotMask = ObjectTableEntries - 1;
+inline constexpr uint32_t MaxMrGeneration =
+    std::numeric_limits<uint32_t>::max() >> MrSlotBits;
+inline constexpr uint32_t SupportedMrAccess = AccessLocalWrite |
+    AccessRemoteWrite | AccessRemoteRead | AccessRemoteAtomic;
 inline constexpr uint32_t FixedMtu = 1024;
 inline constexpr uint32_t MaxMessageSize = uint32_t{1} << 31;
 inline constexpr uint16_t FullMembershipPkey = 0xffff;
@@ -51,6 +60,8 @@ enum class ControlState : uint8_t
     ReadingDsr,
     WritingCaps,
     ReadingCommand,
+    ReadingMrDirectory,
+    ReadingMrTable,
     WritingResponse,
 };
 
@@ -125,6 +136,34 @@ finishCommandRead(ControlState &state, bool has_response)
         return false;
     state = has_response ? ControlState::WritingResponse :
                            ControlState::Active;
+    return true;
+}
+
+constexpr bool
+beginMrDirectory(ControlState &state)
+{
+    if (state != ControlState::ReadingCommand)
+        return false;
+    state = ControlState::ReadingMrDirectory;
+    return true;
+}
+
+constexpr bool
+beginMrTables(ControlState &state)
+{
+    if (state != ControlState::ReadingMrDirectory)
+        return false;
+    state = ControlState::ReadingMrTable;
+    return true;
+}
+
+constexpr bool
+finishMrWalk(ControlState &state)
+{
+    if (state != ControlState::ReadingMrDirectory &&
+        state != ControlState::ReadingMrTable)
+        return false;
+    state = ControlState::WritingResponse;
     return true;
 }
 
@@ -307,6 +346,122 @@ struct ObjectTables
     }
 };
 
+struct MemoryRegion
+{
+    bool valid = false;
+    uint32_t generation = 0;
+    uint32_t mrHandle = 0;
+    uint32_t lkey = 0;
+    uint32_t rkey = 0;
+    uint32_t pdHandle = 0;
+    uint32_t accessFlags = 0;
+    uint32_t activeReferences = 0;
+    uint64_t start = 0;
+    uint64_t length = 0;
+    uint64_t end = 0;
+    std::vector<uint64_t> pages;
+};
+
+struct MemoryRegionBuild
+{
+    uint32_t slot = 0;
+    uint32_t generation = 0;
+    uint32_t mrHandle = 0;
+    uint32_t pdHandle = 0;
+    uint32_t accessFlags = 0;
+    uint32_t numChunks = 0;
+    uint64_t start = 0;
+    uint64_t length = 0;
+    uint64_t end = 0;
+    uint64_t pageDirectoryDma = 0;
+    std::vector<uint64_t> pages;
+};
+
+struct DmaChunk
+{
+    uint64_t address = 0;
+    uint32_t length = 0;
+
+    bool
+    operator==(const DmaChunk &other) const
+    {
+        return address == other.address && length == other.length;
+    }
+};
+
+enum class MrKeyType
+{
+    Local,
+    Remote,
+};
+
+struct MemoryRegionTable
+{
+    std::array<MemoryRegion, ObjectTableEntries> entries{};
+
+    void reset() { entries = {}; }
+
+    bool
+    allocate(MemoryRegionBuild &build) const
+    {
+        for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+            const auto &entry = entries[slot];
+            if (!entry.valid && entry.generation <= MaxMrGeneration) {
+                build.slot = slot;
+                build.generation = entry.generation;
+                build.mrHandle = (build.generation << MrSlotBits) | slot;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool
+    commit(MemoryRegionBuild &&build, ObjectTables &objects)
+    {
+        if (!build.slot || build.slot >= ObjectTableEntries ||
+            !build.pdHandle || build.pdHandle >= ObjectTableEntries ||
+            build.pages.size() != build.numChunks ||
+            !objects.pdAllocated[build.pdHandle])
+            return false;
+        auto &entry = entries[build.slot];
+        if (entry.valid || entry.generation != build.generation ||
+            build.mrHandle != ((build.generation << MrSlotBits) | build.slot))
+            return false;
+        entry.valid = true;
+        entry.generation = build.generation;
+        entry.mrHandle = build.mrHandle;
+        entry.lkey = build.mrHandle;
+        entry.rkey = build.mrHandle;
+        entry.pdHandle = build.pdHandle;
+        entry.accessFlags = build.accessFlags;
+        entry.start = build.start;
+        entry.length = build.length;
+        entry.end = build.end;
+        entry.pages = std::move(build.pages);
+        ++objects.pdChildren[entry.pdHandle];
+        return true;
+    }
+
+    bool
+    destroy(uint32_t handle, ObjectTables &objects)
+    {
+        const uint32_t slot = handle & MrSlotMask;
+        if (!slot || slot >= ObjectTableEntries)
+            return false;
+        auto &entry = entries[slot];
+        if (!entry.valid || entry.mrHandle != handle ||
+            entry.activeReferences || !objects.pdChildren[entry.pdHandle])
+            return false;
+
+        const uint32_t generation = entry.generation;
+        --objects.pdChildren[entry.pdHandle];
+        entry = {};
+        entry.generation = generation + 1;
+        return true;
+    }
+};
+
 struct CommandResult
 {
     bool hasResponse;
@@ -372,6 +527,180 @@ inline bool
 alignedPage(uint64_t address)
 {
     return address && (address % UarPageSize) == 0;
+}
+
+inline bool
+mrPageCount(uint64_t start, uint64_t length, uint32_t &pages)
+{
+    if (!length || start > std::numeric_limits<uint64_t>::max() - length)
+        return false;
+    const uint64_t bytes = (start & (MrPageSize - 1)) + length;
+    const uint64_t count = bytes / MrPageSize + (bytes % MrPageSize != 0);
+    if (!count || count > PageDirectoryMaxPages)
+        return false;
+    pages = count;
+    return true;
+}
+
+inline bool
+validMrAccess(uint32_t access)
+{
+    return !(access & ~SupportedMrAccess) &&
+        (!((access & (AccessRemoteWrite | AccessRemoteAtomic)) &&
+           !(access & AccessLocalWrite)));
+}
+
+inline bool
+prepareCreateMr(const CommandRequest &request, const ObjectTables &objects,
+                const MemoryRegionTable &mrs, MemoryRegionBuild &build)
+{
+    const auto &cmd = request.createMr;
+    const uint32_t pd = letoh(cmd.pdHandle);
+    const uint32_t access = letoh(cmd.accessFlags);
+    const uint32_t flags = letoh(cmd.flags);
+    const uint32_t chunks = letoh(cmd.numChunks);
+    const uint64_t start = letoh(cmd.start);
+    const uint64_t length = letoh(cmd.length);
+    const uint64_t directory = letoh(cmd.pageDirectoryDma);
+    uint32_t expected = 0;
+
+    if (letoh(request.header.reserved) || flags || !validMrAccess(access) ||
+        !pd || pd >= ObjectTableEntries || !objects.pdAllocated[pd] ||
+        !alignedPage(directory) || !mrPageCount(start, length, expected) ||
+        chunks != expected || !mrs.allocate(build))
+        return false;
+
+    build.pdHandle = pd;
+    build.accessFlags = access;
+    build.numChunks = chunks;
+    build.start = start;
+    build.length = length;
+    build.end = start + length;
+    build.pageDirectoryDma = directory;
+    build.pages.clear();
+    build.pages.reserve(chunks);
+    return true;
+}
+
+inline bool
+validMemoryRegions(const MemoryRegionTable &mrs,
+                   const ObjectTables &objects)
+{
+    if (mrs.entries[0].valid || mrs.entries[0].generation)
+        return false;
+
+    std::array<uint32_t, ObjectTableEntries> children{};
+    for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+        const auto &mr = mrs.entries[slot];
+        if (!mr.valid) {
+            if (mr.mrHandle || mr.lkey || mr.rkey || mr.pdHandle ||
+                mr.accessFlags || mr.activeReferences || mr.start ||
+                mr.length || mr.end || !mr.pages.empty())
+                return false;
+            continue;
+        }
+
+        uint32_t pages = 0;
+        if (mr.generation > MaxMrGeneration ||
+            mr.mrHandle != ((mr.generation << MrSlotBits) | slot) ||
+            mr.lkey != mr.mrHandle || mr.rkey != mr.mrHandle ||
+            !mr.pdHandle || mr.pdHandle >= ObjectTableEntries ||
+            !objects.pdAllocated[mr.pdHandle] ||
+            !validMrAccess(mr.accessFlags) ||
+            !mrPageCount(mr.start, mr.length, pages) ||
+            mr.end != mr.start + mr.length || mr.pages.size() != pages ||
+            std::any_of(mr.pages.begin(), mr.pages.end(),
+                        [](uint64_t page) { return !alignedPage(page); }))
+            return false;
+        ++children[mr.pdHandle];
+    }
+    return children == objects.pdChildren;
+}
+
+inline bool
+translate(const MemoryRegionTable &mrs, MrKeyType key_type, uint32_t key,
+          uint64_t address, uint64_t length, uint32_t required_access,
+          std::vector<DmaChunk> &chunks)
+{
+    chunks.clear();
+    if (!length || (required_access & ~SupportedMrAccess) ||
+        address > std::numeric_limits<uint64_t>::max() - length)
+        return false;
+
+    const MemoryRegion *mr = nullptr;
+    for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+        const auto &candidate = mrs.entries[slot];
+        const uint32_t candidate_key = key_type == MrKeyType::Local ?
+            candidate.lkey : candidate.rkey;
+        if (candidate.valid && candidate_key == key) {
+            mr = &candidate;
+            break;
+        }
+    }
+    if (!mr || (mr->accessFlags & required_access) != required_access ||
+        address < mr->start || address + length > mr->end)
+        return false;
+
+    uint64_t offset = address - mr->start;
+    uint64_t remaining = length;
+    const uint64_t first_offset = mr->start & (MrPageSize - 1);
+    while (remaining) {
+        const uint64_t mapped = first_offset + offset;
+        const uint64_t page_index = mapped / MrPageSize;
+        const uint32_t page_offset = mapped % MrPageSize;
+        if (page_index >= mr->pages.size()) {
+            chunks.clear();
+            return false;
+        }
+        const uint32_t size = std::min<uint64_t>(
+            remaining, MrPageSize - page_offset);
+        chunks.push_back({mr->pages[page_index] + page_offset, size});
+        remaining -= size;
+        offset += size;
+    }
+    return true;
+}
+
+inline bool
+consumeMrDirectory(const MemoryRegionBuild &build,
+                   const std::array<uint64_t, MrEntriesPerPage> &directory,
+                   std::vector<uint64_t> &tables)
+{
+    const uint32_t count = (build.numChunks + MrEntriesPerPage - 1) /
+                           MrEntriesPerPage;
+    tables.clear();
+    tables.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t address = letoh(directory[i]);
+        if (!alignedPage(address)) {
+            tables.clear();
+            return false;
+        }
+        tables.push_back(address);
+    }
+    return true;
+}
+
+inline bool
+consumeMrTable(MemoryRegionBuild &build, uint32_t table_index,
+               const std::array<uint64_t, MrEntriesPerPage> &table)
+{
+    if (table_index != build.pages.size() / MrEntriesPerPage ||
+        build.pages.size() >= build.numChunks)
+        return false;
+
+    const uint32_t count = std::min<uint32_t>(
+        MrEntriesPerPage, build.numChunks - build.pages.size());
+    const size_t original_size = build.pages.size();
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t address = letoh(table[i]);
+        if (!alignedPage(address)) {
+            build.pages.resize(original_size);
+            return false;
+        }
+        build.pages.push_back(address);
+    }
+    return true;
 }
 
 inline bool
@@ -443,8 +772,6 @@ validObjectTables(const ObjectTables &objects, UarRange range)
                 return false;
             continue;
         }
-        if (objects.pdChildren[handle])
-            return false;
         const uint32_t parent = objects.pdParent[handle];
         if (parent) {
             if (parent >= ObjectTableEntries ||
@@ -604,6 +931,17 @@ destroyPd(const CommandRequest &request, ObjectTables &objects)
 }
 
 inline CommandResult
+destroyMr(const CommandRequest &request, ObjectTables &objects,
+          MemoryRegionTable &mrs)
+{
+    if (letoh(request.header.reserved) ||
+        !allZero(request.destroyMr.reserved) ||
+        !mrs.destroy(letoh(request.destroyMr.mrHandle), objects))
+        return {false, CommandError};
+    return {false, 0};
+}
+
+inline CommandResult
 destroyBind(const CommandRequest &request, GidTable &gids,
             GidValidTable &gid_valid)
 {
@@ -628,6 +966,44 @@ inline bool
 validObjectTables(const ObjectTables &objects, UarRange range)
 {
     return detail::validObjectTables(objects, range);
+}
+
+inline bool
+prepareCreateMr(const CommandRequest &request, const ObjectTables &objects,
+                const MemoryRegionTable &mrs, MemoryRegionBuild &build)
+{
+    return detail::prepareCreateMr(request, objects, mrs, build);
+}
+
+inline bool
+consumeMrDirectory(const MemoryRegionBuild &build,
+                   const std::array<uint64_t, MrEntriesPerPage> &directory,
+                   std::vector<uint64_t> &tables)
+{
+    return detail::consumeMrDirectory(build, directory, tables);
+}
+
+inline bool
+consumeMrTable(MemoryRegionBuild &build, uint32_t table_index,
+               const std::array<uint64_t, MrEntriesPerPage> &table)
+{
+    return detail::consumeMrTable(build, table_index, table);
+}
+
+inline bool
+validMemoryRegions(const MemoryRegionTable &mrs,
+                   const ObjectTables &objects)
+{
+    return detail::validMemoryRegions(mrs, objects);
+}
+
+inline bool
+translate(const MemoryRegionTable &mrs, MrKeyType key_type, uint32_t key,
+          uint64_t address, uint64_t length, uint32_t required_access,
+          std::vector<DmaChunk> &chunks)
+{
+    return detail::translate(mrs, key_type, key, address, length,
+                             required_access, chunks);
 }
 
 inline DeviceCaps
@@ -679,7 +1055,8 @@ validSharedRegion(const DeviceSharedRegion &dsr, uint64_t dsr_address)
 inline CommandResult
 processCommand(const CommandRequest &request, CommandResponse &response,
                GidTable &gids, GidValidTable &gid_valid,
-               ObjectTables &objects, UarRange uar_range)
+               ObjectTables &objects, MemoryRegionTable &mrs,
+               UarRange uar_range)
 {
     response = {};
     const uint32_t command = letoh(request.header.command);
@@ -692,6 +1069,8 @@ processCommand(const CommandRequest &request, CommandResponse &response,
         return detail::createPd(request, response, objects);
       case static_cast<uint32_t>(Command::DestroyPd):
         return detail::destroyPd(request, objects);
+      case static_cast<uint32_t>(Command::DestroyMr):
+        return detail::destroyMr(request, objects, mrs);
       case static_cast<uint32_t>(Command::CreateUc):
         return detail::createUc(request, response, objects, uar_range);
       case static_cast<uint32_t>(Command::DestroyUc):
@@ -705,6 +1084,16 @@ processCommand(const CommandRequest &request, CommandResponse &response,
                                   CommandError);
         return {true, CommandError};
     }
+}
+
+inline CommandResult
+processCommand(const CommandRequest &request, CommandResponse &response,
+               GidTable &gids, GidValidTable &gid_valid,
+               ObjectTables &objects, UarRange uar_range)
+{
+    MemoryRegionTable mrs;
+    return processCommand(request, response, gids, gid_valid, objects, mrs,
+                          uar_range);
 }
 
 } // namespace pvrdma
@@ -737,6 +1126,12 @@ class Pvrdma : public PciDevice
     pvrdma::GidTable gids{};
     pvrdma::GidValidTable gidValid{};
     pvrdma::ObjectTables objects{};
+    pvrdma::MemoryRegionTable memoryRegions{};
+    pvrdma::MemoryRegionBuild mrBuild{};
+    std::array<uint64_t, pvrdma::MrEntriesPerPage> mrDirectory{};
+    std::array<uint64_t, pvrdma::MrEntriesPerPage> mrTable{};
+    std::vector<uint64_t> mrTables;
+    uint32_t mrTableIndex = 0;
     pvrdma::OperationErrorState operationError;
     bool intxAsserted = false;
     const Tick controlCompletionLatency;
@@ -744,6 +1139,8 @@ class Pvrdma : public PciDevice
     EventFunctionWrapper dsrReadEvent;
     EventFunctionWrapper capsWriteEvent;
     EventFunctionWrapper commandReadEvent;
+    EventFunctionWrapper mrDirectoryReadEvent;
+    EventFunctionWrapper mrTableReadEvent;
     EventFunctionWrapper responseWriteEvent;
 
     void startDsr();
@@ -751,6 +1148,11 @@ class Pvrdma : public PciDevice
     void capsWriteDone();
     void startCommand(uint32_t value);
     void commandReadDone();
+    void startMrCreate();
+    void mrDirectoryReadDone();
+    void startMrTableRead();
+    void mrTableReadDone();
+    void finishMrCreate(bool success);
     void responseWriteDone();
     void writeControl(uint32_t value);
     void resetDevice();

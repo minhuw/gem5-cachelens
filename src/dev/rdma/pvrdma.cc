@@ -14,6 +14,10 @@ Pvrdma::Pvrdma(const Params &p)
       dsrReadEvent([this] { dsrReadDone(); }, name() + ".dsrRead"),
       capsWriteEvent([this] { capsWriteDone(); }, name() + ".capsWrite"),
       commandReadEvent([this] { commandReadDone(); }, name() + ".commandRead"),
+      mrDirectoryReadEvent([this] { mrDirectoryReadDone(); },
+                           name() + ".mrDirectoryRead"),
+      mrTableReadEvent([this] { mrTableReadDone(); },
+                       name() + ".mrTableRead"),
       responseWriteEvent([this] { responseWriteDone(); },
                          name() + ".responseWrite")
 {
@@ -238,8 +242,14 @@ Pvrdma::startCommand(uint32_t value)
 void
 Pvrdma::commandReadDone()
 {
+    if (letoh(command.header.command) ==
+        static_cast<uint32_t>(pvrdma::Command::CreateMr)) {
+        startMrCreate();
+        return;
+    }
+
     const auto result = pvrdma::processCommand(
-        command, response, gids, gidValid, objects,
+        command, response, gids, gidValid, objects, memoryRegions,
         {BARs[pvrdma::UarBar]->addr(), BARs[pvrdma::UarBar]->size()});
     operationError.complete(regs.error, result.error);
     panic_if(!pvrdma::finishCommandRead(controlState, result.hasResponse),
@@ -249,6 +259,115 @@ Pvrdma::commandReadDone()
         return;
     }
 
+    dmaWrite(responseSlotDmaAddress, sizeof(response),
+             sys->isAtomicMode() ? nullptr : &responseWriteEvent,
+             reinterpret_cast<uint8_t *>(&response));
+    if (sys->isAtomicMode())
+        responseWriteDone();
+}
+
+void
+Pvrdma::startMrCreate()
+{
+    response = {};
+    mrBuild = {};
+    if (!pvrdma::detail::prepareCreateMr(
+            command, objects, memoryRegions, mrBuild)) {
+        pvrdma::detail::setResponseHeader(
+            response.header, command.header,
+            static_cast<uint32_t>(pvrdma::Command::CreateMr),
+            pvrdma::CommandError);
+        response.header.acknowledgement = 0;
+        operationError.complete(regs.error, pvrdma::CommandError);
+        panic_if(!pvrdma::finishCommandRead(controlState, true),
+                 "PVRDMA rejected MR create in invalid state");
+        dmaWrite(responseSlotDmaAddress, sizeof(response),
+                 sys->isAtomicMode() ? nullptr : &responseWriteEvent,
+                 reinterpret_cast<uint8_t *>(&response));
+        if (sys->isAtomicMode())
+            responseWriteDone();
+        return;
+    }
+
+    panic_if(!pvrdma::beginMrDirectory(controlState),
+             "PVRDMA began MR directory read in invalid state");
+    mrDirectory = {};
+    dmaRead(pciToDma(mrBuild.pageDirectoryDma), sizeof(mrDirectory),
+            sys->isAtomicMode() ? nullptr : &mrDirectoryReadEvent,
+            reinterpret_cast<uint8_t *>(mrDirectory.data()));
+    if (sys->isAtomicMode())
+        mrDirectoryReadDone();
+}
+
+void
+Pvrdma::mrDirectoryReadDone()
+{
+    if (!pvrdma::detail::consumeMrDirectory(
+            mrBuild, mrDirectory, mrTables)) {
+        finishMrCreate(false);
+        return;
+    }
+    panic_if(!pvrdma::beginMrTables(controlState),
+             "PVRDMA completed MR directory read in invalid state");
+    mrTableIndex = 0;
+    startMrTableRead();
+}
+
+void
+Pvrdma::startMrTableRead()
+{
+    panic_if(controlState != pvrdma::ControlState::ReadingMrTable ||
+                 mrTableIndex >= mrTables.size(),
+             "PVRDMA started invalid MR table read");
+    mrTable = {};
+    dmaRead(pciToDma(mrTables[mrTableIndex]), sizeof(mrTable),
+            sys->isAtomicMode() ? nullptr : &mrTableReadEvent,
+            reinterpret_cast<uint8_t *>(mrTable.data()));
+    if (sys->isAtomicMode())
+        mrTableReadDone();
+}
+
+void
+Pvrdma::mrTableReadDone()
+{
+    if (!pvrdma::detail::consumeMrTable(mrBuild, mrTableIndex, mrTable)) {
+        finishMrCreate(false);
+        return;
+    }
+    if (++mrTableIndex < mrTables.size()) {
+        startMrTableRead();
+        return;
+    }
+    finishMrCreate(true);
+}
+
+void
+Pvrdma::finishMrCreate(bool success)
+{
+    if (success)
+        success = memoryRegions.commit(std::move(mrBuild), objects);
+
+    pvrdma::detail::setResponseHeader(
+        response.header, command.header,
+        static_cast<uint32_t>(pvrdma::Command::CreateMr), !success);
+    if (success) {
+        const uint32_t slot = mrBuild.mrHandle & pvrdma::MrSlotMask;
+        const auto &mr = memoryRegions.entries[slot];
+        response.createMr.mrHandle = htole(mr.mrHandle);
+        response.createMr.lkey = htole(mr.lkey);
+        response.createMr.rkey = htole(mr.rkey);
+    } else {
+        // Linux 6.18 ignores response.header.error. An acknowledgement
+        // mismatch is its only response-path command failure signal.
+        response.header.acknowledgement = 0;
+    }
+    operationError.complete(regs.error,
+                            success ? 0 : pvrdma::CommandError);
+    panic_if(!pvrdma::finishMrWalk(controlState),
+             "PVRDMA finished MR walk in invalid state");
+    mrBuild = {};
+    mrTables.clear();
+    mrTableIndex = 0;
     dmaWrite(responseSlotDmaAddress, sizeof(response),
              sys->isAtomicMode() ? nullptr : &responseWriteEvent,
              reinterpret_cast<uint8_t *>(&response));
@@ -281,6 +400,12 @@ Pvrdma::resetDevice()
     gids = {};
     gidValid = {};
     objects.reset();
+    memoryRegions.reset();
+    mrBuild = {};
+    mrDirectory = {};
+    mrTable = {};
+    mrTables.clear();
+    mrTableIndex = 0;
     operationError.reset();
     if (intxAsserted) {
         intrClear();
@@ -353,6 +478,24 @@ Pvrdma::serialize(CheckpointOut &cp) const
     arrayParamOut(cp, "pdChildren", objects.pdChildren.data(),
                   objects.pdChildren.size());
     SERIALIZE_SCALAR(intxAsserted);
+    for (uint32_t slot = 1; slot < pvrdma::ObjectTableEntries; ++slot) {
+        const auto &mr = memoryRegions.entries[slot];
+        ScopedCheckpointSection sec(cp, csprintf("mr%u", slot));
+        paramOut(cp, "valid", mr.valid);
+        paramOut(cp, "generation", mr.generation);
+        if (!mr.valid)
+            continue;
+        paramOut(cp, "mrHandle", mr.mrHandle);
+        paramOut(cp, "lkey", mr.lkey);
+        paramOut(cp, "rkey", mr.rkey);
+        paramOut(cp, "pdHandle", mr.pdHandle);
+        paramOut(cp, "accessFlags", mr.accessFlags);
+        paramOut(cp, "activeReferences", mr.activeReferences);
+        paramOut(cp, "start", mr.start);
+        paramOut(cp, "length", mr.length);
+        paramOut(cp, "end", mr.end);
+        arrayParamOut(cp, "pages", mr.pages);
+    }
 }
 
 void
@@ -389,6 +532,25 @@ Pvrdma::unserialize(CheckpointIn &cp)
     arrayParamIn(cp, "pdChildren", objects.pdChildren.data(),
                  objects.pdChildren.size());
     UNSERIALIZE_SCALAR(intxAsserted);
+    memoryRegions.reset();
+    for (uint32_t slot = 1; slot < pvrdma::ObjectTableEntries; ++slot) {
+        auto &mr = memoryRegions.entries[slot];
+        ScopedCheckpointSection sec(cp, csprintf("mr%u", slot));
+        paramIn(cp, "valid", mr.valid);
+        paramIn(cp, "generation", mr.generation);
+        if (!mr.valid)
+            continue;
+        paramIn(cp, "mrHandle", mr.mrHandle);
+        paramIn(cp, "lkey", mr.lkey);
+        paramIn(cp, "rkey", mr.rkey);
+        paramIn(cp, "pdHandle", mr.pdHandle);
+        paramIn(cp, "accessFlags", mr.accessFlags);
+        paramIn(cp, "activeReferences", mr.activeReferences);
+        paramIn(cp, "start", mr.start);
+        paramIn(cp, "length", mr.length);
+        paramIn(cp, "end", mr.end);
+        arrayParamIn(cp, "pages", mr.pages);
+    }
     operationError.reset();
 
     panic_if(!pvrdma::stable(controlState),
@@ -398,8 +560,14 @@ Pvrdma::unserialize(CheckpointIn &cp)
              "PVRDMA checkpoint has inconsistent interrupt state");
     panic_if(!pvrdma::validObjectTables(
                  objects, {BARs[pvrdma::UarBar]->addr(),
-                           BARs[pvrdma::UarBar]->size()}),
+                           BARs[pvrdma::UarBar]->size()}) ||
+                 !pvrdma::detail::validMemoryRegions(memoryRegions, objects),
              "PVRDMA checkpoint has inconsistent object tables");
+    mrBuild = {};
+    mrDirectory = {};
+    mrTable = {};
+    mrTables.clear();
+    mrTableIndex = 0;
     if (controlState == pvrdma::ControlState::Unconfigured) {
         dsrDmaAddress = commandSlotDmaAddress = responseSlotDmaAddress = 0;
     } else {

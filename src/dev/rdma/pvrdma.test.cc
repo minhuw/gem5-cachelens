@@ -13,6 +13,59 @@ namespace gem5
 namespace pvrdma
 {
 
+namespace
+{
+
+CommandRequest
+mrRequest(uint64_t start, uint64_t length, uint32_t chunks,
+          uint32_t access = AccessLocalWrite)
+{
+    CommandRequest request{};
+    request.header.response = htole(uint64_t{0x123456789abcdef0});
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::CreateMr));
+    request.createMr.start = htole(start);
+    request.createMr.length = htole(length);
+    request.createMr.pageDirectoryDma = htole(uint64_t{0x1000});
+    request.createMr.pdHandle = htole(uint32_t{1});
+    request.createMr.accessFlags = htole(access);
+    request.createMr.numChunks = htole(chunks);
+    return request;
+}
+
+bool
+buildMr(const CommandRequest &request, ObjectTables &objects,
+        MemoryRegionTable &mrs, MemoryRegionBuild &build,
+        uint64_t first_page = 0x4000)
+{
+    if (!prepareCreateMr(request, objects, mrs, build))
+        return false;
+    std::array<uint64_t, MrEntriesPerPage> directory{};
+    std::vector<uint64_t> tables;
+    const uint32_t table_count =
+        (build.numChunks + MrEntriesPerPage - 1) / MrEntriesPerPage;
+    for (uint32_t i = 0; i < table_count; ++i)
+        directory[i] = htole(uint64_t{0x2000} + i * MrPageSize);
+    if (!consumeMrDirectory(build, directory, tables))
+        return false;
+    for (uint32_t table_index = 0; table_index < table_count; ++table_index) {
+        std::array<uint64_t, MrEntriesPerPage> table{};
+        const uint32_t count = std::min<uint32_t>(
+            MrEntriesPerPage,
+            build.numChunks - table_index * MrEntriesPerPage);
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint64_t page = first_page +
+                uint64_t{table_index * MrEntriesPerPage + i} * MrPageSize;
+            table[i] = htole(page);
+        }
+        if (!consumeMrTable(build, table_index, table))
+            return false;
+    }
+    return true;
+}
+
+} // anonymous namespace
+
 TEST(PvrdmaRegisterTest, DecodesOnlyDefinedAlignedRegisters)
 {
     EXPECT_EQ(decodeRegister(RegVersion), Register::Version);
@@ -554,7 +607,9 @@ TEST(PvrdmaObjectTest, ResetsAndValidatesRestoreInvariants)
     EXPECT_FALSE(validObjectTables(malformed, range));
     malformed = objects;
     malformed.pdChildren[1] = 1;
-    EXPECT_FALSE(validObjectTables(malformed, range));
+    EXPECT_TRUE(validObjectTables(malformed, range));
+    MemoryRegionTable emptyMrs;
+    EXPECT_FALSE(validMemoryRegions(emptyMrs, malformed));
 
     objects.reset();
     EXPECT_TRUE(validObjectTables(objects, range));
@@ -591,7 +646,13 @@ TEST(PvrdmaControlTest, PublishesResponseCauseOnlyAfterWriteCompletion)
     uint32_t pending = 0;
 
     ASSERT_TRUE(beginCommand(state));
-    ASSERT_TRUE(finishCommandRead(state, true));
+    ASSERT_TRUE(beginMrDirectory(state));
+    EXPECT_EQ(state, ControlState::ReadingMrDirectory);
+    EXPECT_EQ(pending, 0);
+    ASSERT_TRUE(beginMrTables(state));
+    EXPECT_EQ(state, ControlState::ReadingMrTable);
+    EXPECT_EQ(pending, 0);
+    ASSERT_TRUE(finishMrWalk(state));
     EXPECT_EQ(state, ControlState::WritingResponse);
     EXPECT_EQ(pending, 0);
     EXPECT_FALSE(checkpointStable(state, false));
@@ -609,7 +670,267 @@ TEST(PvrdmaControlTest, CheckpointsOnlyStableIdleState)
     EXPECT_FALSE(checkpointStable(ControlState::ReadingDsr, false));
     EXPECT_FALSE(checkpointStable(ControlState::WritingCaps, false));
     EXPECT_FALSE(checkpointStable(ControlState::ReadingCommand, false));
+    EXPECT_FALSE(checkpointStable(ControlState::ReadingMrDirectory, false));
+    EXPECT_FALSE(checkpointStable(ControlState::ReadingMrTable, false));
     EXPECT_FALSE(checkpointStable(ControlState::WritingResponse, false));
+}
+
+TEST(PvrdmaMrTest, ComputesExactLinuxPageGeometry)
+{
+    uint32_t pages = 0;
+    EXPECT_TRUE(detail::mrPageCount(0x1000, 1, pages));
+    EXPECT_EQ(pages, 1);
+    EXPECT_TRUE(detail::mrPageCount(0x1003, 4093, pages));
+    EXPECT_EQ(pages, 1);
+    EXPECT_TRUE(detail::mrPageCount(0x1003, 4094, pages));
+    EXPECT_EQ(pages, 2);
+    EXPECT_TRUE(detail::mrPageCount(0, uint64_t{512} * MrPageSize, pages));
+    EXPECT_EQ(pages, 512);
+    EXPECT_TRUE(detail::mrPageCount(0, uint64_t{513} * MrPageSize, pages));
+    EXPECT_EQ(pages, 513);
+    EXPECT_FALSE(detail::mrPageCount(0, 0, pages));
+    EXPECT_FALSE(detail::mrPageCount(UINT64_MAX, 1, pages));
+    EXPECT_FALSE(detail::mrPageCount(
+        0, uint64_t{PageDirectoryMaxPages + 1} * MrPageSize, pages));
+}
+
+TEST(PvrdmaMrTest, RejectsMalformedCreateBeforeDma)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    MemoryRegionTable mrs{};
+    MemoryRegionBuild build{};
+    auto request = mrRequest(0x1003, 4094, 2);
+    EXPECT_TRUE(prepareCreateMr(request, objects, mrs, build));
+    EXPECT_EQ(build.slot, 1);
+    EXPECT_EQ(build.mrHandle, 1);
+
+    auto malformed = request;
+    malformed.header.reserved = htole(uint32_t{1});
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed = request;
+    malformed.createMr.flags = htole(MrFlagDma);
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed = request;
+    malformed.createMr.accessFlags = htole(AccessMemoryWindowBind);
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed.createMr.accessFlags = htole(AccessRemoteWrite);
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed.createMr.accessFlags = htole(AccessRemoteAtomic);
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed = request;
+    malformed.createMr.pdHandle = htole(uint32_t{2});
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed = request;
+    malformed.createMr.pageDirectoryDma = 0;
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed.createMr.pageDirectoryDma = htole(uint64_t{0x1001});
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed = request;
+    malformed.createMr.length = 0;
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed = mrRequest(UINT64_MAX, 1, 1);
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed = request;
+    malformed.createMr.numChunks = htole(uint32_t{0});
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed.createMr.numChunks = htole(uint32_t{1});
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+    malformed.createMr.numChunks = htole(PageDirectoryMaxPages + 1);
+    EXPECT_FALSE(prepareCreateMr(malformed, objects, mrs, build));
+}
+
+TEST(PvrdmaMrTest, WalksOne512And513PageDirectories)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    for (const uint32_t count : {1U, 512U, 513U}) {
+        MemoryRegionTable mrs{};
+        MemoryRegionBuild build{};
+        ASSERT_TRUE(buildMr(mrRequest(0, uint64_t{count} * MrPageSize,
+                                      count),
+                            objects, mrs, build));
+        EXPECT_EQ(build.pages.size(), count);
+        EXPECT_EQ(build.pages.front(), 0x4000);
+        EXPECT_EQ(build.pages.back(),
+                  0x4000 + uint64_t{count - 1} * MrPageSize);
+    }
+}
+
+TEST(PvrdmaMrTest, RejectsZeroAndUnalignedDirectoryTableAndLeavesAtomically)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    MemoryRegionTable mrs{};
+    MemoryRegionBuild build{};
+    ASSERT_TRUE(prepareCreateMr(mrRequest(0, 2 * MrPageSize, 2),
+                                objects, mrs, build));
+    std::array<uint64_t, MrEntriesPerPage> directory{};
+    std::vector<uint64_t> tables;
+    EXPECT_FALSE(consumeMrDirectory(build, directory, tables));
+    directory[0] = htole(uint64_t{0x2001});
+    EXPECT_FALSE(consumeMrDirectory(build, directory, tables));
+    directory[0] = htole(uint64_t{0x2000});
+    ASSERT_TRUE(consumeMrDirectory(build, directory, tables));
+
+    std::array<uint64_t, MrEntriesPerPage> table{};
+    table[0] = htole(uint64_t{0x4000});
+    EXPECT_FALSE(consumeMrTable(build, 1, table));
+    EXPECT_FALSE(consumeMrTable(build, 0, table));
+    EXPECT_TRUE(build.pages.empty());
+    table[1] = htole(uint64_t{0x5001});
+    EXPECT_FALSE(consumeMrTable(build, 0, table));
+    EXPECT_TRUE(build.pages.empty());
+    table[1] = htole(uint64_t{0x5000});
+    ASSERT_TRUE(consumeMrTable(build, 0, table));
+    ASSERT_TRUE(mrs.commit(std::move(build), objects));
+    EXPECT_EQ(objects.pdChildren[1], 1);
+    EXPECT_EQ(mrs.entries[1].pages.size(), 2);
+}
+
+TEST(PvrdmaMrTest, AllocatesExhaustsDestroysAndRejectsStaleOrBusyHandles)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    MemoryRegionTable mrs{};
+    std::vector<uint32_t> handles;
+    for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
+        MemoryRegionBuild build{};
+        ASSERT_TRUE(buildMr(mrRequest(0, MrPageSize, 1), objects, mrs,
+                            build, 0x100000 + uint64_t{slot} * MrPageSize));
+        EXPECT_EQ(build.mrHandle, slot);
+        handles.push_back(build.mrHandle);
+        ASSERT_TRUE(mrs.commit(std::move(build), objects));
+    }
+    MemoryRegionBuild exhausted{};
+    EXPECT_FALSE(prepareCreateMr(mrRequest(0, MrPageSize, 1), objects,
+                                 mrs, exhausted));
+    EXPECT_EQ(objects.pdChildren[1], ObjectTableEntries - 1);
+
+    const uint32_t old_handle = handles[16];
+    mrs.entries[17].activeReferences = 1;
+    EXPECT_FALSE(mrs.destroy(old_handle, objects));
+    mrs.entries[17].activeReferences = 0;
+    EXPECT_TRUE(mrs.destroy(old_handle, objects));
+    EXPECT_FALSE(mrs.destroy(old_handle, objects));
+    EXPECT_FALSE(mrs.destroy(0, objects));
+
+    MemoryRegionBuild reused{};
+    ASSERT_TRUE(buildMr(mrRequest(0, MrPageSize, 1), objects, mrs, reused));
+    EXPECT_EQ(reused.slot, 17);
+    EXPECT_EQ(reused.mrHandle, 17 + ObjectTableEntries);
+    EXPECT_NE(reused.mrHandle, old_handle);
+    ASSERT_TRUE(mrs.commit(std::move(reused), objects));
+    EXPECT_TRUE(validMemoryRegions(mrs, objects));
+
+    mrs.reset();
+    objects.pdChildren = {};
+    EXPECT_TRUE(validMemoryRegions(mrs, objects));
+}
+
+TEST(PvrdmaMrTest, PdDestroyAndDestroyMrHonorDependenciesAndReservedBytes)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    MemoryRegionTable mrs{};
+    MemoryRegionBuild build{};
+    ASSERT_TRUE(buildMr(mrRequest(0, MrPageSize, 1), objects, mrs, build));
+    ASSERT_TRUE(mrs.commit(std::move(build), objects));
+
+    CommandRequest request{};
+    CommandResponse response{};
+    GidTable gids{};
+    GidValidTable gids_valid{};
+    UarRange range{};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyPd));
+    request.destroyPd.pdHandle = htole(uint32_t{1});
+    EXPECT_EQ(processCommand(request, response, gids, gids_valid, objects,
+                             mrs, range).error, CommandError);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyMr));
+    request.destroyMr.mrHandle = htole(uint32_t{1});
+    request.destroyMr.reserved[0] = 1;
+    EXPECT_EQ(processCommand(request, response, gids, gids_valid, objects,
+                             mrs, range).error, CommandError);
+    request.destroyMr.reserved[0] = 0;
+    EXPECT_EQ(processCommand(request, response, gids, gids_valid, objects,
+                             mrs, range).error, 0);
+    EXPECT_EQ(objects.pdChildren[1], 0);
+    EXPECT_EQ(processCommand(request, response, gids, gids_valid, objects,
+                             mrs, range).error, CommandError);
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyPd));
+    request.destroyPd.pdHandle = htole(uint32_t{1});
+    EXPECT_EQ(processCommand(request, response, gids, gids_valid, objects,
+                             mrs, range).error, 0);
+}
+
+TEST(PvrdmaMrTest, TranslatesOneSgeWithinAndAcrossPages)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    MemoryRegionTable mrs{};
+    MemoryRegionBuild build{};
+    auto request = mrRequest(0x1003, 5000, 2,
+                             AccessLocalWrite | AccessRemoteRead);
+    ASSERT_TRUE(buildMr(request, objects, mrs, build, 0x8000));
+    ASSERT_TRUE(mrs.commit(std::move(build), objects));
+
+    std::vector<DmaChunk> chunks;
+    EXPECT_TRUE(translate(mrs, MrKeyType::Local, 1, 0x1010, 16, 0,
+                          chunks));
+    EXPECT_EQ(chunks, (std::vector<DmaChunk>{{0x8010, 16}}));
+    EXPECT_TRUE(translate(mrs, MrKeyType::Local, 1, 0x1ff0, 32, 0,
+                          chunks));
+    EXPECT_EQ(chunks, (std::vector<DmaChunk>{{0x8ff0, 16},
+                                             {0x9000, 16}}));
+    EXPECT_TRUE(translate(mrs, MrKeyType::Remote, 1, 0x1003, 1,
+                          AccessRemoteRead, chunks));
+    EXPECT_FALSE(translate(mrs, MrKeyType::Local, 2, 0x1003, 1, 0,
+                           chunks));
+    EXPECT_FALSE(translate(mrs, MrKeyType::Remote, 1, 0x1003, 1,
+                           AccessRemoteWrite, chunks));
+    EXPECT_FALSE(translate(mrs, MrKeyType::Local, 1, 0x1002, 1, 0,
+                           chunks));
+    EXPECT_FALSE(translate(mrs, MrKeyType::Local, 1, 0x1003, 0, 0,
+                           chunks));
+    EXPECT_FALSE(translate(mrs, MrKeyType::Local, 1, UINT64_MAX, 2, 0,
+                           chunks));
+    EXPECT_FALSE(translate(mrs, MrKeyType::Local, 1, 0x1003 + 5000, 1, 0,
+                           chunks));
+
+    ASSERT_TRUE(mrs.destroy(1, objects));
+    EXPECT_FALSE(translate(mrs, MrKeyType::Local, 1, 0x1003, 1, 0,
+                           chunks));
+}
+
+TEST(PvrdmaMrTest, ValidatesRestoreConsistency)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    MemoryRegionTable mrs{};
+    MemoryRegionBuild build{};
+    ASSERT_TRUE(buildMr(mrRequest(0x1003, 4094, 2), objects, mrs, build));
+    ASSERT_TRUE(mrs.commit(std::move(build), objects));
+    EXPECT_TRUE(validMemoryRegions(mrs, objects));
+
+    auto malformed = mrs;
+    malformed.entries[1].pages.pop_back();
+    EXPECT_FALSE(validMemoryRegions(malformed, objects));
+    malformed = mrs;
+    malformed.entries[1].pages[0]++;
+    EXPECT_FALSE(validMemoryRegions(malformed, objects));
+    malformed = mrs;
+    malformed.entries[1].end++;
+    EXPECT_FALSE(validMemoryRegions(malformed, objects));
+    auto malformed_objects = objects;
+    malformed_objects.pdChildren[1] = 0;
+    EXPECT_FALSE(validMemoryRegions(mrs, malformed_objects));
 }
 
 } // namespace pvrdma
