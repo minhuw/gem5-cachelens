@@ -94,6 +94,8 @@ PvrdmaTester::getPort(const std::string &if_name, PortID idx)
 void
 PvrdmaTester::startup()
 {
+    rdma = dynamic_cast<Pvrdma *>(SimObject::find("system.rdma"));
+    panic_if(!rdma, "PVRDMA tester could not find system.rdma");
     schedule(testEvent, curTick());
 }
 
@@ -545,6 +547,26 @@ PvrdmaTester::ringDoorbell(uint32_t action, uint32_t handle, bool cq)
                              pvrdma::QpDoorbellOffset;
     write(UarBarAddress + pvrdma::UarPageSize + offset,
           htole(action | handle), MmioFlags);
+}
+
+pvrdma::CompletionSubmitResult
+PvrdmaTester::submitCompletion(pvrdma::CompletionOpcode opcode,
+                               pvrdma::CompletionStatus status,
+                               uint64_t wr_id, uint32_t byte_length,
+                               uint32_t source_qp)
+{
+    panic_if(!rdma, "PVRDMA synthetic completion test has no device");
+    pvrdma::CompletionRecord record;
+    record.cqHandle = 1;
+    record.qpHandle = 1;
+    record.cqGeneration = rdma->completionQueues.entries[1].generation;
+    record.qpGeneration = rdma->queuePairs.entries[1].generation;
+    record.workRequestId = wr_id;
+    record.opcode = opcode;
+    record.status = status;
+    record.byteLength = byte_length;
+    record.sourceQp = source_qp;
+    return rdma->submitCompletion(record);
 }
 
 void
@@ -1017,6 +1039,423 @@ PvrdmaTester::runTimingQueues()
 }
 
 void
+PvrdmaTester::runTimingCompletion()
+{
+    panic_if(system->isAtomicMode(),
+             "PVRDMA timing completion test requires timing mode");
+    const Tick LongDelay = microseconds(40);
+    switch (timingStage) {
+      case TimingStage::Configure:
+        configurePci();
+        configureDsr();
+        timingStage = TimingStage::UserContext;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::UserContext:
+        testCapabilities();
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Activate)), MmioFlags);
+        startUserContext(0x1010101010101010);
+        timingStage = TimingStage::UserPd;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::UserPd:
+        verifyResponse(pvrdma::Command::CreateUc, 0x1010101010101010);
+        startUserPd(0x2020202020202020);
+        timingStage = TimingStage::Cq;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::Cq:
+        verifyResponse(pvrdma::Command::CreatePd, 0x2020202020202020);
+        startCq(0x3030303030303030);
+        timingStage = TimingStage::Qp;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::Qp:
+        verifyResponse(pvrdma::Command::CreateCq, 0x3030303030303030);
+        startQp(0x4040404040404040);
+        timingStage = TimingStage::Init;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::Init: {
+        verifyResponse(pvrdma::Command::CreateQp, 0x4040404040404040);
+        pvrdma::QpAttr attrs{};
+        attrs.qpAccessFlags = htole(pvrdma::AccessLocalWrite);
+        attrs.portNumber = 1;
+        startModifyQp(0x5050505050505050, pvrdma::QpState::Init,
+                      pvrdma::QpAttrState | pvrdma::QpAttrAccessFlags |
+                      pvrdma::QpAttrPkeyIndex | pvrdma::QpAttrPort,
+                      attrs);
+        timingStage = TimingStage::Rtr;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Rtr: {
+        verifyResponse(pvrdma::Command::ModifyQp, 0x5050505050505050);
+        pvrdma::QpAttr attrs{};
+        attrs.pathMtu = static_cast<pvrdma::Mtu>(
+            htole(static_cast<uint32_t>(pvrdma::Mtu::Mtu1024)));
+        attrs.destinationQpNumber = htole(uint32_t{1});
+        attrs.addressHandle.portNumber = 1;
+        startModifyQp(0x6060606060606060,
+                      pvrdma::QpState::ReadyToReceive,
+                      pvrdma::QpAttrState | pvrdma::QpAttrAddressVector |
+                      pvrdma::QpAttrPathMtu | pvrdma::QpAttrReceivePsn |
+                      pvrdma::QpAttrMaxDestReadAtomic |
+                      pvrdma::QpAttrMinRnrTimer |
+                      pvrdma::QpAttrDestinationQpn,
+                      attrs);
+        timingStage = TimingStage::Rts;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Rts: {
+        verifyResponse(pvrdma::Command::ModifyQp, 0x6060606060606060);
+        pvrdma::QpAttr attrs{};
+        startModifyQp(0x7070707070707070,
+                      pvrdma::QpState::ReadyToSend,
+                      pvrdma::QpAttrState | pvrdma::QpAttrTimeout |
+                      pvrdma::QpAttrRetryCount | pvrdma::QpAttrRnrRetry |
+                      pvrdma::QpAttrSendPsn |
+                      pvrdma::QpAttrMaxQpReadAtomic,
+                      attrs);
+        timingStage = TimingStage::Query;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::Query:
+        verifyResponse(pvrdma::Command::ModifyQp, 0x7070707070707070);
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Receive,
+                                  pvrdma::CompletionStatus::Success,
+                                  0xabcdef0123456789, 512,
+                                  0x123456) !=
+                     pvrdma::CompletionSubmitResult::Queued,
+                 "PVRDMA timing completion was not queued");
+        timingStage = TimingStage::CompletionTimingCqe;
+        schedule(testEvent, curTick() + microseconds(7));
+        return;
+      case TimingStage::CompletionTimingCqe: {
+        const auto cqe = read<pvrdma::CompletionQueueElement>(
+            CqLeafAddress + pvrdma::PageSize);
+        const auto cq = read<pvrdma::Ring>(
+            CqLeafAddress + offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(cqe.workRequestId) != 0xabcdef0123456789 ||
+                     letoh(cqe.qp) != 1 || letoh(cqe.opcode) != 128 ||
+                     letoh(cqe.status) != 0 ||
+                     letoh(cqe.byteLength) != 512 ||
+                     letoh(cqe.sourceQp) != 0x123456 || cq.producerTail,
+                 "PVRDMA CQ producer became visible before the full CQE");
+        ringDoorbell(pvrdma::CqArmSolicitedAction, 1, true);
+        timingStage = TimingStage::CompletionTimingCqProducer;
+        schedule(testEvent, curTick() + microseconds(9));
+        return;
+      }
+      case TimingStage::CompletionTimingCqProducer: {
+        const auto cqe = read<pvrdma::CompletionQueueElement>(
+            CqLeafAddress + pvrdma::PageSize);
+        const auto cq = read<pvrdma::Ring>(
+            CqLeafAddress + offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(cqe.workRequestId) != 0xabcdef0123456789 ||
+                     letoh(cqe.opcode) != 128 || letoh(cqe.status) != 0 ||
+                     letoh(cqe.byteLength) != 512 ||
+                     letoh(cqe.sourceQp) != 0x123456 ||
+                     letoh(cq.producerTail) != 1 ||
+                     rdma->completionQueues.entries[1].armFlags !=
+                         static_cast<uint32_t>(
+                             pvrdma::CqArmMode::Solicited) ||
+                     (rdma->regs.pendingCauses &
+                      pvrdma::InterruptCauseCompletion),
+                 "PVRDMA CQ producer ordering/polling-only state mismatch");
+        inform("PVRDMA timing completion DMA ordering test passed");
+        exitSimLoop("PVRDMA timing completion test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA timing completion stage");
+    }
+}
+
+void
+PvrdmaTester::runCompletionErrors()
+{
+    panic_if(!system->isAtomicMode(),
+             "PVRDMA completion error test requires atomic mode");
+    const std::string prefix = "system.rdma.queues.";
+    switch (timingStage) {
+      case TimingStage::Configure: {
+        configurePci();
+        configureDsr();
+        testCapabilities();
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Activate)), MmioFlags);
+        createUserParentAtomic();
+        createQueuePairAtomic(1);
+        moveQueuePairToRtsAtomic();
+        statistics::reset();
+
+        pvrdma::CompletionRecord stale;
+        stale.cqHandle = stale.qpHandle = 1;
+        stale.cqGeneration = rdma->completionQueues.entries[1].generation;
+        stale.qpGeneration = rdma->queuePairs.entries[1].generation + 1;
+        stale.opcode = pvrdma::CompletionOpcode::Send;
+        panic_if(rdma->submitCompletion(stale) !=
+                     pvrdma::CompletionSubmitResult::Rejected,
+                 "PVRDMA stale completion was accepted");
+        auto &qp = rdma->queuePairs.entries[1];
+        const auto saved_state = qp.state;
+        qp.state = pvrdma::QpState::Reset;
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Send,
+                                  pvrdma::CompletionStatus::Success, 1) !=
+                     pvrdma::CompletionSubmitResult::Rejected,
+                 "PVRDMA completion accepted an invalid QP state");
+        qp.state = saved_state;
+        const uint32_t saved_cq = qp.sendCqHandle;
+        qp.sendCqHandle = 2;
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Send,
+                                  pvrdma::CompletionStatus::Success, 2) !=
+                     pvrdma::CompletionSubmitResult::Rejected,
+                 "PVRDMA completion accepted a wrong CQ association");
+        qp.sendCqHandle = saved_cq;
+        rdma->completionQueues.entries[1].armFlags =
+            static_cast<uint32_t>(pvrdma::CqArmMode::Any);
+        panic_if(read<pvrdma::Ring>(CqLeafAddress +
+                     offsetof(pvrdma::RingState, rx)).producerTail ||
+                     read<uint64_t>(CqLeafAddress + pvrdma::PageSize) ||
+                     statValue(prefix + "cqPublicationRejected") != 3,
+                 "PVRDMA rejected completion performed a partial write");
+
+        auto &cq = rdma->completionQueues.entries[1];
+        cq.producerTail = 64;
+        cq.consumerHead = 0;
+        pvrdma::Ring full{};
+        full.producerTail = htole(uint32_t{64});
+        write(CqLeafAddress + offsetof(pvrdma::RingState, rx), full);
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Send,
+                                  pvrdma::CompletionStatus::Success,
+                                  0x1111) !=
+                     pvrdma::CompletionSubmitResult::Queued,
+                 "PVRDMA full CQ preflight was not queued");
+        timingStage = TimingStage::CompletionCqFull;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      }
+      case TimingStage::CompletionCqFull: {
+        const auto cq_ring = read<pvrdma::Ring>(
+            CqLeafAddress + offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(cq_ring.producerTail) != 64 ||
+                     read<uint64_t>(CqLeafAddress + pvrdma::PageSize) ||
+                     rdma->completionQueues.entries[1].armFlags !=
+                         static_cast<uint32_t>(pvrdma::CqArmMode::Any) ||
+                     statValue(prefix + "cqPublicationBackpressured") != 1 ||
+                     statValue(prefix + "cqPublicationRejected") != 3 ||
+                     statValue(prefix + "cqPublished") != 0 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA full CQ partially published a completion");
+        auto &cq = rdma->completionQueues.entries[1];
+        cq.producerTail = cq.consumerHead = 0;
+        pvrdma::Ring malformed{};
+        malformed.producerTail = htole(uint32_t{1});
+        write(CqLeafAddress + offsetof(pvrdma::RingState, rx), malformed);
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Receive,
+                                  pvrdma::CompletionStatus::Success,
+                                  0x2222, 32, 1) !=
+                     pvrdma::CompletionSubmitResult::Queued,
+                 "PVRDMA malformed CQ preflight was not queued");
+        timingStage = TimingStage::CompletionMalformed;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      }
+      case TimingStage::CompletionMalformed:
+        panic_if(letoh(read<pvrdma::Ring>(CqLeafAddress +
+                     offsetof(pvrdma::RingState, rx)).producerTail) != 1 ||
+                     read<uint64_t>(CqLeafAddress + pvrdma::PageSize) ||
+                     rdma->completionQueues.entries[1].armFlags !=
+                         static_cast<uint32_t>(pvrdma::CqArmMode::Any) ||
+                     (rdma->regs.pendingCauses &
+                      pvrdma::InterruptCauseCompletion) ||
+                     statValue(prefix + "cqPublicationRejected") != 4 ||
+                     statValue(prefix + "cqPublicationBackpressured") != 1 ||
+                     statValue(prefix + "cqPublished") != 0 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA malformed CQ partially published a completion");
+        inform("PVRDMA completion rejection/backpressure test passed");
+        exitSimLoop("PVRDMA completion error test passed");
+        return;
+      default:
+        panic("Invalid PVRDMA completion error stage");
+    }
+}
+
+void
+PvrdmaTester::runCompletion()
+{
+    panic_if(!system->isAtomicMode(),
+             "PVRDMA completion test requires atomic mode");
+    const std::string prefix = "system.rdma.queues.";
+    switch (timingStage) {
+      case TimingStage::Configure: {
+        configurePci();
+        configureDsr();
+        testCapabilities();
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Activate)), MmioFlags);
+        createUserParentAtomic();
+        createQueuePairAtomic(1);
+        moveQueuePairToRtsAtomic();
+        auto &cq = rdma->completionQueues.entries[1];
+        cq.producerTail = cq.consumerHead = 126;
+        pvrdma::Ring ring{};
+        ring.producerTail = ring.consumerHead = htole(uint32_t{126});
+        write(CqLeafAddress + offsetof(pvrdma::RingState, rx), ring);
+        ringDoorbell(pvrdma::CqArmAnyAction, 1, true);
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Send,
+                                  pvrdma::CompletionStatus::Success,
+                                  0x1111222233334444) !=
+                     pvrdma::CompletionSubmitResult::Busy,
+                 "PVRDMA completion ignored queued ARM observation");
+        timingStage = TimingStage::CompletionSendDone;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      }
+      case TimingStage::CompletionSendDone:
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Send,
+                                  pvrdma::CompletionStatus::Success,
+                                  0x1111222233334444) !=
+                     pvrdma::CompletionSubmitResult::Queued ||
+                 submitCompletion(pvrdma::CompletionOpcode::Send,
+                                  pvrdma::CompletionStatus::Success, 2) !=
+                     pvrdma::CompletionSubmitResult::Busy,
+                 "PVRDMA completion single-flight admission failed");
+        timingStage = TimingStage::CompletionReceiveDone;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      case TimingStage::CompletionReceiveDone: {
+        const auto cqe = read<pvrdma::CompletionQueueElement>(
+            CqLeafAddress + pvrdma::PageSize + 62 * pvrdma::CqeSize);
+        const auto cq = read<pvrdma::Ring>(
+            CqLeafAddress + offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(cq.producerTail) != 127 ||
+                     letoh(cqe.workRequestId) != 0x1111222233334444 ||
+                     letoh(cqe.qp) != 1 || letoh(cqe.opcode) != 0 ||
+                     letoh(cqe.status) != 0 ||
+                     rdma->completionQueues.entries[1].armFlags !=
+                         static_cast<uint32_t>(pvrdma::CqArmMode::Any) ||
+                     (rdma->regs.pendingCauses &
+                      pvrdma::InterruptCauseCompletion),
+                 "PVRDMA SEND polling publication mismatch");
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Receive,
+                                  pvrdma::CompletionStatus::Success,
+                                  0x5555666677778888, 128,
+                                  0x123456) !=
+                     pvrdma::CompletionSubmitResult::Queued,
+                 "PVRDMA RECV success was not queued");
+        timingStage = TimingStage::CompletionErrorDone;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      }
+      case TimingStage::CompletionErrorDone: {
+        const auto cqe = read<pvrdma::CompletionQueueElement>(
+            CqLeafAddress + pvrdma::PageSize + 63 * pvrdma::CqeSize);
+        const auto cq = read<pvrdma::Ring>(
+            CqLeafAddress + offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(cq.producerTail) != 0 ||
+                     letoh(cqe.workRequestId) != 0x5555666677778888 ||
+                     letoh(cqe.opcode) != 128 || letoh(cqe.status) != 0 ||
+                     letoh(cqe.byteLength) != 128 ||
+                     letoh(cqe.sourceQp) != 0x123456,
+                 "PVRDMA RECV success/wrap publication mismatch");
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Receive,
+                                  pvrdma::CompletionStatus::GeneralError,
+                                  0x9999aaaabbbbcccc, 256,
+                                  0x654321) !=
+                     pvrdma::CompletionSubmitResult::Queued,
+                 "PVRDMA RECV error was not queued");
+        timingStage = TimingStage::CompletionReclaimed;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      }
+      case TimingStage::CompletionReclaimed: {
+        const auto cqe = read<pvrdma::CompletionQueueElement>(
+            CqLeafAddress + pvrdma::PageSize);
+        const auto cq = read<pvrdma::Ring>(
+            CqLeafAddress + offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(cq.producerTail) != 1 ||
+                     letoh(cqe.workRequestId) != 0x9999aaaabbbbcccc ||
+                     letoh(cqe.opcode) != 128 || letoh(cqe.status) != 21 ||
+                     letoh(cqe.byteLength) != 256 ||
+                     letoh(cqe.sourceQp) != 0x654321 ||
+                     statValue(prefix + "cqPublished") != 3 ||
+                     statValue(prefix + "cqErrorPublished") != 1 ||
+                     statValue(prefix + "cqOutstanding") != 3 ||
+                     statValue(prefix + "cqPublicationRejected") != 0 ||
+                     statValue(prefix + "cqPublicationBackpressured") != 0 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA RECV error/statistics mismatch");
+        pvrdma::Ring consumed{};
+        consumed.producerTail = consumed.consumerHead = htole(uint32_t{1});
+        write(CqLeafAddress + offsetof(pvrdma::RingState, rx), consumed);
+        ringDoorbell(pvrdma::CqPollAction, 1, true);
+        timingStage = TimingStage::CompletionWrapDone;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      }
+      case TimingStage::CompletionWrapDone:
+        panic_if(rdma->completionQueues.entries[1].consumerHead != 1 ||
+                     rdma->completionQueues.entries[1].armFlags !=
+                         static_cast<uint32_t>(pvrdma::CqArmMode::Any) ||
+                     statValue(prefix + "cqReclaimed") != 3 ||
+                     statValue(prefix + "cqOutstanding") != 0 ||
+                     (rdma->regs.pendingCauses &
+                      pvrdma::InterruptCauseCompletion),
+                 "PVRDMA polling reclamation/ARM preservation mismatch");
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Send,
+                                  pvrdma::CompletionStatus::GeneralError,
+                                  0xddddeeeeffff0000) !=
+                     pvrdma::CompletionSubmitResult::Queued,
+                 "PVRDMA post-wrap SEND was not queued");
+        timingStage = TimingStage::CompletionDestroyDone;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      case TimingStage::CompletionDestroyDone: {
+        const auto cqe = read<pvrdma::CompletionQueueElement>(
+            CqLeafAddress + pvrdma::PageSize + pvrdma::CqeSize);
+        const auto cq = read<pvrdma::Ring>(
+            CqLeafAddress + offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(cq.producerTail) != 2 ||
+                     letoh(cqe.workRequestId) != 0xddddeeeeffff0000 ||
+                     letoh(cqe.opcode) != 0 || letoh(cqe.status) != 21 ||
+                     statValue(prefix + "cqPublished") != 4 ||
+                     statValue(prefix + "cqErrorPublished") != 2 ||
+                     statValue(prefix + "cqOutstanding") != 1 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA post-wrap publication mismatch");
+        destroyQp();
+        destroyCq();
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != 0 ||
+                     statValue(prefix + "cqOutstanding") != 0 ||
+                     statValue(prefix + "cqResetDiscarded") != 1 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA CQ destroy conservation mismatch");
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Reset)), MmioFlags);
+        panic_if(statValue(prefix + "cqResetDiscarded") != 1 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA completion reset conservation mismatch");
+        inform("PVRDMA synthetic polling completion test passed");
+        exitSimLoop("PVRDMA completion publication test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA completion test stage");
+    }
+}
+
+void
 PvrdmaTester::runStatsReset()
 {
     panic_if(!system->isAtomicMode(),
@@ -1176,6 +1615,75 @@ PvrdmaTester::testCheckpointRestore()
 }
 
 void
+PvrdmaTester::testCheckpointCompletionSave()
+{
+    panic_if(!system->isAtomicMode(),
+             "PVRDMA completion checkpoint setup requires atomic mode");
+    if (timingStage == TimingStage::Configure) {
+        configurePci();
+        configureDsr();
+        testCapabilities();
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Activate)), MmioFlags);
+        createUserParentAtomic();
+        createQueuePairAtomic(1);
+        moveQueuePairToRtsAtomic();
+        timingStage = TimingStage::CompletionSendDone;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+    }
+    if (timingStage == TimingStage::CompletionSendDone) {
+        panic_if(submitCompletion(pvrdma::CompletionOpcode::Receive,
+                                  pvrdma::CompletionStatus::Success,
+                                  0xc0dec0dec0dec0de, 64,
+                                  0x123456) !=
+                     pvrdma::CompletionSubmitResult::Queued,
+                 "PVRDMA checkpoint completion was not queued");
+        timingStage = TimingStage::CompletionDone;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+    }
+    panic_if(timingStage != TimingStage::CompletionDone ||
+                 rdma->completionBusy(),
+             "Invalid PVRDMA completion checkpoint stage");
+    const auto cq = read<pvrdma::Ring>(
+        CqLeafAddress + offsetof(pvrdma::RingState, rx));
+    panic_if(letoh(cq.producerTail) != 1,
+             "PVRDMA completion checkpoint missed publication");
+    inform("PVRDMA nonempty completion checkpoint ready");
+    exitSimLoop("PVRDMA completion checkpoint save ready");
+}
+
+void
+PvrdmaTester::testCheckpointCompletionRestore()
+{
+    panic_if(!system->isAtomicMode(),
+             "PVRDMA completion checkpoint restore requires atomic mode");
+    const std::string prefix = "system.rdma.queues.";
+    const auto cqe = read<pvrdma::CompletionQueueElement>(
+        CqLeafAddress + pvrdma::PageSize);
+    const auto cq = read<pvrdma::Ring>(
+        CqLeafAddress + offsetof(pvrdma::RingState, rx));
+    panic_if(letoh(cqe.workRequestId) != 0xc0dec0dec0dec0de ||
+                 letoh(cqe.opcode) != 128 || letoh(cqe.status) != 0 ||
+                 letoh(cqe.byteLength) != 64 ||
+                 letoh(cqe.sourceQp) != 0x123456 ||
+                 letoh(cq.producerTail) != 1 ||
+                 statValue(prefix + "cqOutstanding") != 1 ||
+                 statValue(prefix + "cqOutstandingAtReset") != 1,
+             "PVRDMA completion checkpoint restore duplicated/lost data");
+    write(RegisterBarAddress + pvrdma::RegControl,
+          htole(static_cast<uint32_t>(pvrdma::DeviceControl::Reset)),
+          MmioFlags);
+    panic_if(statValue(prefix + "cqResetDiscarded") != 1 ||
+                 statValue(prefix + "conservationViolations") != 0,
+             "PVRDMA restored completion reset conservation failed");
+    inform("PVRDMA nonempty completion checkpoint restored");
+    exitSimLoop("PVRDMA completion checkpoint restored");
+}
+
+void
 PvrdmaTester::testCheckpointObservationSave()
 {
     panic_if(!system->isAtomicMode(),
@@ -1257,6 +1765,18 @@ PvrdmaTester::run()
         runTimingQueues();
         return;
     }
+    if (testMode == "timing-completion") {
+        runTimingCompletion();
+        return;
+    }
+    if (testMode == "completion-errors") {
+        runCompletionErrors();
+        return;
+    }
+    if (testMode == "completion") {
+        runCompletion();
+        return;
+    }
     if (testMode == "stats-reset") {
         runStatsReset();
         return;
@@ -1267,6 +1787,14 @@ PvrdmaTester::run()
     }
     if (testMode == "checkpoint-restore") {
         testCheckpointRestore();
+        return;
+    }
+    if (testMode == "checkpoint-completion-save") {
+        testCheckpointCompletionSave();
+        return;
+    }
+    if (testMode == "checkpoint-completion-restore") {
+        testCheckpointCompletionRestore();
         return;
     }
     if (testMode == "checkpoint-observation-save") {

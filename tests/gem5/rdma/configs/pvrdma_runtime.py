@@ -25,11 +25,16 @@ parser.add_argument(
         "timing-mr",
         "timing-queues",
         "timing-observation",
+        "timing-completion",
+        "completion",
+        "completion-errors",
         "stats-reset",
         "checkpoint-save",
         "checkpoint-restore",
         "checkpoint-observation-save",
         "checkpoint-observation-restore",
+        "checkpoint-completion-save",
+        "checkpoint-completion-restore",
     ),
     required=True,
 )
@@ -87,6 +92,15 @@ elif args.mode == "timing-queues":
 elif args.mode == "timing-observation":
     assert exit_event.getCause() == "PVRDMA timing observation test passed"
     print("PVRDMA_TIMING_OBSERVATION_OK")
+elif args.mode == "timing-completion":
+    assert exit_event.getCause() == "PVRDMA timing completion test passed"
+    print("PVRDMA_TIMING_COMPLETION_OK")
+elif args.mode == "completion":
+    assert exit_event.getCause() == "PVRDMA completion publication test passed"
+    print("PVRDMA_COMPLETION_OK")
+elif args.mode == "completion-errors":
+    assert exit_event.getCause() == "PVRDMA completion error test passed"
+    print("PVRDMA_COMPLETION_ERRORS_OK")
 elif args.mode == "stats-reset":
     assert exit_event.getCause() == "PVRDMA queue statistics test passed"
     m5.stats.dump()
@@ -111,6 +125,14 @@ elif args.mode == "checkpoint-save":
 elif args.mode == "checkpoint-restore":
     assert exit_event.getCause() == "PVRDMA checkpoint restore test passed"
     print("PVRDMA_CHECKPOINT_RESTORED")
+elif args.mode == "checkpoint-completion-save":
+    assert exit_event.getCause() == "PVRDMA completion checkpoint save ready"
+    args.checkpoint.mkdir(parents=True, exist_ok=True)
+    m5.checkpoint(args.checkpoint.as_posix())
+    print("PVRDMA_COMPLETION_CHECKPOINT_SAVED")
+elif args.mode == "checkpoint-completion-restore":
+    assert exit_event.getCause() == "PVRDMA completion checkpoint restored"
+    print("PVRDMA_COMPLETION_CHECKPOINT_RESTORED")
 elif args.mode == "checkpoint-observation-save":
     assert exit_event.getCause() == "PVRDMA observation checkpoint save ready"
     args.checkpoint.mkdir(parents=True, exist_ok=True)

@@ -6,13 +6,15 @@
 #include <string>
 
 #include "dev/platform.hh"
-#include "dev/rdma/pvrdma_abi.hh"
+#include "dev/rdma/pvrdma.hh"
 #include "mem/port.hh"
 #include "params/PvrdmaTester.hh"
 #include "sim/eventq.hh"
 
 namespace gem5
 {
+
+class Pvrdma;
 
 class PvrdmaTester : public Platform
 {
@@ -63,11 +65,23 @@ class PvrdmaTester : public Platform
         StatsDone,
         StatsReposted,
         CheckpointObservationReady,
+        CompletionSendDone,
+        CompletionReceiveDone,
+        CompletionErrorDone,
+        CompletionReclaimed,
+        CompletionWrapDone,
+        CompletionDestroyDone,
+        CompletionDone,
+        CompletionCqFull,
+        CompletionMalformed,
+        CompletionTimingCqe,
+        CompletionTimingCqProducer,
     };
 
     TestPort port;
     RequestorID requestorId;
     EventFunctionWrapper testEvent;
+    Pvrdma *rdma = nullptr;
     const bool commandTest;
     const std::string testMode;
     bool dsrConfigured = false;
@@ -113,10 +127,19 @@ class PvrdmaTester : public Platform
     void runTimingMr();
     void runTimingQueues();
     void runStatsReset();
+    pvrdma::CompletionSubmitResult submitCompletion(
+        pvrdma::CompletionOpcode opcode, pvrdma::CompletionStatus status,
+        uint64_t wr_id, uint32_t byte_length = 0,
+        uint32_t source_qp = 0);
+    void runCompletion();
+    void runCompletionErrors();
+    void runTimingCompletion();
     void testCheckpointSave();
     void testCheckpointRestore();
     void testCheckpointObservationSave();
     void testCheckpointObservationRestore();
+    void testCheckpointCompletionSave();
+    void testCheckpointCompletionRestore();
 
   public:
     PARAMS(PvrdmaTester);

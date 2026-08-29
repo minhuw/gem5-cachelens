@@ -28,12 +28,35 @@ for name, args, marker in (
 
 
 for name, mode, marker in (
+    ("publication", "completion", "PVRDMA_COMPLETION_OK"),
+    ("errors", "completion-errors", "PVRDMA_COMPLETION_ERRORS_OK"),
+):
+    gem5_verify_config(
+        name=f"pvrdma-completion-{name}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(marker)),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=("--mode", mode),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
+
+
+for name, mode, marker in (
     ("mr-walk", "timing-mr", "PVRDMA_TIMING_MR_OK"),
     ("queue-walk", "timing-queues", "PVRDMA_TIMING_QUEUES_OK"),
     (
         "queue-observation",
         "timing-observation",
         "PVRDMA_TIMING_OBSERVATION_OK",
+    ),
+    (
+        "completion-ordering",
+        "timing-completion",
+        "PVRDMA_TIMING_COMPLETION_OK",
     ),
     ("queue-stats-reset", "stats-reset", "PVRDMA_STATS_RESET_OK"),
 ):
@@ -144,6 +167,77 @@ def pvrdma_observation_checkpoint_test(host):
     )
 
 
+def pvrdma_completion_checkpoint_test(host):
+    def run_test(params):
+        tempdir = Path(params.fixtures[constants.tempdir_fixture_name].path)
+        gem5 = params.fixtures[constants.gem5_binary_fixture_name].path
+        config_path = joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        )
+        checkpoint = tempdir / "pvrdma-completion-checkpoint"
+        for phase, marker in (
+            ("save", "PVRDMA_COMPLETION_CHECKPOINT_SAVED"),
+            ("restore", "PVRDMA_COMPLETION_CHECKPOINT_RESTORED"),
+        ):
+            result = subprocess.run(
+                [
+                    gem5,
+                    "-d",
+                    (tempdir / f"completion-{phase}").as_posix(),
+                    config_path,
+                    "--mode",
+                    f"checkpoint-completion-{phase}",
+                    "--checkpoint",
+                    checkpoint.as_posix(),
+                ],
+                cwd=config.base_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            print(result.stdout)
+            assert result.returncode == 0
+            assert marker in result.stdout
+
+    name = f"pvrdma-checkpoint-completion-{host}-opt"
+    TestSuite(
+        name=name,
+        fixtures=[Gem5Fixture("x86", "opt"), TempdirFixture()],
+        tags=["X86", "opt", constants.quick_tag, host],
+        tests=[TestFunction(run_test, name=name)],
+    )
+
+
+def pvrdma_polling_only_source_test(_):
+    root = Path(config.base_dir)
+    implementation = "\n".join(
+        (root / path).read_text()
+        for path in (
+            "src/dev/rdma/pvrdma.cc",
+            "src/dev/rdma/pvrdma.hh",
+            "src/dev/rdma/pvrdma_ring.hh",
+        )
+    )
+    for forbidden in (
+        "completionRingDirectoryReadDone",
+        "completionRingForwardDistance",
+        "ReadNotificationRing",
+        "WriteNotificationEntry",
+        "cqNotificationsPublished",
+        "cqCompletionInterrupts",
+        "regs.pendingCauses |= pvrdma::InterruptCauseCompletion",
+    ):
+        assert forbidden not in implementation
+
+
 for host in constants.supported_hosts:
+    name = f"pvrdma-completion-polling-only-source-{host}"
+    TestSuite(
+        name=name,
+        fixtures=[],
+        tags=["ALL", constants.quick_tag, host],
+        tests=[TestFunction(pvrdma_polling_only_source_test, name=name)],
+    )
     pvrdma_checkpoint_test(host)
     pvrdma_observation_checkpoint_test(host)
+    pvrdma_completion_checkpoint_test(host)

@@ -370,6 +370,53 @@ TEST(PvrdmaControlTest, EnforcesBoundedStateTransitions)
     EXPECT_FALSE(applyControl(state, DeviceControl::Activate));
 }
 
+TEST(PvrdmaCompletionTest, EncodesOnlySupportedSendAndReceiveCqes)
+{
+    CompletionRecord record;
+    record.cqHandle = 3;
+    record.qpHandle = 7;
+    record.workRequestId = 0x1122334455667788;
+
+    for (const auto opcode : {CompletionOpcode::Send,
+                              CompletionOpcode::Receive}) {
+        for (const auto status : {CompletionStatus::Success,
+                                  CompletionStatus::GeneralError}) {
+            record.opcode = opcode;
+            record.status = status;
+            record.byteLength = opcode == CompletionOpcode::Receive ?
+                0xaabbccdd : 0;
+            record.sourceQp = opcode == CompletionOpcode::Receive ?
+                0x123456 : 0;
+            ASSERT_TRUE(validCompletionRecord(record));
+            const auto cqe = encodeCompletion(record);
+            EXPECT_EQ(letoh(cqe.workRequestId), record.workRequestId);
+            EXPECT_EQ(letoh(cqe.qp), 7);
+            EXPECT_EQ(letoh(cqe.opcode),
+                      opcode == CompletionOpcode::Send ? 0 : 128);
+            EXPECT_EQ(letoh(cqe.status),
+                      status == CompletionStatus::Success ? 0 : 21);
+            EXPECT_EQ(letoh(cqe.byteLength), record.byteLength);
+            EXPECT_EQ(letoh(cqe.sourceQp), record.sourceQp);
+            EXPECT_EQ(cqe.beImmediateData, 0);
+            EXPECT_EQ(cqe.flags, 0);
+            EXPECT_EQ(cqe.vendorError, 0);
+            EXPECT_TRUE(std::all_of(
+                reinterpret_cast<const uint8_t *>(&cqe) + 36,
+                reinterpret_cast<const uint8_t *>(&cqe) + sizeof(cqe),
+                [](uint8_t byte) { return byte == 0; }));
+        }
+    }
+
+    record.opcode = CompletionOpcode::RdmaWrite;
+    EXPECT_FALSE(validCompletionRecord(record));
+    record.opcode = CompletionOpcode::Send;
+    record.status = CompletionStatus::LocalLengthError;
+    EXPECT_FALSE(validCompletionRecord(record));
+    record.status = CompletionStatus::Success;
+    record.byteLength = 1;
+    EXPECT_FALSE(validCompletionRecord(record));
+}
+
 TEST(PvrdmaCommandTest, BuildsResponseHeaderAndRejectsUnsupportedCommands)
 {
     CommandRequest request{};
@@ -1692,6 +1739,12 @@ TEST(PvrdmaObservationTest, AcceptsOnlyBoundedCqConsumerReclamation)
     observed = {htole(uint32_t{10}), htole(uint32_t{15})};
     EXPECT_FALSE(observeConsumer(observed, 8, 10, consumer, delta));
     EXPECT_EQ(consumer, 9);
+
+    consumer = 14;
+    observed = {htole(uint32_t{1}), htole(uint32_t{0})};
+    ASSERT_TRUE(observeConsumer(observed, 8, 1, consumer, delta));
+    EXPECT_EQ(consumer, 0);
+    EXPECT_EQ(delta, 2);
 }
 
 TEST(PvrdmaObservationTest, ValidatesNonemptyRestoredQueueSnapshots)

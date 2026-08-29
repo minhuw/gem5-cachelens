@@ -37,6 +37,14 @@ Pvrdma::QueueStats::QueueStats(Pvrdma &parent)
                "Observed RQ producer advances"),
       ADD_STAT(cqReclaimed, statistics::units::Count::get(),
                "Observed CQ consumer advances"),
+      ADD_STAT(cqPublished, statistics::units::Count::get(),
+               "Published completion queue entries"),
+      ADD_STAT(cqErrorPublished, statistics::units::Count::get(),
+               "Published error completion queue entries"),
+      ADD_STAT(cqPublicationRejected, statistics::units::Count::get(),
+               "Rejected completion publication requests"),
+      ADD_STAT(cqPublicationBackpressured, statistics::units::Count::get(),
+               "Completion publications blocked by full rings"),
       ADD_STAT(sqResetDiscarded, statistics::units::Count::get(),
                "SQ occupancy discarded by reset or removal"),
       ADD_STAT(rqResetDiscarded, statistics::units::Count::get(),
@@ -95,7 +103,14 @@ Pvrdma::Pvrdma(const Params &p)
                          name() + ".responseWrite"),
       observationEvent([this] { startObservation(); },
                        name() + ".queueObservation"),
-      queueDmaEvent([this] { queueDmaDone(); }, name() + ".queueDma")
+      queueDmaEvent([this] { queueDmaDone(); }, name() + ".queueDma"),
+      completionDmaEvent(
+          [this] {
+              if (completionDma.queued())
+                  startCompletion();
+              else
+                  completionDmaDone();
+          }, name() + ".completionDma")
 {
     const auto *mac = p.hardware_address.bytes();
     regs.macLow = static_cast<uint32_t>(mac[0]) |
@@ -244,9 +259,15 @@ Pvrdma::observationQueued() const
 }
 
 bool
+Pvrdma::completionBusy() const
+{
+    return completionDma.active() || completionDmaEvent.scheduled();
+}
+
+bool
 Pvrdma::commandBlockedByObservation() const
 {
-    return observationQueued() || queueDma.active();
+    return observationQueued() || queueDma.active() || completionBusy();
 }
 
 bool
@@ -313,7 +334,7 @@ void
 Pvrdma::scheduleObservation()
 {
     if (controlState == pvrdma::ControlState::Active &&
-        !queueDma.active() && observationQueued() &&
+        !queueDma.active() && !completionBusy() && observationQueued() &&
         !observationEvent.scheduled())
         schedule(observationEvent, nextCycle());
 }
@@ -396,7 +417,7 @@ void
 Pvrdma::startObservation()
 {
     if (controlState != pvrdma::ControlState::Active ||
-        queueDma.active() || !selectObservation())
+        queueDma.active() || completionBusy() || !selectObservation())
         return;
     if (!revalidateObservation() || !queueDma.ringAddress) {
         queueStats.ringObservationsRejected++;
@@ -464,7 +485,8 @@ Pvrdma::finishObservation()
     queueDma.reset();
     scheduleObservation();
     if (pvrdma::checkpointStable(controlState, dmaPending(),
-                                 observationQueued(), queueDma.active()))
+                                 observationQueued(), queueDma.active(),
+                                 completionBusy()))
         signalDrainDone();
 }
 
@@ -566,11 +588,199 @@ Pvrdma::checkQueueConservation()
         queueStats.rqResetDiscarded.value() +
             queueStats.rqAvailable.value())
         queueStats.conservationViolations++;
-    if (queueStats.cqOutstandingAtReset.value() !=
+    if (queueStats.cqOutstandingAtReset.value() +
+            queueStats.cqPublished.value() !=
         queueStats.cqReclaimed.value() +
             queueStats.cqResetDiscarded.value() +
             queueStats.cqOutstanding.value())
         queueStats.conservationViolations++;
+    if (queueStats.cqErrorPublished.value() >
+        queueStats.cqPublished.value())
+        queueStats.conservationViolations++;
+}
+
+pvrdma::CompletionSubmitResult
+Pvrdma::submitCompletion(
+    const pvrdma::CompletionRecord &record,
+    std::function<void(pvrdma::CompletionSubmitResult)> done)
+{
+    if (completionBusy() || observationQueued() || queueDma.active() ||
+        dmaPending())
+        return pvrdma::CompletionSubmitResult::Busy;
+    if (controlState != pvrdma::ControlState::Active ||
+        !pvrdma::validCompletionRecord(record)) {
+        queueStats.cqPublicationRejected++;
+        return pvrdma::CompletionSubmitResult::Rejected;
+    }
+
+    completionDma.reset();
+    completionDma.record = record;
+    completionDma.done = std::move(done);
+    completionDma.stage = CompletionDmaState::Stage::Queued;
+    if (!revalidateCompletion()) {
+        completionDma.reset();
+        queueStats.cqPublicationRejected++;
+        return pvrdma::CompletionSubmitResult::Rejected;
+    }
+    schedule(completionDmaEvent, nextCycle());
+    return pvrdma::CompletionSubmitResult::Queued;
+}
+
+bool
+Pvrdma::revalidateCompletion() const
+{
+    const auto &record = completionDma.record;
+    if (controlState != pvrdma::ControlState::Active ||
+        !pvrdma::validCompletionRecord(record))
+        return false;
+    const auto &cq = completionQueues.entries[record.cqHandle];
+    const auto &qp = queuePairs.entries[record.qpHandle];
+    if (!cq.valid || cq.cqHandle != record.cqHandle ||
+        cq.generation != record.cqGeneration || !qp.valid ||
+        qp.qpHandle != record.qpHandle ||
+        qp.generation != record.qpGeneration || cq.pages.empty())
+        return false;
+    if (record.opcode == pvrdma::CompletionOpcode::Send)
+        return qp.sendCqHandle == record.cqHandle &&
+            qp.state == pvrdma::QpState::ReadyToSend;
+    return qp.recvCqHandle == record.cqHandle &&
+        (qp.state == pvrdma::QpState::ReadyToReceive ||
+         qp.state == pvrdma::QpState::ReadyToSend);
+}
+
+void
+Pvrdma::startCompletion()
+{
+    if (!completionDma.queued())
+        return;
+    if (!revalidateCompletion()) {
+        rejectCompletion(false);
+        return;
+    }
+    const auto &cq = completionQueues.entries[completionDma.record.cqHandle];
+    completionDma.stage = CompletionDmaState::Stage::ReadCqRing;
+    completionDma.ring = {};
+    dmaRead(pciToDma(cq.pages[0] + offsetof(pvrdma::RingState, rx)),
+            sizeof(completionDma.ring),
+            sys->isAtomicMode() ? nullptr : &completionDmaEvent,
+            reinterpret_cast<uint8_t *>(&completionDma.ring));
+    if (sys->isAtomicMode())
+        completionDmaDone();
+}
+
+void
+Pvrdma::rejectCompletion(bool backpressure)
+{
+    if (backpressure)
+        queueStats.cqPublicationBackpressured++;
+    else
+        queueStats.cqPublicationRejected++;
+    auto done = std::move(completionDma.done);
+    completionDma.reset();
+    scheduleObservation();
+    checkQueueConservation();
+    if (done)
+        done(backpressure ? pvrdma::CompletionSubmitResult::Backpressured :
+                            pvrdma::CompletionSubmitResult::Rejected);
+    if (pvrdma::checkpointStable(controlState, dmaPending(),
+                                 observationQueued(), queueDma.active(),
+                                 completionBusy()))
+        signalDrainDone();
+}
+
+void
+Pvrdma::finishCompletion()
+{
+    auto done = std::move(completionDma.done);
+    completionDma.reset();
+    scheduleObservation();
+    checkQueueConservation();
+    if (done)
+        done(pvrdma::CompletionSubmitResult::Published);
+    if (pvrdma::checkpointStable(controlState, dmaPending(),
+                                 observationQueued(), queueDma.active(),
+                                 completionBusy()))
+        signalDrainDone();
+}
+
+void
+Pvrdma::completionDmaDone()
+{
+    using Stage = CompletionDmaState::Stage;
+    if (!revalidateCompletion()) {
+        rejectCompletion(false);
+        return;
+    }
+
+    auto &cq = completionQueues.entries[completionDma.record.cqHandle];
+    switch (completionDma.stage) {
+      case Stage::ReadCqRing: {
+        uint32_t consumer = cq.consumerHead;
+        uint32_t reclaimed = 0;
+        if (!pvrdma::observeConsumer(completionDma.ring, cq.cqe,
+                                     cq.producerTail, consumer,
+                                     reclaimed)) {
+            rejectCompletion(false);
+            return;
+        }
+        if (reclaimed) {
+            sampleQueueOccupancy();
+            cq.consumerHead = consumer;
+            queueStats.cqReclaimed += reclaimed;
+            refreshQueueGauges();
+            sampleCurrentQueueOccupancy();
+            checkQueueConservation();
+        }
+        uint32_t slot = 0;
+        if (!pvrdma::ringHasSpace(cq.producerTail, cq.consumerHead,
+                                  cq.cqe, slot)) {
+            rejectCompletion(true);
+            return;
+        }
+        completionDma.cqSlot = slot;
+        completionDma.cqNextProducer = pvrdma::ringAdvance(
+            cq.producerTail, cq.cqe);
+        completionDma.cqProducerLe = htole(
+            completionDma.cqNextProducer);
+        completionDma.cqe = pvrdma::encodeCompletion(completionDma.record);
+        completionDma.stage = Stage::WriteCqe;
+        const uint32_t offset = completionDma.cqSlot * pvrdma::CqeSize;
+        dmaWrite(pciToDma(cq.pages[1 + offset / pvrdma::PageSize] +
+                          offset % pvrdma::PageSize),
+                 sizeof(completionDma.cqe),
+                 sys->isAtomicMode() ? nullptr : &completionDmaEvent,
+                 reinterpret_cast<uint8_t *>(&completionDma.cqe));
+        if (sys->isAtomicMode())
+            completionDmaDone();
+        return;
+      }
+      case Stage::WriteCqe:
+        completionDma.stage = Stage::PublishCqProducer;
+        dmaWrite(pciToDma(cq.pages[0] +
+                          offsetof(pvrdma::RingState, rx) +
+                          offsetof(pvrdma::Ring, producerTail)),
+                 sizeof(completionDma.cqProducerLe),
+                 sys->isAtomicMode() ? nullptr : &completionDmaEvent,
+                 reinterpret_cast<uint8_t *>(
+                     &completionDma.cqProducerLe));
+        if (sys->isAtomicMode())
+            completionDmaDone();
+        return;
+      case Stage::PublishCqProducer:
+        sampleQueueOccupancy();
+        cq.producerTail = completionDma.cqNextProducer;
+        queueStats.cqPublished++;
+        if (completionDma.record.status ==
+            pvrdma::CompletionStatus::GeneralError)
+            queueStats.cqErrorPublished++;
+        refreshQueueGauges();
+        sampleCurrentQueueOccupancy();
+        checkQueueConservation();
+        finishCompletion();
+        return;
+      default:
+        panic("Invalid PVRDMA completion DMA stage");
+    }
 }
 
 void
@@ -639,7 +849,8 @@ Pvrdma::writeControl(uint32_t value)
 
     const auto control = static_cast<pvrdma::DeviceControl>(value);
     if (control == pvrdma::DeviceControl::Reset) {
-        if (!pvrdma::stable(controlState) || queueDma.active()) {
+        if (!pvrdma::stable(controlState) || queueDma.active() ||
+            completionBusy()) {
             operationError.set(regs.error, pvrdma::CommandError);
             return;
         }
@@ -684,6 +895,10 @@ Pvrdma::commandReadDone()
             cq_busy |= bit;
         else
             qp_busy |= bit;
+    }
+    if (completionBusy()) {
+        cq_busy |= uint64_t{1} << completionDma.record.cqHandle;
+        qp_busy |= uint64_t{1} << completionDma.record.qpHandle;
     }
     const bool target_busy = pvrdma::queueCommandTargetBusy(
         command, qp_busy, cq_busy);
@@ -1003,6 +1218,9 @@ Pvrdma::resetDevice()
     queueStats.rqResetDiscarded += queueStats.rqAvailable.value();
     queueStats.cqResetDiscarded += queueStats.cqOutstanding.value();
     clearObservations();
+    if (completionDmaEvent.scheduled())
+        deschedule(completionDmaEvent);
+    completionDma.reset();
     regs.reset();
     regs.control = static_cast<uint32_t>(pvrdma::DeviceControl::Reset);
     regs.error = 0;
@@ -1056,7 +1274,8 @@ Pvrdma::operationDone()
 {
     scheduleObservation();
     if (pvrdma::checkpointStable(controlState, dmaPending(),
-                                 observationQueued(), queueDma.active()))
+                                 observationQueued(), queueDma.active(),
+                                 completionBusy()))
         signalDrainDone();
 }
 
@@ -1067,7 +1286,7 @@ Pvrdma::drain()
         deschedule(observationEvent);
     sqDirty = rqDirty = cqDirty = 0;
     return pvrdma::checkpointStable(controlState, dmaPending(), false,
-                                    queueDma.active()) ?
+                                    queueDma.active(), completionBusy()) ?
         DrainState::Drained : DrainState::Draining;
 }
 
@@ -1076,7 +1295,8 @@ Pvrdma::serialize(CheckpointOut &cp) const
 {
     panic_if(!pvrdma::checkpointStable(controlState, dmaPending(),
                                         observationQueued(),
-                                        queueDma.active()),
+                                        queueDma.active(),
+                                        completionBusy()),
              "Cannot checkpoint PVRDMA with active or queued DMA");
     PciDevice::serialize(cp);
     SERIALIZE_SCALAR(regs.dsrAddress);
@@ -1302,6 +1522,7 @@ Pvrdma::unserialize(CheckpointIn &cp)
                                             memoryRegions, objects),
              "PVRDMA checkpoint has inconsistent object tables");
     clearObservations();
+    completionDma.reset();
     pendingCreate = pvrdma::PendingCreateKind::None;
     mrBuild = {};
     cqBuild = {};

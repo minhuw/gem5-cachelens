@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <vector>
 
@@ -79,6 +80,54 @@ enum class CqArmMode : uint32_t
     Solicited,
     Any,
 };
+
+enum class CompletionSubmitResult : uint8_t
+{
+    Queued,
+    Busy,
+    Rejected,
+    Backpressured,
+    Published,
+};
+
+struct CompletionRecord
+{
+    uint32_t cqHandle = 0;
+    uint32_t qpHandle = 0;
+    uint32_t cqGeneration = 0;
+    uint32_t qpGeneration = 0;
+    uint64_t workRequestId = 0;
+    CompletionOpcode opcode = CompletionOpcode::Send;
+    CompletionStatus status = CompletionStatus::Success;
+    uint32_t byteLength = 0;
+    uint32_t sourceQp = 0;
+};
+
+inline bool
+validCompletionRecord(const CompletionRecord &record)
+{
+    return record.cqHandle && record.cqHandle < ObjectTableEntries &&
+        record.qpHandle && record.qpHandle < ObjectTableEntries &&
+        (record.opcode == CompletionOpcode::Send ||
+         record.opcode == CompletionOpcode::Receive) &&
+        (record.status == CompletionStatus::Success ||
+         record.status == CompletionStatus::GeneralError) &&
+        (record.opcode == CompletionOpcode::Receive ||
+         (!record.byteLength && !record.sourceQp));
+}
+
+inline CompletionQueueElement
+encodeCompletion(const CompletionRecord &record)
+{
+    CompletionQueueElement cqe{};
+    cqe.workRequestId = htole(record.workRequestId);
+    cqe.qp = htole(static_cast<uint64_t>(record.qpHandle));
+    cqe.opcode = htole(static_cast<uint32_t>(record.opcode));
+    cqe.status = htole(static_cast<uint32_t>(record.status));
+    cqe.byteLength = htole(record.byteLength);
+    cqe.sourceQp = htole(record.sourceQp);
+    return cqe;
+}
 
 struct Doorbell
 {
@@ -327,10 +376,11 @@ finishResponseWrite(ControlState &state, uint32_t &pending)
 constexpr bool
 checkpointStable(ControlState state, bool dma_pending,
                  bool observation_queued = false,
-                 bool observation_active = false)
+                 bool observation_active = false,
+                 bool completion_active = false)
 {
     return stable(state) && !dma_pending && !observation_queued &&
-           !observation_active;
+           !observation_active && !completion_active;
 }
 
 constexpr Register
@@ -2176,6 +2226,8 @@ processCommand(const CommandRequest &request, CommandResponse &response,
 
 } // namespace pvrdma
 
+class PvrdmaTester;
+
 class Pvrdma : public PciDevice
 {
   public:
@@ -2191,6 +2243,8 @@ class Pvrdma : public PciDevice
     void unserialize(CheckpointIn &cp) override;
 
   private:
+    friend class PvrdmaTester;
+
     pvrdma::RegisterState regs;
     pvrdma::ControlState controlState = pvrdma::ControlState::Unconfigured;
     uint64_t commandSlotAddress = 0;
@@ -2235,6 +2289,30 @@ class Pvrdma : public PciDevice
         void reset() { *this = {}; }
     } queueDma;
 
+    struct CompletionDmaState
+    {
+        enum class Stage : uint8_t
+        {
+            Idle,
+            Queued,
+            ReadCqRing,
+            WriteCqe,
+            PublishCqProducer,
+        } stage = Stage::Idle;
+
+        pvrdma::CompletionRecord record{};
+        std::function<void(pvrdma::CompletionSubmitResult)> done;
+        pvrdma::Ring ring{};
+        pvrdma::CompletionQueueElement cqe{};
+        uint32_t cqSlot = 0;
+        uint32_t cqNextProducer = 0;
+        uint32_t cqProducerLe = 0;
+
+        bool active() const { return stage != Stage::Idle; }
+        bool queued() const { return stage == Stage::Queued; }
+        void reset() { *this = {}; }
+    } completionDma;
+
     struct QueueStats : public statistics::Group
     {
         QueueStats(Pvrdma &parent);
@@ -2253,6 +2331,10 @@ class Pvrdma : public PciDevice
         statistics::Scalar sqPosted;
         statistics::Scalar rqPosted;
         statistics::Scalar cqReclaimed;
+        statistics::Scalar cqPublished;
+        statistics::Scalar cqErrorPublished;
+        statistics::Scalar cqPublicationRejected;
+        statistics::Scalar cqPublicationBackpressured;
         statistics::Scalar sqResetDiscarded;
         statistics::Scalar rqResetDiscarded;
         statistics::Scalar cqResetDiscarded;
@@ -2284,9 +2366,11 @@ class Pvrdma : public PciDevice
     EventFunctionWrapper responseWriteEvent;
     EventFunctionWrapper observationEvent;
     EventFunctionWrapper queueDmaEvent;
+    EventFunctionWrapper completionDmaEvent;
 
     bool observationQueued() const;
     bool commandBlockedByObservation() const;
+    bool completionBusy() const;
     bool validDoorbell(const pvrdma::Doorbell &doorbell) const;
     void writeDoorbell(uint64_t offset, PacketPtr pkt);
     void markDirty(pvrdma::QueueKind kind, uint32_t handle);
@@ -2302,6 +2386,15 @@ class Pvrdma : public PciDevice
     void refreshQueueGauges();
     void queueStatsReset();
     void checkQueueConservation();
+
+    pvrdma::CompletionSubmitResult submitCompletion(
+        const pvrdma::CompletionRecord &record,
+        std::function<void(pvrdma::CompletionSubmitResult)> done = {});
+    bool revalidateCompletion() const;
+    void startCompletion();
+    void completionDmaDone();
+    void finishCompletion();
+    void rejectCompletion(bool backpressure);
 
     void startDsr();
     void dsrReadDone();
