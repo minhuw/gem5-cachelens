@@ -7,6 +7,7 @@
 #include <cstddef>
 
 #include "base/logging.hh"
+#include "base/statistics.hh"
 #include "dev/pci/pcireg.h"
 #include "dev/rdma/pvrdma.hh"
 #include "mem/packet.hh"
@@ -41,6 +42,18 @@ constexpr Addr MrLeafAddress = 0x100000;
 constexpr Addr CqLeafAddress = 0x400000;
 constexpr Addr QpLeafAddress = 0x500000;
 constexpr Addr BadQpLeafAddress = 0x600000;
+constexpr Addr PayloadAddress = 0x700000;
+
+statistics::Counter
+statValue(const std::string &name)
+{
+    auto *info = statistics::resolve(name);
+    panic_if(!info, "Missing PVRDMA statistic %s", name);
+    auto *scalar = dynamic_cast<const statistics::ScalarInfo *>(info);
+    panic_if(!scalar, "PVRDMA statistic %s is not scalar", name);
+    return scalar->value();
+}
+
 Tick
 microseconds(uint64_t value)
 {
@@ -517,6 +530,24 @@ PvrdmaTester::moveQueuePairToRtsAtomic()
 }
 
 void
+PvrdmaTester::postObservedRings(uint32_t sq, uint32_t rq)
+{
+    pvrdma::RingState rings{};
+    rings.tx.producerTail = htole(sq);
+    rings.rx.producerTail = htole(rq);
+    write(QpLeafAddress, rings);
+}
+
+void
+PvrdmaTester::ringDoorbell(uint32_t action, uint32_t handle, bool cq)
+{
+    const Addr offset = cq ? pvrdma::CqDoorbellOffset :
+                             pvrdma::QpDoorbellOffset;
+    write(UarBarAddress + pvrdma::UarPageSize + offset,
+          htole(action | handle), MmioFlags);
+}
+
+void
 PvrdmaTester::testCommand()
 {
     panic_if(!dsrConfigured, "PVRDMA command test has no configured DSR");
@@ -783,9 +814,41 @@ PvrdmaTester::runTimingQueues()
       }
       case TimingStage::Query:
         verifyResponse(pvrdma::Command::ModifyQp, 0x7070707070707070);
-        startQueryQp(0x8080808080808080);
-        timingStage = TimingStage::DestroyQp;
-        schedule(testEvent, curTick() + LongDelay);
+        if (testMode == "timing-observation") {
+            panic_if(read<uint32_t>(
+                         UarBarAddress + pvrdma::UarPageSize,
+                         MmioFlags) != 0,
+                     "PVRDMA BAR2 read was not deterministic");
+            postObservedRings(3, 5);
+            write(QpLeafAddress + pvrdma::PageSize,
+                  uint64_t{0x1122334455667788});
+            write(CqLeafAddress + pvrdma::PageSize,
+                  uint64_t{0x8877665544332211});
+            write(PayloadAddress, uint64_t{0xfeedfacecafebeef});
+            ringDoorbell(pvrdma::SqDoorbellAction);
+            ringDoorbell(pvrdma::SqDoorbellAction);
+            ringDoorbell(pvrdma::RqDoorbellAction);
+            ringDoorbell(pvrdma::CqPollAction, 1, true);
+            ringDoorbell(pvrdma::CqArmSolicitedAction, 1, true);
+            ringDoorbell(pvrdma::CqArmAnyAction, 1, true);
+            write(UarBarAddress + 2 * pvrdma::UarPageSize,
+                  htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+            write(UarBarAddress + pvrdma::UarPageSize,
+                  htole(pvrdma::SqDoorbellAction | 0x01000000 | 1),
+                  MmioFlags);
+            write(UarBarAddress + pvrdma::UarPageSize,
+                  htole(static_cast<uint16_t>(
+                      pvrdma::SqDoorbellAction | 1)), MmioFlags);
+            ringDoorbell(pvrdma::SqDoorbellAction, 2);
+            startQueryQp(0x8080808080808080);
+            timingStage = TimingStage::ObservationActive;
+        } else {
+            startQueryQp(0x8080808080808080);
+            timingStage = TimingStage::DestroyQp;
+        }
+        schedule(testEvent, curTick() +
+            (timingStage == TimingStage::ObservationActive ?
+                 microseconds(1) : LongDelay));
         return;
       case TimingStage::DestroyQp: {
         const auto response = verifyResponse(pvrdma::Command::QueryQp,
@@ -859,8 +922,194 @@ PvrdmaTester::runTimingQueues()
         inform("PVRDMA timing CQ/QP walk and RTS/query test passed");
         exitSimLoop("PVRDMA timing queue test passed");
         return;
+      case TimingStage::ObservationActive:
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != pvrdma::CommandError,
+                 "PVRDMA queued observation did not reject command");
+        postObservedRings(4, 6);
+        ringDoorbell(pvrdma::SqDoorbellAction);
+        ringDoorbell(pvrdma::RqDoorbellAction);
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Reset)), MmioFlags);
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != pvrdma::CommandError,
+                 "PVRDMA reset raced active queue DMA");
+        destroyQp();
+        timingStage = TimingStage::ObservationDone;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::ObservationDone: {
+        const auto rings = read<pvrdma::RingState>(QpLeafAddress);
+        const auto cq_ring = read<pvrdma::Ring>(
+            CqLeafAddress + offsetof(pvrdma::RingState, rx));
+        const uint32_t cause = read<uint32_t>(
+            RegisterBarAddress + pvrdma::RegInterruptCause, MmioFlags);
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != pvrdma::CommandError || cause ||
+                     letoh(rings.tx.producerTail) != 4 ||
+                     letoh(rings.tx.consumerHead) != 0 ||
+                     letoh(rings.rx.producerTail) != 6 ||
+                     letoh(rings.rx.consumerHead) != 0 ||
+                     cq_ring.producerTail || cq_ring.consumerHead ||
+                     read<uint64_t>(QpLeafAddress + pvrdma::PageSize) !=
+                         0x1122334455667788 ||
+                     read<uint64_t>(CqLeafAddress + pvrdma::PageSize) !=
+                         0x8877665544332211 ||
+                     read<uint64_t>(PayloadAddress) !=
+                         0xfeedfacecafebeef,
+                 "PVRDMA observation mutated guest-owned queue data");
+        const std::string prefix = "system.rdma.queues.";
+        panic_if(statValue(prefix + "sqDepth") != 32 ||
+                     statValue(prefix + "rqDepth") != 128 ||
+                     statValue(prefix + "cqDepth") != 64 ||
+                     statValue(prefix + "sqOutstanding") != 4 ||
+                     statValue(prefix + "rqAvailable") != 6 ||
+                     statValue(prefix + "cqOutstanding") != 0 ||
+                     statValue(prefix + "sqPosted") != 4 ||
+                     statValue(prefix + "rqPosted") != 6 ||
+                     statValue(prefix + "sqDoorbells") != 3 ||
+                     statValue(prefix + "rqDoorbells") != 2 ||
+                     statValue(prefix + "cqPollDoorbells") != 1 ||
+                     statValue(prefix + "cqArmDoorbells") != 2 ||
+                     statValue(prefix + "cqArmSolicitedDoorbells") != 1 ||
+                     statValue(prefix + "doorbellWritesRejected") != 5 ||
+                     statValue(prefix + "ringObservationsRejected") != 0 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA observation statistics mismatch");
+        auto malformed = rings;
+        malformed.tx.consumerHead = htole(uint32_t{1});
+        write(QpLeafAddress, malformed);
+        ringDoorbell(pvrdma::SqDoorbellAction);
+        timingStage = TimingStage::ObservationMalformed;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::ObservationMalformed: {
+        const std::string prefix = "system.rdma.queues.";
+        panic_if(statValue(prefix + "sqOutstanding") != 4 ||
+                     statValue(prefix + "sqPosted") != 4 ||
+                     statValue(prefix + "ringObservationsRejected") != 1 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA malformed observation changed queue shadow");
+        startModifyQp(0x9090909090909090, pvrdma::QpState::Reset,
+                      pvrdma::QpAttrState, {});
+        timingStage = TimingStage::ObservationReset;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      }
+      case TimingStage::ObservationReset: {
+        verifyResponse(pvrdma::Command::ModifyQp, 0x9090909090909090);
+        const std::string prefix = "system.rdma.queues.";
+        panic_if(statValue(prefix + "sqOutstanding") != 0 ||
+                     statValue(prefix + "rqAvailable") != 0 ||
+                     statValue(prefix + "sqResetDiscarded") != 4 ||
+                     statValue(prefix + "rqResetDiscarded") != 6 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA timing nonempty QP reset accounting mismatch");
+        inform("PVRDMA timing coherent queue observation test passed");
+        exitSimLoop("PVRDMA timing observation test passed");
+        return;
+      }
       default:
         panic("Invalid PVRDMA timing queue stage");
+    }
+}
+
+void
+PvrdmaTester::runStatsReset()
+{
+    panic_if(!system->isAtomicMode(),
+             "PVRDMA statistics test requires atomic mode");
+    const std::string prefix = "system.rdma.queues.";
+    switch (timingStage) {
+      case TimingStage::Configure:
+        configurePci();
+        configureDsr();
+        testCapabilities();
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Activate)), MmioFlags);
+        createUserParentAtomic();
+        createQueuePairAtomic(1);
+        moveQueuePairToRtsAtomic();
+        postObservedRings(3, 5);
+        ringDoorbell(pvrdma::SqDoorbellAction);
+        ringDoorbell(pvrdma::RqDoorbellAction);
+        timingStage = TimingStage::StatsPosted;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      case TimingStage::StatsPosted:
+        panic_if(statValue(prefix + "sqOutstanding") != 3 ||
+                     statValue(prefix + "rqAvailable") != 5,
+                 "PVRDMA pre-reset queue statistics mismatch");
+        statistics::reset();
+        panic_if(statValue(prefix + "sqOutstanding") != 3 ||
+                     statValue(prefix + "rqAvailable") != 5 ||
+                     statValue(prefix + "sqOutstandingAtReset") != 3 ||
+                     statValue(prefix + "rqAvailableAtReset") != 5 ||
+                     statValue(prefix + "sqPosted") != 0 ||
+                     statValue(prefix + "rqPosted") != 0,
+                 "PVRDMA statistics reset lost live occupancy");
+        timingStage = TimingStage::StatsAdvance;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      case TimingStage::StatsAdvance:
+        postObservedRings(5, 8);
+        ringDoorbell(pvrdma::SqDoorbellAction);
+        ringDoorbell(pvrdma::RqDoorbellAction);
+        timingStage = TimingStage::StatsDone;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::StatsDone: {
+        panic_if(statValue(prefix + "sqOutstanding") != 5 ||
+                     statValue(prefix + "rqAvailable") != 8 ||
+                     statValue(prefix + "sqPosted") != 2 ||
+                     statValue(prefix + "rqPosted") != 3 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA post-reset queue statistics mismatch");
+        startModifyQp(0x9009009009009009, pvrdma::QpState::Reset,
+                      pvrdma::QpAttrState, {});
+        verifyResponse(pvrdma::Command::ModifyQp, 0x9009009009009009);
+        panic_if(statValue(prefix + "sqOutstanding") != 0 ||
+                     statValue(prefix + "rqAvailable") != 0 ||
+                     statValue(prefix + "sqResetDiscarded") != 5 ||
+                     statValue(prefix + "rqResetDiscarded") != 8 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA nonempty QP reset accounting mismatch");
+        moveQueuePairToRtsAtomic();
+        postObservedRings(2, 4);
+        ringDoorbell(pvrdma::SqDoorbellAction);
+        ringDoorbell(pvrdma::RqDoorbellAction);
+        timingStage = TimingStage::StatsReposted;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+      }
+      case TimingStage::StatsReposted: {
+        destroyQp();
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != 0 ||
+                     statValue(prefix + "sqOutstanding") != 0 ||
+                     statValue(prefix + "rqAvailable") != 0 ||
+                     statValue(prefix + "sqResetDiscarded") != 7 ||
+                     statValue(prefix + "rqResetDiscarded") != 12 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA nonempty QP destroy accounting mismatch");
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Reset)), MmioFlags);
+        panic_if(statValue(prefix + "sqOutstanding") != 0 ||
+                     statValue(prefix + "rqAvailable") != 0 ||
+                     statValue(prefix + "sqResetDiscarded") != 7 ||
+                     statValue(prefix + "rqResetDiscarded") != 12 ||
+                     statValue(prefix + "conservationViolations") != 0,
+                 "PVRDMA device reset queue accounting mismatch");
+        inform("PVRDMA queue statistics/reset test passed");
+        exitSimLoop("PVRDMA queue statistics test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA statistics stage");
     }
 }
 
@@ -927,14 +1176,89 @@ PvrdmaTester::testCheckpointRestore()
 }
 
 void
+PvrdmaTester::testCheckpointObservationSave()
+{
+    panic_if(!system->isAtomicMode(),
+             "PVRDMA observation checkpoint setup requires atomic mode");
+    if (timingStage == TimingStage::Configure) {
+        configurePci();
+        configureDsr();
+        testCapabilities();
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(
+                  pvrdma::DeviceControl::Activate)), MmioFlags);
+        createUserParentAtomic();
+        createQueuePairAtomic(1);
+        moveQueuePairToRtsAtomic();
+        postObservedRings(5, 7);
+        ringDoorbell(pvrdma::SqDoorbellAction);
+        ringDoorbell(pvrdma::RqDoorbellAction);
+        ringDoorbell(pvrdma::CqArmAnyAction, 1, true);
+        timingStage = TimingStage::CheckpointObservationReady;
+        schedule(testEvent, curTick() + microseconds(10));
+        return;
+    }
+    panic_if(timingStage != TimingStage::CheckpointObservationReady,
+             "Invalid PVRDMA observation checkpoint stage");
+    const std::string prefix = "system.rdma.queues.";
+    panic_if(statValue(prefix + "sqOutstanding") != 5 ||
+                 statValue(prefix + "rqAvailable") != 7,
+             "PVRDMA checkpoint missed queue observations");
+    pvrdma::Ring cq_ring{};
+    cq_ring.producerTail = htole(uint32_t{3});
+    write(CqLeafAddress + offsetof(pvrdma::RingState, rx), cq_ring);
+    inform("PVRDMA nonempty queue observation checkpoint ready");
+    exitSimLoop("PVRDMA observation checkpoint save ready");
+}
+
+void
+PvrdmaTester::testCheckpointObservationRestore()
+{
+    panic_if(!system->isAtomicMode(),
+             "PVRDMA observation checkpoint restore requires atomic mode");
+    const std::string prefix = "system.rdma.queues.";
+    panic_if(statValue(prefix + "sqOutstanding") != 5 ||
+                 statValue(prefix + "rqAvailable") != 7 ||
+                 statValue(prefix + "cqOutstanding") != 3 ||
+                 statValue(prefix + "sqOutstandingAtReset") != 5 ||
+                 statValue(prefix + "rqAvailableAtReset") != 7 ||
+                 statValue(prefix + "cqOutstandingAtReset") != 3,
+             "PVRDMA restored queue baselines were incorrect");
+    destroyQp();
+    panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                            MmioFlags) != 0 ||
+                 statValue(prefix + "sqOutstanding") != 0 ||
+                 statValue(prefix + "rqAvailable") != 0 ||
+                 statValue(prefix + "sqResetDiscarded") != 5 ||
+                 statValue(prefix + "rqResetDiscarded") != 7 ||
+                 statValue(prefix + "cqOutstanding") != 3 ||
+                 statValue(prefix + "conservationViolations") != 0,
+             "Restored nonempty PVRDMA QP destroy accounting failed");
+    destroyCq();
+    panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                            MmioFlags) != 0 ||
+                 statValue(prefix + "cqOutstanding") != 0 ||
+                 statValue(prefix + "cqResetDiscarded") != 3 ||
+                 statValue(prefix + "conservationViolations") != 0,
+             "Restored nonempty PVRDMA CQ destroy accounting failed");
+    inform("PVRDMA nonempty queue observation checkpoint restored");
+    exitSimLoop("PVRDMA observation checkpoint restored");
+}
+
+void
 PvrdmaTester::run()
 {
     if (testMode == "timing-mr") {
         runTimingMr();
         return;
     }
-    if (testMode == "timing-queues") {
+    if (testMode == "timing-queues" ||
+        testMode == "timing-observation") {
         runTimingQueues();
+        return;
+    }
+    if (testMode == "stats-reset") {
+        runStatsReset();
         return;
     }
     if (testMode == "checkpoint-save") {
@@ -943,6 +1267,14 @@ PvrdmaTester::run()
     }
     if (testMode == "checkpoint-restore") {
         testCheckpointRestore();
+        return;
+    }
+    if (testMode == "checkpoint-observation-save") {
+        testCheckpointObservationSave();
+        return;
+    }
+    if (testMode == "checkpoint-observation-restore") {
+        testCheckpointObservationRestore();
         return;
     }
 

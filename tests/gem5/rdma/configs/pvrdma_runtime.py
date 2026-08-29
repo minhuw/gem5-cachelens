@@ -2,6 +2,7 @@
 
 import argparse
 from pathlib import Path
+import re
 
 import m5
 from m5.objects import (
@@ -23,8 +24,12 @@ parser.add_argument(
     choices=(
         "timing-mr",
         "timing-queues",
+        "timing-observation",
+        "stats-reset",
         "checkpoint-save",
         "checkpoint-restore",
+        "checkpoint-observation-save",
+        "checkpoint-observation-restore",
     ),
     required=True,
 )
@@ -69,7 +74,7 @@ system.rdma.dma = system.bus.cpu_side_ports
 
 root = Root(full_system=False, system=system)
 m5.instantiate(
-    args.checkpoint.as_posix() if args.mode == "checkpoint-restore" else None
+    args.checkpoint.as_posix() if args.mode.endswith("-restore") else None
 )
 exit_event = m5.simulate()
 
@@ -79,11 +84,38 @@ if args.mode == "timing-mr":
 elif args.mode == "timing-queues":
     assert exit_event.getCause() == "PVRDMA timing queue test passed"
     print("PVRDMA_TIMING_QUEUES_OK")
+elif args.mode == "timing-observation":
+    assert exit_event.getCause() == "PVRDMA timing observation test passed"
+    print("PVRDMA_TIMING_OBSERVATION_OK")
+elif args.mode == "stats-reset":
+    assert exit_event.getCause() == "PVRDMA queue statistics test passed"
+    m5.stats.dump()
+    stats = (Path(m5.options.outdir) / "stats.txt").read_text()
+
+    def stat(name):
+        match = re.search(rf"^system\.rdma\.queues\.{name}\s+(\S+)",
+                          stats, re.MULTILINE)
+        assert match, name
+        return float(match.group(1))
+
+    assert abs(stat("sqOccupancy::mean") - 3.7499) < 0.00001
+    assert stat("sqOccupancy::max_value") == 5
+    assert abs(stat("rqOccupancy::mean") - 6.24965) < 0.00001
+    assert stat("rqOccupancy::max_value") == 8
+    print("PVRDMA_STATS_RESET_OK")
 elif args.mode == "checkpoint-save":
     assert exit_event.getCause() == "PVRDMA checkpoint save ready"
     args.checkpoint.mkdir(parents=True, exist_ok=True)
     m5.checkpoint(args.checkpoint.as_posix())
     print("PVRDMA_CHECKPOINT_SAVED")
-else:
+elif args.mode == "checkpoint-restore":
     assert exit_event.getCause() == "PVRDMA checkpoint restore test passed"
     print("PVRDMA_CHECKPOINT_RESTORED")
+elif args.mode == "checkpoint-observation-save":
+    assert exit_event.getCause() == "PVRDMA observation checkpoint save ready"
+    args.checkpoint.mkdir(parents=True, exist_ok=True)
+    m5.checkpoint(args.checkpoint.as_posix())
+    print("PVRDMA_OBSERVATION_CHECKPOINT_SAVED")
+else:
+    assert exit_event.getCause() == "PVRDMA observation checkpoint restored"
+    print("PVRDMA_OBSERVATION_CHECKPOINT_RESTORED")

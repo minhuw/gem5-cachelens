@@ -777,6 +777,8 @@ TEST(PvrdmaControlTest, CheckpointsOnlyStableIdleState)
     EXPECT_TRUE(checkpointStable(ControlState::Ready, false));
     EXPECT_TRUE(checkpointStable(ControlState::Active, false));
     EXPECT_FALSE(checkpointStable(ControlState::Active, true));
+    EXPECT_FALSE(checkpointStable(ControlState::Active, false, true));
+    EXPECT_FALSE(checkpointStable(ControlState::Active, false, false, true));
     EXPECT_FALSE(checkpointStable(ControlState::ReadingDsr, false));
     EXPECT_FALSE(checkpointStable(ControlState::WritingCaps, false));
     EXPECT_FALSE(checkpointStable(ControlState::ReadingCommand, false));
@@ -1147,11 +1149,17 @@ TEST(PvrdmaCqTest, EnforcesDependenciesAndReusesDirectHandles)
     EXPECT_EQ(processCommand(request, response, gids, gid_valid, objects,
                              mrs, cqs, qps, {}).error, CommandError);
     request.destroyCq.reserved[0] = 0;
+    cqs.entries[1].producerTail = 3;
+    cqs.entries[1].armFlags = static_cast<uint32_t>(CqArmMode::Any);
     auto result = processCommand(request, response, gids, gid_valid, objects,
                                  mrs, cqs, qps, {});
     EXPECT_FALSE(result.hasResponse);
     EXPECT_EQ(result.error, 0);
     EXPECT_EQ(objects.contextCqChildren[1], 0);
+    EXPECT_EQ(cqs.entries[1].producerTail, 0);
+    EXPECT_EQ(cqs.entries[1].consumerHead, 0);
+    EXPECT_EQ(cqs.entries[1].armFlags, 0);
+    EXPECT_EQ(cqs.entries[1].generation, 1);
 
     ASSERT_TRUE(buildCq(cqRequest(64), objects, cqs, build));
     EXPECT_EQ(build.slot, 1);
@@ -1255,6 +1263,8 @@ TEST(PvrdmaQpTest, TracksDependenciesDirectHandleAndGenerationSafeQpn)
     EXPECT_FALSE(result.hasResponse);
     EXPECT_EQ(result.error, CommandError);
     request.destroyQp.reserved[0] = 0;
+    qps.entries[1].sqProducerTail = 3;
+    qps.entries[1].rqProducerTail = 5;
     result = processCommand(request, response, gids, gid_valid, objects,
                             mrs, cqs, qps, {});
     EXPECT_FALSE(result.hasResponse);
@@ -1352,7 +1362,7 @@ TEST(PvrdmaQpTest, ReachesRtsQueriesStoredAttributesAndResets)
     EXPECT_TRUE(validQueueObjects(cqs, qps, MemoryRegionTable{}, objects));
 }
 
-TEST(PvrdmaQpTest, RejectsInvalidMasksTransitionsValuesAndBusyReset)
+TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
 {
     ObjectTables objects{};
     setupUserParent(objects);
@@ -1453,10 +1463,16 @@ TEST(PvrdmaQpTest, RejectsInvalidMasksTransitionsValuesAndBusyReset)
     ASSERT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, 0);
 
-    qps.entries[1].sqProducerTail = 1;
+    qps.entries[1].sqProducerTail = 3;
+    qps.entries[1].rqProducerTail = 5;
     QpAttr reset{};
     EXPECT_EQ(modify(qps, QpState::Reset, QpAttrState,
-                     reset, response).error, CommandError);
+                     reset, response).error, 0);
+    EXPECT_EQ(qps.entries[1].state, QpState::Reset);
+    EXPECT_EQ(qps.entries[1].sqProducerTail, 0);
+    EXPECT_EQ(qps.entries[1].sqConsumerHead, 0);
+    EXPECT_EQ(qps.entries[1].rqProducerTail, 0);
+    EXPECT_EQ(qps.entries[1].rqConsumerHead, 0);
 }
 
 TEST(PvrdmaQpTest, ValidatesRestoreCountersGeometryStateAndGeneration)
@@ -1521,6 +1537,194 @@ TEST(PvrdmaQpTest, ValidatesRestoreCountersGeometryStateAndGeneration)
     cqs.reset();
     objects.contextCqChildren = {};
     EXPECT_EQ(qps.entries[1].generation, 0);
+}
+
+TEST(PvrdmaDoorbellTest, DecodesOnlyExactLittleEndianAbiEncodings)
+{
+    Doorbell doorbell;
+    const uint64_t qp = 3 * UarPageSize + QpDoorbellOffset;
+    const uint64_t cq = 3 * UarPageSize + CqDoorbellOffset;
+
+    ASSERT_TRUE(decodeDoorbell(qp, 4, SqDoorbellAction | 7, doorbell));
+    EXPECT_EQ(doorbell.action, DoorbellAction::Sq);
+    EXPECT_EQ(doorbell.handle, 7);
+    EXPECT_EQ(doorbell.uar, 3);
+    ASSERT_TRUE(decodeDoorbell(qp, 4, RqDoorbellAction | 7, doorbell));
+    EXPECT_EQ(doorbell.action, DoorbellAction::Rq);
+    ASSERT_TRUE(decodeDoorbell(cq, 4, CqPollAction | 7, doorbell));
+    EXPECT_EQ(doorbell.action, DoorbellAction::CqPoll);
+    ASSERT_TRUE(decodeDoorbell(cq, 4,
+                               CqArmSolicitedAction | 7, doorbell));
+    EXPECT_EQ(doorbell.action, DoorbellAction::CqArmSolicited);
+    ASSERT_TRUE(decodeDoorbell(cq, 4, CqArmAnyAction | 7, doorbell));
+    EXPECT_EQ(doorbell.action, DoorbellAction::CqArmAny);
+
+    EXPECT_FALSE(decodeDoorbell(qp, 1, SqDoorbellAction | 7, doorbell));
+    EXPECT_FALSE(decodeDoorbell(qp, 8, SqDoorbellAction | 7, doorbell));
+    EXPECT_FALSE(decodeDoorbell(qp + 1, 4,
+                                SqDoorbellAction | 7, doorbell));
+    EXPECT_FALSE(decodeDoorbell(qp, 4, SqDoorbellAction, doorbell));
+    EXPECT_FALSE(decodeDoorbell(qp, 4,
+        SqDoorbellAction | ObjectTableEntries, doorbell));
+    EXPECT_FALSE(decodeDoorbell(qp, 4,
+        SqDoorbellAction | RqDoorbellAction | 7, doorbell));
+    EXPECT_FALSE(decodeDoorbell(cq, 4,
+        CqArmSolicitedAction | CqArmAnyAction | 7, doorbell));
+    EXPECT_FALSE(decodeDoorbell(qp, 4,
+        SqDoorbellAction | 0x01000000 | 7, doorbell));
+}
+
+TEST(PvrdmaDoorbellTest, ValidatesLiveHandleUarAndQpState)
+{
+    CompletionQueueTable cqs{};
+    QueuePairTable qps{};
+    auto &cq = cqs.entries[1];
+    cq.valid = true;
+    cq.cqHandle = 1;
+    cq.uar = 2;
+    auto &qp = qps.entries[1];
+    qp.valid = true;
+    qp.qpHandle = 1;
+    qp.uar = 2;
+    qp.state = QpState::ReadyToSend;
+    Doorbell doorbell;
+
+    ASSERT_TRUE(decodeDoorbell(2 * UarPageSize, 4,
+                               SqDoorbellAction | 1, doorbell));
+    EXPECT_TRUE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+    qp.state = QpState::ReadyToReceive;
+    EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+    ASSERT_TRUE(decodeDoorbell(2 * UarPageSize, 4,
+                               RqDoorbellAction | 1, doorbell));
+    EXPECT_TRUE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+    qp.state = QpState::Reset;
+    EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+    qp.state = QpState::ReadyToSend;
+    ASSERT_TRUE(decodeDoorbell(3 * UarPageSize, 4,
+                               RqDoorbellAction | 1, doorbell));
+    EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+    qps.entries[1].valid = false;
+    EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+
+    ASSERT_TRUE(decodeDoorbell(2 * UarPageSize + CqDoorbellOffset, 4,
+                               CqPollAction | 1, doorbell));
+    EXPECT_TRUE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+    EXPECT_FALSE(validDoorbell(doorbell, ControlState::Ready, cqs, qps));
+    cqs.entries[1].valid = false;
+    EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+}
+
+TEST(PvrdmaDoorbellTest, BlocksOnlyQueueDestroyAndResetTargets)
+{
+    CommandRequest request{};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyQp));
+    request.destroyQp.qpHandle = htole(uint32_t{5});
+    EXPECT_TRUE(queueCommandTargetBusy(request, uint64_t{1} << 5, 0));
+    EXPECT_FALSE(queueCommandTargetBusy(request, uint64_t{1} << 4, 0));
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::DestroyCq));
+    request.destroyCq.cqHandle = htole(uint32_t{6});
+    EXPECT_TRUE(queueCommandTargetBusy(request, 0, uint64_t{1} << 6));
+
+    request = {};
+    request.header.command = htole(
+        static_cast<uint32_t>(Command::ModifyQp));
+    request.modifyQp.qpHandle = htole(uint32_t{5});
+    request.modifyQp.attributes.qpState = static_cast<QpState>(
+        htole(static_cast<uint32_t>(QpState::Reset)));
+    EXPECT_TRUE(queueCommandTargetBusy(request, uint64_t{1} << 5, 0));
+    request.modifyQp.attributes.qpState = static_cast<QpState>(
+        htole(static_cast<uint32_t>(QpState::ReadyToSend)));
+    EXPECT_FALSE(queueCommandTargetBusy(request, uint64_t{1} << 5, 0));
+}
+
+TEST(PvrdmaObservationTest, AcceptsProducerAdvanceWrapFullAndDuplicates)
+{
+    uint32_t producer = 0;
+    uint32_t delta = 99;
+    Ring observed{htole(uint32_t{8}), htole(uint32_t{0})};
+    ASSERT_TRUE(observeProducer(observed, 8, producer, 0, delta));
+    EXPECT_EQ(producer, 8);
+    EXPECT_EQ(delta, 8);
+    delta = 99;
+    ASSERT_TRUE(observeProducer(observed, 8, producer, 0, delta));
+    EXPECT_EQ(delta, 0);
+
+    producer = 14;
+    observed = {htole(uint32_t{1}), htole(uint32_t{12})};
+    ASSERT_TRUE(observeProducer(observed, 8, producer, 12, delta));
+    EXPECT_EQ(producer, 1);
+    EXPECT_EQ(delta, 3);
+}
+
+TEST(PvrdmaObservationTest, RejectsMalformedProducerSnapshotsAtomically)
+{
+    uint32_t producer = 4;
+    uint32_t delta = 99;
+    Ring observed{htole(uint32_t{5}), htole(uint32_t{1})};
+    EXPECT_FALSE(observeProducer(observed, 8, producer, 0, delta));
+    EXPECT_EQ(producer, 4);
+    EXPECT_EQ(delta, 99);
+
+    observed = {htole(uint32_t{9}), htole(uint32_t{0})};
+    EXPECT_FALSE(observeProducer(observed, 8, producer, 0, delta));
+    EXPECT_EQ(producer, 4);
+    observed = {htole(uint32_t{16}), htole(uint32_t{0})};
+    EXPECT_FALSE(observeProducer(observed, 8, producer, 0, delta));
+    EXPECT_EQ(producer, 4);
+}
+
+TEST(PvrdmaObservationTest, AcceptsOnlyBoundedCqConsumerReclamation)
+{
+    uint32_t consumer = 6;
+    uint32_t delta = 99;
+    Ring observed{htole(uint32_t{10}), htole(uint32_t{9})};
+    ASSERT_TRUE(observeConsumer(observed, 8, 10, consumer, delta));
+    EXPECT_EQ(consumer, 9);
+    EXPECT_EQ(delta, 3);
+
+    observed = {htole(uint32_t{11}), htole(uint32_t{10})};
+    EXPECT_FALSE(observeConsumer(observed, 8, 10, consumer, delta));
+    EXPECT_EQ(consumer, 9);
+    observed = {htole(uint32_t{10}), htole(uint32_t{15})};
+    EXPECT_FALSE(observeConsumer(observed, 8, 10, consumer, delta));
+    EXPECT_EQ(consumer, 9);
+}
+
+TEST(PvrdmaObservationTest, ValidatesNonemptyRestoredQueueSnapshots)
+{
+    ObjectTables objects{};
+    setupUserParent(objects);
+    CompletionQueueTable cqs{};
+    CompletionQueueBuild cq_build{};
+    ASSERT_TRUE(buildCq(cqRequest(64), objects, cqs, cq_build));
+    ASSERT_TRUE(cqs.commit(std::move(cq_build), objects));
+    QueuePairTable qps{};
+    QueuePairBuild qp_build{};
+    ASSERT_TRUE(buildQp(qpRequest(32, 128), objects, cqs, qps, qp_build));
+    ASSERT_TRUE(qps.commit(std::move(qp_build), objects, cqs));
+    MemoryRegionTable mrs{};
+
+    qps.entries[1].state = QpState::Init;
+    qps.entries[1].attributes.qpState = QpState::Init;
+    qps.entries[1].attributes.currentQpState = QpState::Init;
+    qps.entries[1].attributes.qpAccessFlags = AccessLocalWrite;
+    qps.entries[1].attributes.portNumber = 1;
+    qps.entries[1].sqProducerTail = 7;
+    qps.entries[1].rqProducerTail = 9;
+    cqs.entries[1].producerTail = 5;
+    cqs.entries[1].consumerHead = 2;
+    cqs.entries[1].armFlags = static_cast<uint32_t>(CqArmMode::Any);
+    EXPECT_TRUE(validQueueObjects(cqs, qps, mrs, objects));
+
+    qps.entries[1].sqProducerTail = 33;
+    EXPECT_FALSE(validQueueObjects(cqs, qps, mrs, objects));
+    qps.entries[1].sqProducerTail = 7;
+    cqs.entries[1].consumerHead = 63;
+    EXPECT_FALSE(validQueueObjects(cqs, qps, mrs, objects));
 }
 
 } // namespace pvrdma

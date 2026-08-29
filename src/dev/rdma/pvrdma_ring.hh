@@ -57,6 +57,23 @@ ringIndicesValid(uint32_t producerTail, uint32_t consumerHead,
            ringIndexValid(consumerHead, entries);
 }
 
+constexpr int32_t
+ringForwardDistance(uint32_t newer, uint32_t older, uint32_t entries)
+{
+    return ringIndicesValid(newer, older, entries) ?
+        static_cast<int32_t>((newer - older) & ((entries << 1) - 1)) :
+        InvalidRingIndex;
+}
+
+constexpr bool
+ringSnapshotValid(uint32_t producerTail, uint32_t consumerHead,
+                  uint32_t entries)
+{
+    const int32_t occupancy = ringForwardDistance(
+        producerTail, consumerHead, entries);
+    return occupancy >= 0 && static_cast<uint32_t>(occupancy) <= entries;
+}
+
 constexpr uint32_t
 ringSlot(uint32_t index, uint32_t entries)
 {

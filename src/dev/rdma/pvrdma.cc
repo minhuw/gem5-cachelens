@@ -2,6 +2,8 @@
 
 #include "dev/rdma/pvrdma.hh"
 
+#include <cstring>
+
 #include "base/logging.hh"
 #include "mem/packet_access.hh"
 #include "sim/serialize.hh"
@@ -9,8 +11,79 @@
 namespace gem5
 {
 
+Pvrdma::QueueStats::QueueStats(Pvrdma &parent)
+    : statistics::Group(&parent, "queues"), device(parent),
+      ADD_STAT(sqDepth, statistics::units::Count::get(),
+               "Aggregate live SQ depth"),
+      ADD_STAT(rqDepth, statistics::units::Count::get(),
+               "Aggregate live RQ depth"),
+      ADD_STAT(cqDepth, statistics::units::Count::get(),
+               "Aggregate live CQ depth"),
+      ADD_STAT(sqOutstanding, statistics::units::Count::get(),
+               "Observed outstanding SQ entries"),
+      ADD_STAT(rqAvailable, statistics::units::Count::get(),
+               "Observed available RQ entries"),
+      ADD_STAT(cqOutstanding, statistics::units::Count::get(),
+               "Observed outstanding CQ entries"),
+      ADD_STAT(sqOutstandingAtReset, statistics::units::Count::get(),
+               "SQ occupancy at statistics reset"),
+      ADD_STAT(rqAvailableAtReset, statistics::units::Count::get(),
+               "RQ occupancy at statistics reset"),
+      ADD_STAT(cqOutstandingAtReset, statistics::units::Count::get(),
+               "CQ occupancy at statistics reset"),
+      ADD_STAT(sqPosted, statistics::units::Count::get(),
+               "Observed SQ producer advances"),
+      ADD_STAT(rqPosted, statistics::units::Count::get(),
+               "Observed RQ producer advances"),
+      ADD_STAT(cqReclaimed, statistics::units::Count::get(),
+               "Observed CQ consumer advances"),
+      ADD_STAT(sqResetDiscarded, statistics::units::Count::get(),
+               "SQ occupancy discarded by reset or removal"),
+      ADD_STAT(rqResetDiscarded, statistics::units::Count::get(),
+               "RQ occupancy discarded by reset or removal"),
+      ADD_STAT(cqResetDiscarded, statistics::units::Count::get(),
+               "CQ occupancy discarded by reset or removal"),
+      ADD_STAT(doorbellWrites, statistics::units::Count::get(),
+               "BAR2 doorbell writes"),
+      ADD_STAT(sqDoorbells, statistics::units::Count::get(),
+               "Accepted SQ doorbells"),
+      ADD_STAT(rqDoorbells, statistics::units::Count::get(),
+               "Accepted RQ doorbells"),
+      ADD_STAT(cqPollDoorbells, statistics::units::Count::get(),
+               "Accepted CQ poll doorbells"),
+      ADD_STAT(cqArmDoorbells, statistics::units::Count::get(),
+               "Accepted CQ arm doorbells"),
+      ADD_STAT(cqArmSolicitedDoorbells, statistics::units::Count::get(),
+               "Accepted solicited-only CQ arm doorbells"),
+      ADD_STAT(doorbellWritesRejected, statistics::units::Count::get(),
+               "Rejected BAR2 accesses"),
+      ADD_STAT(ringObservationsRejected, statistics::units::Count::get(),
+               "Rejected coherent ring snapshots"),
+      ADD_STAT(conservationViolations, statistics::units::Count::get(),
+               "Queue accounting conservation violations"),
+      ADD_STAT(sqOccupancy, statistics::units::Count::get(),
+               "Time-weighted aggregate SQ occupancy"),
+      ADD_STAT(rqOccupancy, statistics::units::Count::get(),
+               "Time-weighted aggregate RQ occupancy"),
+      ADD_STAT(cqOccupancy, statistics::units::Count::get(),
+               "Time-weighted aggregate CQ occupancy")
+{
+    sqOccupancy.init(0, 65534, 255);
+    rqOccupancy.init(0, 65534, 255);
+    cqOccupancy.init(0, 65534, 255);
+}
+
+void
+Pvrdma::QueueStats::preDumpStats()
+{
+    statistics::Group::preDumpStats();
+    device.sampleQueueOccupancy();
+    device.checkQueueConservation();
+}
+
 Pvrdma::Pvrdma(const Params &p)
     : PciDevice(p), controlCompletionLatency(p.control_completion_latency),
+      queueStats(*this),
       dsrReadEvent([this] { dsrReadDone(); }, name() + ".dsrRead"),
       capsWriteEvent([this] { capsWriteDone(); }, name() + ".capsWrite"),
       commandReadEvent([this] { commandReadDone(); }, name() + ".commandRead"),
@@ -19,7 +92,10 @@ Pvrdma::Pvrdma(const Params &p)
       objectTableReadEvent([this] { objectTableReadDone(); },
                            name() + ".objectTableRead"),
       responseWriteEvent([this] { responseWriteDone(); },
-                         name() + ".responseWrite")
+                         name() + ".responseWrite"),
+      observationEvent([this] { startObservation(); },
+                       name() + ".queueObservation"),
+      queueDmaEvent([this] { queueDmaDone(); }, name() + ".queueDma")
 {
     const auto *mac = p.hardware_address.bytes();
     regs.macLow = static_cast<uint32_t>(mac[0]) |
@@ -30,6 +106,15 @@ Pvrdma::Pvrdma(const Params &p)
                    (static_cast<uint32_t>(mac[5]) << 8);
     regs.reset();
     capabilities = pvrdma::makeCapabilities(regs.macLow, regs.macHigh);
+    queueStatsReset();
+    statistics::registerResetCallback([this] { queueStatsReset(); });
+}
+
+void
+Pvrdma::startup()
+{
+    PciDevice::startup();
+    queueStatsReset();
 }
 
 Tick
@@ -39,6 +124,12 @@ Pvrdma::read(PacketPtr pkt)
     Addr offset;
     panic_if(!getBAR(pkt->getAddr(), bar, offset),
              "PVRDMA read from unmapped PCI address %#x", pkt->getAddr());
+    if (bar == pvrdma::UarBar) {
+        std::memset(pkt->getPtr<uint8_t>(), 0, pkt->getSize());
+        queueStats.doorbellWritesRejected++;
+        pkt->makeAtomicResponse();
+        return pioDelay;
+    }
     panic_if(bar != pvrdma::RegisterBar,
              "PVRDMA datapath BAR%d read is not implemented", bar);
     panic_if(!pvrdma::validRegisterAccess(offset, pkt->getSize()),
@@ -86,6 +177,11 @@ Pvrdma::write(PacketPtr pkt)
     Addr offset;
     panic_if(!getBAR(pkt->getAddr(), bar, offset),
              "PVRDMA write to unmapped PCI address %#x", pkt->getAddr());
+    if (bar == pvrdma::UarBar) {
+        writeDoorbell(offset, pkt);
+        pkt->makeAtomicResponse();
+        return pioDelay;
+    }
     panic_if(bar != pvrdma::RegisterBar,
              "PVRDMA datapath BAR%d write is not implemented", bar);
     panic_if(!pvrdma::validRegisterAccess(offset, pkt->getSize()),
@@ -139,6 +235,342 @@ Pvrdma::write(PacketPtr pkt)
 
     pkt->makeAtomicResponse();
     return delay;
+}
+
+bool
+Pvrdma::observationQueued() const
+{
+    return sqDirty || rqDirty || cqDirty || observationEvent.scheduled();
+}
+
+bool
+Pvrdma::commandBlockedByObservation() const
+{
+    return observationQueued() || queueDma.active();
+}
+
+bool
+Pvrdma::validDoorbell(const pvrdma::Doorbell &doorbell) const
+{
+    return pvrdma::validDoorbell(doorbell, controlState, completionQueues,
+                                 queuePairs);
+}
+
+void
+Pvrdma::writeDoorbell(uint64_t offset, PacketPtr pkt)
+{
+    queueStats.doorbellWrites++;
+    pvrdma::Doorbell doorbell;
+    if (pkt->getSize() != sizeof(uint32_t) ||
+        !pvrdma::decodeDoorbell(offset, pkt->getSize(),
+                               pkt->getLE<uint32_t>(), doorbell) ||
+        !validDoorbell(doorbell)) {
+        queueStats.doorbellWritesRejected++;
+        return;
+    }
+
+    switch (doorbell.action) {
+      case pvrdma::DoorbellAction::Sq:
+        queueStats.sqDoorbells++;
+        break;
+      case pvrdma::DoorbellAction::Rq:
+        queueStats.rqDoorbells++;
+        break;
+      case pvrdma::DoorbellAction::CqPoll:
+        queueStats.cqPollDoorbells++;
+        break;
+      case pvrdma::DoorbellAction::CqArmSolicited:
+        queueStats.cqArmDoorbells++;
+        queueStats.cqArmSolicitedDoorbells++;
+        completionQueues.entries[doorbell.handle].armFlags =
+            static_cast<uint32_t>(pvrdma::CqArmMode::Solicited);
+        break;
+      case pvrdma::DoorbellAction::CqArmAny:
+        queueStats.cqArmDoorbells++;
+        completionQueues.entries[doorbell.handle].armFlags =
+            static_cast<uint32_t>(pvrdma::CqArmMode::Any);
+        break;
+      default:
+        panic("PVRDMA accepted invalid doorbell action");
+    }
+    markDirty(pvrdma::queueKind(doorbell.action), doorbell.handle);
+}
+
+void
+Pvrdma::markDirty(pvrdma::QueueKind kind, uint32_t handle)
+{
+    const uint64_t bit = uint64_t{1} << handle;
+    if (kind == pvrdma::QueueKind::Sq)
+        sqDirty |= bit;
+    else if (kind == pvrdma::QueueKind::Rq)
+        rqDirty |= bit;
+    else
+        cqDirty |= bit;
+    scheduleObservation();
+}
+
+void
+Pvrdma::scheduleObservation()
+{
+    if (controlState == pvrdma::ControlState::Active &&
+        !queueDma.active() && observationQueued() &&
+        !observationEvent.scheduled())
+        schedule(observationEvent, nextCycle());
+}
+
+bool
+Pvrdma::selectObservation()
+{
+    for (uint32_t i = 0; i < 3 * pvrdma::ObjectTableEntries; ++i) {
+        const uint32_t index = (observationCursor + i) %
+            (3 * pvrdma::ObjectTableEntries);
+        const uint32_t handle = index % pvrdma::ObjectTableEntries;
+        if (!handle)
+            continue;
+        const auto kind = static_cast<pvrdma::QueueKind>(
+            index / pvrdma::ObjectTableEntries + 1);
+        uint64_t *mask = kind == pvrdma::QueueKind::Sq ? &sqDirty :
+            kind == pvrdma::QueueKind::Rq ? &rqDirty : &cqDirty;
+        const uint64_t bit = uint64_t{1} << handle;
+        if (!(*mask & bit))
+            continue;
+        *mask &= ~bit;
+        observationCursor = (index + 1) %
+            (3 * pvrdma::ObjectTableEntries);
+        queueDma.kind = kind;
+        queueDma.handle = handle;
+        if (kind == pvrdma::QueueKind::Cq) {
+            const auto &cq = completionQueues.entries[handle];
+            queueDma.generation = cq.generation;
+            queueDma.uar = cq.uar;
+            queueDma.depth = cq.cqe;
+            queueDma.ringAddress = cq.pages.empty() ? 0 :
+                cq.pages[0] + offsetof(pvrdma::RingState, rx);
+        } else {
+            const auto &qp = queuePairs.entries[handle];
+            queueDma.generation = qp.generation;
+            queueDma.uar = qp.uar;
+            queueDma.depth = kind == pvrdma::QueueKind::Sq ?
+                qp.capabilities.maxSendWr : qp.capabilities.maxRecvWr;
+            queueDma.ringAddress = qp.pages.empty() ? 0 : qp.pages[0] +
+                (kind == pvrdma::QueueKind::Sq ?
+                     offsetof(pvrdma::RingState, tx) :
+                     offsetof(pvrdma::RingState, rx));
+        }
+        return true;
+    }
+    return false;
+}
+
+bool
+Pvrdma::revalidateObservation() const
+{
+    const auto kind = queueDma.kind;
+    const uint32_t handle = queueDma.handle;
+    if (!handle || handle >= pvrdma::ObjectTableEntries)
+        return false;
+    if (kind == pvrdma::QueueKind::Cq) {
+        const auto &cq = completionQueues.entries[handle];
+        return cq.valid && cq.cqHandle == handle &&
+            cq.generation == queueDma.generation &&
+            cq.uar == queueDma.uar && cq.cqe == queueDma.depth &&
+            !cq.pages.empty() && queueDma.ringAddress ==
+                cq.pages[0] + offsetof(pvrdma::RingState, rx);
+    }
+    const auto &qp = queuePairs.entries[handle];
+    const uint32_t depth = kind == pvrdma::QueueKind::Sq ?
+        qp.capabilities.maxSendWr : qp.capabilities.maxRecvWr;
+    const uint64_t address = qp.pages.empty() ? 0 : qp.pages[0] +
+        (kind == pvrdma::QueueKind::Sq ?
+             offsetof(pvrdma::RingState, tx) :
+             offsetof(pvrdma::RingState, rx));
+    return qp.valid && qp.qpHandle == handle &&
+        qp.generation == queueDma.generation && qp.uar == queueDma.uar &&
+        depth == queueDma.depth && address == queueDma.ringAddress &&
+        (kind == pvrdma::QueueKind::Sq ?
+             qp.state == pvrdma::QpState::ReadyToSend :
+             qp.state != pvrdma::QpState::Reset);
+}
+
+void
+Pvrdma::startObservation()
+{
+    if (controlState != pvrdma::ControlState::Active ||
+        queueDma.active() || !selectObservation())
+        return;
+    if (!revalidateObservation() || !queueDma.ringAddress) {
+        queueStats.ringObservationsRejected++;
+        finishObservation();
+        return;
+    }
+
+    queueDma.ring = {};
+    dmaRead(pciToDma(queueDma.ringAddress), sizeof(queueDma.ring),
+            sys->isAtomicMode() ? nullptr : &queueDmaEvent,
+            reinterpret_cast<uint8_t *>(&queueDma.ring));
+    if (sys->isAtomicMode())
+        queueDmaDone();
+}
+
+void
+Pvrdma::queueDmaDone()
+{
+    uint32_t delta = 0;
+    bool accepted = revalidateObservation();
+    if (accepted && queueDma.kind == pvrdma::QueueKind::Cq) {
+        auto &cq = completionQueues.entries[queueDma.handle];
+        uint32_t consumer = cq.consumerHead;
+        accepted = pvrdma::observeConsumer(
+            queueDma.ring, cq.cqe, cq.producerTail, consumer, delta);
+        if (accepted && delta) {
+            sampleQueueOccupancy();
+            cq.consumerHead = consumer;
+            queueStats.cqReclaimed += delta;
+        }
+    } else if (accepted) {
+        auto &qp = queuePairs.entries[queueDma.handle];
+        uint32_t &stored_producer = queueDma.kind == pvrdma::QueueKind::Sq ?
+            qp.sqProducerTail : qp.rqProducerTail;
+        const uint32_t consumer = queueDma.kind == pvrdma::QueueKind::Sq ?
+            qp.sqConsumerHead : qp.rqConsumerHead;
+        uint32_t producer = stored_producer;
+        accepted = pvrdma::observeProducer(
+            queueDma.ring, queueDma.depth, producer, consumer, delta);
+        if (accepted && delta) {
+            sampleQueueOccupancy();
+            stored_producer = producer;
+            if (queueDma.kind == pvrdma::QueueKind::Sq)
+                queueStats.sqPosted += delta;
+            else
+                queueStats.rqPosted += delta;
+        }
+    }
+
+    if (!accepted) {
+        queueStats.ringObservationsRejected++;
+    } else if (delta) {
+        refreshQueueGauges();
+        sampleCurrentQueueOccupancy();
+        checkQueueConservation();
+    } else {
+        checkQueueConservation();
+    }
+    finishObservation();
+}
+
+void
+Pvrdma::finishObservation()
+{
+    queueDma.reset();
+    scheduleObservation();
+    if (pvrdma::checkpointStable(controlState, dmaPending(),
+                                 observationQueued(), queueDma.active()))
+        signalDrainDone();
+}
+
+void
+Pvrdma::clearObservations()
+{
+    if (observationEvent.scheduled())
+        deschedule(observationEvent);
+    sqDirty = rqDirty = cqDirty = 0;
+    observationCursor = 0;
+    queueDma.reset();
+}
+
+void
+Pvrdma::sampleQueueOccupancy()
+{
+    const Tick now = curTick();
+    Tick remaining = now - lastQueueSample;
+    lastQueueSample = now;
+    while (remaining) {
+        const int weight = std::min<Tick>(
+            remaining, std::numeric_limits<int>::max());
+        queueStats.sqOccupancy.sample(queueStats.sqOutstanding.value(),
+                                      weight);
+        queueStats.rqOccupancy.sample(queueStats.rqAvailable.value(),
+                                      weight);
+        queueStats.cqOccupancy.sample(queueStats.cqOutstanding.value(),
+                                      weight);
+        remaining -= weight;
+    }
+}
+
+void
+Pvrdma::sampleCurrentQueueOccupancy()
+{
+    queueStats.sqOccupancy.sample(queueStats.sqOutstanding.value(), 0);
+    queueStats.rqOccupancy.sample(queueStats.rqAvailable.value(), 0);
+    queueStats.cqOccupancy.sample(queueStats.cqOutstanding.value(), 0);
+}
+
+void
+Pvrdma::refreshQueueGauges()
+{
+    uint64_t sq_depth = 0;
+    uint64_t rq_depth = 0;
+    uint64_t cq_depth = 0;
+    uint64_t sq_occupancy = 0;
+    uint64_t rq_occupancy = 0;
+    uint64_t cq_occupancy = 0;
+    for (uint32_t handle = 1; handle < pvrdma::ObjectTableEntries;
+         ++handle) {
+        const auto &qp = queuePairs.entries[handle];
+        if (qp.valid) {
+            sq_depth += qp.capabilities.maxSendWr;
+            rq_depth += qp.capabilities.maxRecvWr;
+            sq_occupancy += pvrdma::ringForwardDistance(
+                qp.sqProducerTail, qp.sqConsumerHead,
+                qp.capabilities.maxSendWr);
+            rq_occupancy += pvrdma::ringForwardDistance(
+                qp.rqProducerTail, qp.rqConsumerHead,
+                qp.capabilities.maxRecvWr);
+        }
+        const auto &cq = completionQueues.entries[handle];
+        if (cq.valid) {
+            cq_depth += cq.cqe;
+            cq_occupancy += pvrdma::ringForwardDistance(
+                cq.producerTail, cq.consumerHead, cq.cqe);
+        }
+    }
+    queueStats.sqDepth = sq_depth;
+    queueStats.rqDepth = rq_depth;
+    queueStats.cqDepth = cq_depth;
+    queueStats.sqOutstanding = sq_occupancy;
+    queueStats.rqAvailable = rq_occupancy;
+    queueStats.cqOutstanding = cq_occupancy;
+}
+
+void
+Pvrdma::queueStatsReset()
+{
+    refreshQueueGauges();
+    queueStats.sqOutstandingAtReset = queueStats.sqOutstanding.value();
+    queueStats.rqAvailableAtReset = queueStats.rqAvailable.value();
+    queueStats.cqOutstandingAtReset = queueStats.cqOutstanding.value();
+    lastQueueSample = curTick();
+    sampleCurrentQueueOccupancy();
+}
+
+void
+Pvrdma::checkQueueConservation()
+{
+    if (queueStats.sqOutstandingAtReset.value() +
+            queueStats.sqPosted.value() !=
+        queueStats.sqResetDiscarded.value() +
+            queueStats.sqOutstanding.value())
+        queueStats.conservationViolations++;
+    if (queueStats.rqAvailableAtReset.value() +
+            queueStats.rqPosted.value() !=
+        queueStats.rqResetDiscarded.value() +
+            queueStats.rqAvailable.value())
+        queueStats.conservationViolations++;
+    if (queueStats.cqOutstandingAtReset.value() !=
+        queueStats.cqReclaimed.value() +
+            queueStats.cqResetDiscarded.value() +
+            queueStats.cqOutstanding.value())
+        queueStats.conservationViolations++;
 }
 
 void
@@ -207,7 +639,7 @@ Pvrdma::writeControl(uint32_t value)
 
     const auto control = static_cast<pvrdma::DeviceControl>(value);
     if (control == pvrdma::DeviceControl::Reset) {
-        if (!pvrdma::stable(controlState)) {
+        if (!pvrdma::stable(controlState) || queueDma.active()) {
             operationError.set(regs.error, pvrdma::CommandError);
             return;
         }
@@ -226,7 +658,8 @@ void
 Pvrdma::startCommand(uint32_t value)
 {
     regs.request = value;
-    if (value != 0 || !pvrdma::beginCommand(controlState)) {
+    if (value != 0 || commandBlockedByObservation() ||
+        !pvrdma::beginCommand(controlState)) {
         operationError.set(regs.error, pvrdma::CommandError);
         return;
     }
@@ -243,6 +676,40 @@ void
 Pvrdma::commandReadDone()
 {
     const uint32_t command_id = letoh(command.header.command);
+    uint64_t qp_busy = sqDirty | rqDirty;
+    uint64_t cq_busy = cqDirty;
+    if (queueDma.active()) {
+        const uint64_t bit = uint64_t{1} << queueDma.handle;
+        if (queueDma.kind == pvrdma::QueueKind::Cq)
+            cq_busy |= bit;
+        else
+            qp_busy |= bit;
+    }
+    const bool target_busy = pvrdma::queueCommandTargetBusy(
+        command, qp_busy, cq_busy);
+    if (target_busy) {
+        response = {};
+        const bool has_response = command_id ==
+            static_cast<uint32_t>(pvrdma::Command::ModifyQp);
+        if (has_response) {
+            pvrdma::detail::setResponseHeader(
+                response.header, command.header, command_id,
+                pvrdma::CommandError);
+        }
+        operationError.complete(regs.error, pvrdma::CommandError);
+        panic_if(!pvrdma::finishCommandRead(controlState, has_response),
+                 "PVRDMA rejected queue command in invalid state");
+        if (!has_response) {
+            operationDone();
+            return;
+        }
+        dmaWrite(responseSlotDmaAddress, sizeof(response),
+                 sys->isAtomicMode() ? nullptr : &responseWriteEvent,
+                 reinterpret_cast<uint8_t *>(&response));
+        if (sys->isAtomicMode())
+            responseWriteDone();
+        return;
+    }
     if (command_id == static_cast<uint32_t>(pvrdma::Command::CreateMr) ||
         command_id == static_cast<uint32_t>(pvrdma::Command::CreateCq) ||
         command_id == static_cast<uint32_t>(pvrdma::Command::CreateQp)) {
@@ -255,11 +722,74 @@ Pvrdma::commandReadDone()
         return;
     }
 
+    bool lifecycle = false;
+    uint32_t lifecycle_handle = 0;
+    uint64_t sq_discarded = 0;
+    uint64_t rq_discarded = 0;
+    uint64_t cq_discarded = 0;
+    if (command_id == static_cast<uint32_t>(pvrdma::Command::DestroyQp)) {
+        lifecycle = true;
+        lifecycle_handle = letoh(command.destroyQp.qpHandle);
+    } else if (command_id ==
+                   static_cast<uint32_t>(pvrdma::Command::DestroyCq)) {
+        lifecycle = true;
+        lifecycle_handle = letoh(command.destroyCq.cqHandle);
+    } else if (command_id ==
+                   static_cast<uint32_t>(pvrdma::Command::ModifyQp) &&
+               letoh(static_cast<uint32_t>(
+                   command.modifyQp.attributes.qpState)) ==
+                   static_cast<uint32_t>(pvrdma::QpState::Reset)) {
+        lifecycle = true;
+        lifecycle_handle = letoh(command.modifyQp.qpHandle);
+    }
+    if (lifecycle) {
+        sampleQueueOccupancy();
+        if (lifecycle_handle < pvrdma::ObjectTableEntries) {
+            if (command_id ==
+                    static_cast<uint32_t>(pvrdma::Command::DestroyCq)) {
+                const auto &cq = completionQueues.entries[lifecycle_handle];
+                if (cq.valid)
+                    cq_discarded = pvrdma::ringForwardDistance(
+                        cq.producerTail, cq.consumerHead, cq.cqe);
+            } else {
+                const auto &qp = queuePairs.entries[lifecycle_handle];
+                if (qp.valid) {
+                    sq_discarded = pvrdma::ringForwardDistance(
+                        qp.sqProducerTail, qp.sqConsumerHead,
+                        qp.capabilities.maxSendWr);
+                    rq_discarded = pvrdma::ringForwardDistance(
+                        qp.rqProducerTail, qp.rqConsumerHead,
+                        qp.capabilities.maxRecvWr);
+                }
+            }
+        }
+    }
+
     const auto result = pvrdma::processCommand(
         command, response, gids, gidValid, objects, memoryRegions,
         completionQueues, queuePairs,
         {BARs[pvrdma::UarBar]->addr(), BARs[pvrdma::UarBar]->size()});
     operationError.complete(regs.error, result.error);
+    if (!result.error) {
+        if (lifecycle) {
+            queueStats.sqResetDiscarded += sq_discarded;
+            queueStats.rqResetDiscarded += rq_discarded;
+            queueStats.cqResetDiscarded += cq_discarded;
+            const uint64_t bit = uint64_t{1} << lifecycle_handle;
+            if (command_id ==
+                    static_cast<uint32_t>(pvrdma::Command::DestroyCq)) {
+                cqDirty &= ~bit;
+            } else {
+                sqDirty &= ~bit;
+                rqDirty &= ~bit;
+            }
+        }
+        refreshQueueGauges();
+        if (lifecycle) {
+            sampleCurrentQueueOccupancy();
+            checkQueueConservation();
+        }
+    }
     panic_if(!pvrdma::finishCommandRead(controlState, result.hasResponse),
              "PVRDMA completed command read in invalid state");
     if (!result.hasResponse) {
@@ -436,6 +966,8 @@ Pvrdma::finishObjectCreate(bool success)
     }
     operationError.complete(regs.error,
                             success ? 0 : pvrdma::CommandError);
+    if (success)
+        refreshQueueGauges();
     panic_if(!pvrdma::finishObjectWalk(controlState),
              "PVRDMA finished object walk in invalid state");
     pendingCreate = pvrdma::PendingCreateKind::None;
@@ -466,6 +998,11 @@ Pvrdma::responseWriteDone()
 void
 Pvrdma::resetDevice()
 {
+    sampleQueueOccupancy();
+    queueStats.sqResetDiscarded += queueStats.sqOutstanding.value();
+    queueStats.rqResetDiscarded += queueStats.rqAvailable.value();
+    queueStats.cqResetDiscarded += queueStats.cqOutstanding.value();
+    clearObservations();
     regs.reset();
     regs.control = static_cast<uint32_t>(pvrdma::DeviceControl::Reset);
     regs.error = 0;
@@ -490,6 +1027,9 @@ Pvrdma::resetDevice()
     objectTables.clear();
     objectTableIndex = 0;
     operationError.reset();
+    refreshQueueGauges();
+    sampleCurrentQueueOccupancy();
+    checkQueueConservation();
     if (intxAsserted) {
         intrClear();
         intxAsserted = false;
@@ -514,22 +1054,30 @@ Pvrdma::updateInterrupt()
 void
 Pvrdma::operationDone()
 {
-    if (pvrdma::checkpointStable(controlState, dmaPending()))
+    scheduleObservation();
+    if (pvrdma::checkpointStable(controlState, dmaPending(),
+                                 observationQueued(), queueDma.active()))
         signalDrainDone();
 }
 
 DrainState
 Pvrdma::drain()
 {
-    return pvrdma::checkpointStable(controlState, dmaPending()) ?
+    if (observationEvent.scheduled())
+        deschedule(observationEvent);
+    sqDirty = rqDirty = cqDirty = 0;
+    return pvrdma::checkpointStable(controlState, dmaPending(), false,
+                                    queueDma.active()) ?
         DrainState::Drained : DrainState::Draining;
 }
 
 void
 Pvrdma::serialize(CheckpointOut &cp) const
 {
-    panic_if(!pvrdma::checkpointStable(controlState, dmaPending()),
-             "Cannot checkpoint PVRDMA with active control DMA");
+    panic_if(!pvrdma::checkpointStable(controlState, dmaPending(),
+                                        observationQueued(),
+                                        queueDma.active()),
+             "Cannot checkpoint PVRDMA with active or queued DMA");
     PciDevice::serialize(cp);
     SERIALIZE_SCALAR(regs.dsrAddress);
     SERIALIZE_SCALAR(regs.control);
@@ -586,6 +1134,7 @@ Pvrdma::serialize(CheckpointOut &cp) const
         const auto &cq = completionQueues.entries[slot];
         ScopedCheckpointSection sec(cp, csprintf("cq%u", slot));
         paramOut(cp, "valid", cq.valid);
+        paramOut(cp, "generation", cq.generation);
         if (!cq.valid)
             continue;
         paramOut(cp, "cqHandle", cq.cqHandle);
@@ -692,6 +1241,7 @@ Pvrdma::unserialize(CheckpointIn &cp)
         auto &cq = completionQueues.entries[slot];
         ScopedCheckpointSection sec(cp, csprintf("cq%u", slot));
         paramIn(cp, "valid", cq.valid);
+        paramIn(cp, "generation", cq.generation);
         if (!cq.valid)
             continue;
         paramIn(cp, "cqHandle", cq.cqHandle);
@@ -751,6 +1301,7 @@ Pvrdma::unserialize(CheckpointIn &cp)
                  !pvrdma::validQueueObjects(completionQueues, queuePairs,
                                             memoryRegions, objects),
              "PVRDMA checkpoint has inconsistent object tables");
+    clearObservations();
     pendingCreate = pvrdma::PendingCreateKind::None;
     mrBuild = {};
     cqBuild = {};
@@ -769,6 +1320,7 @@ Pvrdma::unserialize(CheckpointIn &cp)
         commandSlotDmaAddress = pciToDma(commandSlotAddress);
         responseSlotDmaAddress = pciToDma(responseSlotAddress);
     }
+    queueStatsReset();
     // The interrupt controller restores its own state. Reposting or clearing
     // the legacy line here can disturb another device sharing that line.
 }

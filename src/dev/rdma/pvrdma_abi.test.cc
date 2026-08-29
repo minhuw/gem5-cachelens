@@ -226,6 +226,26 @@ TEST(PvrdmaRingTest, RejectsMalformedIndicesAndSizes)
     EXPECT_EQ(index, 99);
     EXPECT_FALSE(ringHasData(16, 0, 8));
     EXPECT_EQ(ringHasSpace(0, 0, 0, index), InvalidRingIndex);
+    EXPECT_EQ(ringForwardDistance(16, 0, 8), InvalidRingIndex);
+    EXPECT_FALSE(ringSnapshotValid(9, 0, 8));
+}
+
+TEST(PvrdmaRingTest, ExhaustiveBoundedForwardDistance)
+{
+    constexpr uint32_t entries = 8;
+    for (uint32_t newer = 0; newer < 2 * entries; ++newer) {
+        for (uint32_t older = 0; older < 2 * entries; ++older) {
+            const uint32_t expected =
+                (newer - older) & (2 * entries - 1);
+            EXPECT_EQ(ringForwardDistance(newer, older, entries), expected);
+            EXPECT_EQ(ringSnapshotValid(newer, older, entries),
+                      expected <= entries);
+        }
+    }
+    EXPECT_EQ(ringForwardDistance(0, 0, entries), 0);
+    EXPECT_EQ(ringForwardDistance(7, 5, entries), 2);
+    EXPECT_EQ(ringForwardDistance(1, 15, entries), 2);
+    EXPECT_EQ(ringForwardDistance(8, 0, entries), entries);
 }
 
 } // namespace pvrdma

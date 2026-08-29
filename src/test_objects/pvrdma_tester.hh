@@ -54,6 +54,15 @@ class PvrdmaTester : public Platform
         BadQpEarly,
         BadQpLate,
         DestroyCq,
+        ObservationActive,
+        ObservationMalformed,
+        ObservationReset,
+        ObservationDone,
+        StatsPosted,
+        StatsAdvance,
+        StatsDone,
+        StatsReposted,
+        CheckpointObservationReady,
     };
 
     TestPort port;
@@ -98,10 +107,16 @@ class PvrdmaTester : public Platform
     void createUserParentAtomic();
     void createQueuePairAtomic(uint32_t expected_qpn);
     void moveQueuePairToRtsAtomic();
+    void postObservedRings(uint32_t sq, uint32_t rq);
+    void ringDoorbell(uint32_t action, uint32_t handle = 1,
+                      bool cq = false);
     void runTimingMr();
     void runTimingQueues();
+    void runStatsReset();
     void testCheckpointSave();
     void testCheckpointRestore();
+    void testCheckpointObservationSave();
+    void testCheckpointObservationRestore();
 
   public:
     PARAMS(PvrdmaTester);

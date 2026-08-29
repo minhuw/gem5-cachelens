@@ -9,8 +9,10 @@
 #include <limits>
 #include <vector>
 
+#include "base/statistics.hh"
 #include "dev/pci/device.hh"
 #include "dev/rdma/pvrdma_abi.hh"
+#include "dev/rdma/pvrdma_ring.hh"
 #include "params/Pvrdma.hh"
 #include "sim/byteswap.hh"
 #include "sim/eventq.hh"
@@ -44,6 +46,143 @@ inline constexpr uint32_t SupportedMrAccess = AccessLocalWrite |
 inline constexpr uint32_t FixedMtu = 1024;
 inline constexpr uint32_t MaxMessageSize = uint32_t{1} << 31;
 inline constexpr uint16_t FullMembershipPkey = 0xffff;
+inline constexpr uint32_t QpDoorbellOffset = 0x00;
+inline constexpr uint32_t CqDoorbellOffset = 0x04;
+inline constexpr uint32_t DoorbellHandleMask = 0x00ffffff;
+inline constexpr uint32_t SqDoorbellAction = 0x40000000;
+inline constexpr uint32_t RqDoorbellAction = 0x80000000;
+inline constexpr uint32_t CqArmSolicitedAction = 0x20000000;
+inline constexpr uint32_t CqArmAnyAction = 0x40000000;
+inline constexpr uint32_t CqPollAction = 0x80000000;
+
+enum class QueueKind : uint8_t
+{
+    None,
+    Sq,
+    Rq,
+    Cq,
+};
+
+enum class DoorbellAction : uint8_t
+{
+    Invalid,
+    Sq,
+    Rq,
+    CqPoll,
+    CqArmSolicited,
+    CqArmAny,
+};
+
+enum class CqArmMode : uint32_t
+{
+    Unarmed,
+    Solicited,
+    Any,
+};
+
+struct Doorbell
+{
+    DoorbellAction action = DoorbellAction::Invalid;
+    uint32_t handle = 0;
+    uint32_t uar = 0;
+};
+
+constexpr QueueKind
+queueKind(DoorbellAction action)
+{
+    switch (action) {
+      case DoorbellAction::Sq: return QueueKind::Sq;
+      case DoorbellAction::Rq: return QueueKind::Rq;
+      case DoorbellAction::CqPoll:
+      case DoorbellAction::CqArmSolicited:
+      case DoorbellAction::CqArmAny:
+        return QueueKind::Cq;
+      default:
+        return QueueKind::None;
+    }
+}
+
+constexpr bool
+decodeDoorbell(uint64_t offset, unsigned size, uint32_t value,
+               Doorbell &doorbell)
+{
+    doorbell = {};
+    if (size != sizeof(uint32_t))
+        return false;
+    const uint32_t page_offset = offset % UarPageSize;
+    const uint32_t handle = value & DoorbellHandleMask;
+    if (!handle || handle >= ObjectTableEntries)
+        return false;
+
+    uint32_t action = 0;
+    if (page_offset == QpDoorbellOffset) {
+        action = value & (SqDoorbellAction | RqDoorbellAction);
+        if (action != SqDoorbellAction && action != RqDoorbellAction)
+            return false;
+        if (value & ~(DoorbellHandleMask | action))
+            return false;
+        doorbell.action = action == SqDoorbellAction ?
+            DoorbellAction::Sq : DoorbellAction::Rq;
+    } else if (page_offset == CqDoorbellOffset) {
+        action = value & (CqArmSolicitedAction | CqArmAnyAction |
+                          CqPollAction);
+        if (action != CqArmSolicitedAction && action != CqArmAnyAction &&
+            action != CqPollAction)
+            return false;
+        if (value & ~(DoorbellHandleMask | action))
+            return false;
+        doorbell.action = action == CqArmSolicitedAction ?
+            DoorbellAction::CqArmSolicited :
+            action == CqArmAnyAction ? DoorbellAction::CqArmAny :
+                                      DoorbellAction::CqPoll;
+    } else {
+        return false;
+    }
+    doorbell.handle = handle;
+    doorbell.uar = offset / UarPageSize;
+    return true;
+}
+
+inline bool
+observeProducer(const Ring &observed, uint32_t depth,
+                uint32_t &shadow_producer, uint32_t shadow_consumer,
+                uint32_t &delta)
+{
+    const uint32_t producer = letoh(observed.producerTail);
+    const uint32_t consumer = letoh(observed.consumerHead);
+    const int32_t old = ringForwardDistance(
+        shadow_producer, shadow_consumer, depth);
+    const int32_t advance = ringForwardDistance(
+        producer, shadow_producer, depth);
+    if (consumer != shadow_consumer || !ringSnapshotValid(
+            producer, consumer, depth) || old < 0 ||
+        static_cast<uint32_t>(old) > depth || advance < 0 ||
+        static_cast<uint32_t>(advance) > depth - old)
+        return false;
+    delta = advance;
+    shadow_producer = producer;
+    return true;
+}
+
+inline bool
+observeConsumer(const Ring &observed, uint32_t depth,
+                uint32_t shadow_producer, uint32_t &shadow_consumer,
+                uint32_t &delta)
+{
+    const uint32_t producer = letoh(observed.producerTail);
+    const uint32_t consumer = letoh(observed.consumerHead);
+    const int32_t old = ringForwardDistance(
+        shadow_producer, shadow_consumer, depth);
+    const int32_t advance = ringForwardDistance(
+        consumer, shadow_consumer, depth);
+    if (producer != shadow_producer || !ringSnapshotValid(
+            producer, consumer, depth) || old < 0 || advance < 0 ||
+        static_cast<uint32_t>(advance) > static_cast<uint32_t>(old))
+        return false;
+    delta = advance;
+    shadow_consumer = consumer;
+    return true;
+}
 
 enum class Register
 {
@@ -186,9 +325,12 @@ finishResponseWrite(ControlState &state, uint32_t &pending)
 }
 
 constexpr bool
-checkpointStable(ControlState state, bool dma_pending)
+checkpointStable(ControlState state, bool dma_pending,
+                 bool observation_queued = false,
+                 bool observation_active = false)
 {
-    return stable(state) && !dma_pending;
+    return stable(state) && !dma_pending && !observation_queued &&
+           !observation_active;
 }
 
 constexpr Register
@@ -486,6 +628,7 @@ struct MemoryRegionTable
 struct CompletionQueue
 {
     bool valid = false;
+    uint32_t generation = 0;
     uint32_t cqHandle = 0;
     uint32_t contextHandle = 0;
     uint32_t uar = 0;
@@ -500,6 +643,7 @@ struct CompletionQueue
 struct CompletionQueueBuild : PageDirectoryBuild
 {
     uint32_t slot = 0;
+    uint32_t generation = 0;
     uint32_t contextHandle = 0;
     uint32_t cqe = 0;
 };
@@ -513,8 +657,10 @@ struct CompletionQueueTable
     bool allocate(CompletionQueueBuild &build) const
     {
         for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
-            if (!entries[slot].valid) {
+            if (!entries[slot].valid &&
+                entries[slot].generation <= MaxGeneration) {
                 build.slot = slot;
+                build.generation = entries[slot].generation;
                 return true;
             }
         }
@@ -537,9 +683,10 @@ struct CompletionQueueTable
                 }))
             return false;
         auto &entry = entries[build.slot];
-        if (entry.valid)
+        if (entry.valid || entry.generation != build.generation)
             return false;
         entry.valid = true;
+        entry.generation = build.generation;
         entry.cqHandle = build.slot;
         entry.contextHandle = build.contextHandle;
         entry.uar = objects.contextUar[build.contextHandle];
@@ -559,7 +706,9 @@ struct CompletionQueueTable
             !objects.contextCqChildren[entry.contextHandle])
             return false;
         --objects.contextCqChildren[entry.contextHandle];
+        const uint32_t generation = entry.generation;
         entry = {};
+        entry.generation = generation + 1;
         return true;
     }
 };
@@ -712,8 +861,6 @@ struct QueuePairTable
             entry.recvCqHandle >= ObjectTableEntries ||
             !cqs.entries[entry.sendCqHandle].valid ||
             !cqs.entries[entry.recvCqHandle].valid ||
-            entry.sqProducerTail != entry.sqConsumerHead ||
-            entry.rqProducerTail != entry.rqConsumerHead ||
             !objects.pdChildren[entry.pdHandle] ||
             cqs.entries[entry.sendCqHandle].qpReferences < send_refs ||
             cqs.entries[entry.recvCqHandle].qpReferences < 1)
@@ -727,6 +874,55 @@ struct QueuePairTable
         return true;
     }
 };
+
+inline bool
+validDoorbell(const Doorbell &doorbell, ControlState control_state,
+              const CompletionQueueTable &cqs, const QueuePairTable &qps)
+{
+    if (control_state == ControlState::Unconfigured ||
+        control_state == ControlState::Ready || !doorbell.handle ||
+        doorbell.handle >= ObjectTableEntries)
+        return false;
+    const auto kind = queueKind(doorbell.action);
+    if (kind == QueueKind::None)
+        return false;
+    if (kind == QueueKind::Cq) {
+        const auto &cq = cqs.entries[doorbell.handle];
+        return cq.valid && cq.cqHandle == doorbell.handle &&
+            cq.uar == doorbell.uar;
+    }
+    const auto &qp = qps.entries[doorbell.handle];
+    return qp.valid && qp.qpHandle == doorbell.handle &&
+        qp.uar == doorbell.uar &&
+        (kind == QueueKind::Sq ? qp.state == QpState::ReadyToSend :
+                                qp.state != QpState::Reset);
+}
+
+inline bool
+queueCommandTargetBusy(const CommandRequest &request, uint64_t qp_busy,
+                       uint64_t cq_busy)
+{
+    const uint32_t command = letoh(request.header.command);
+    uint32_t handle = 0;
+    if (command == static_cast<uint32_t>(Command::DestroyQp)) {
+        handle = letoh(request.destroyQp.qpHandle);
+        return handle < ObjectTableEntries &&
+            (qp_busy & (uint64_t{1} << handle));
+    }
+    if (command == static_cast<uint32_t>(Command::DestroyCq)) {
+        handle = letoh(request.destroyCq.cqHandle);
+        return handle < ObjectTableEntries &&
+            (cq_busy & (uint64_t{1} << handle));
+    }
+    if (command == static_cast<uint32_t>(Command::ModifyQp) &&
+        letoh(static_cast<uint32_t>(request.modifyQp.attributes.qpState)) ==
+            static_cast<uint32_t>(QpState::Reset)) {
+        handle = letoh(request.modifyQp.qpHandle);
+        return handle < ObjectTableEntries &&
+            (qp_busy & (uint64_t{1} << handle));
+    }
+    return false;
+}
 
 enum class PendingCreateKind : uint8_t
 {
@@ -996,8 +1192,8 @@ validQueueObjects(const CompletionQueueTable &cqs,
                   const MemoryRegionTable &mrs,
                   const ObjectTables &objects)
 {
-    if (cqs.entries[0].valid || qps.entries[0].valid ||
-        qps.entries[0].generation)
+    if (cqs.entries[0].valid || cqs.entries[0].generation ||
+        qps.entries[0].valid || qps.entries[0].generation)
         return false;
     ObjectTables mr_objects = objects;
     mr_objects.pdChildren = {};
@@ -1017,18 +1213,22 @@ validQueueObjects(const CompletionQueueTable &cqs,
     for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
         const auto &cq = cqs.entries[slot];
         if (!cq.valid) {
-            if (cq.cqHandle || cq.contextHandle || cq.uar || cq.cqe ||
+            if (cq.generation > MaxGeneration + uint64_t{1} ||
+                cq.cqHandle || cq.contextHandle || cq.uar || cq.cqe ||
                 cq.qpReferences || cq.armFlags || cq.producerTail ||
                 cq.consumerHead || !cq.pages.empty())
                 return false;
         } else {
             const uint32_t chunks = 1 + chunksFor(cq.cqe, CqeSize);
-            if (cq.cqHandle != slot || !cq.contextHandle ||
+            if (cq.generation > MaxGeneration || cq.cqHandle != slot ||
+                !cq.contextHandle ||
                 cq.contextHandle >= ObjectTableEntries ||
                 !objects.contextUar[cq.contextHandle] ||
                 cq.uar != objects.contextUar[cq.contextHandle] ||
-                !powerOfTwo(cq.cqe) || cq.cqe > 1024 || cq.armFlags ||
-                cq.producerTail || cq.consumerHead ||
+                !powerOfTwo(cq.cqe) || cq.cqe > 1024 ||
+                cq.armFlags > static_cast<uint32_t>(CqArmMode::Any) ||
+                !ringSnapshotValid(cq.producerTail, cq.consumerHead,
+                                   cq.cqe) ||
                 cq.pages.size() != chunks ||
                 std::any_of(cq.pages.begin(), cq.pages.end(),
                     [](uint64_t page) { return !alignedPage(page); }))
@@ -1084,8 +1284,14 @@ validQueueObjects(const CompletionQueueTable &cqs,
             qp.totalChunks != 1 + qp.sendChunks + qp.recvChunks ||
             qp.pages.size() != qp.totalChunks ||
             !validSupportedState(qp.state) ||
-            !validStoredQpAttributes(qp) || qp.sqProducerTail ||
-            qp.sqConsumerHead || qp.rqProducerTail || qp.rqConsumerHead ||
+            !validStoredQpAttributes(qp) ||
+            !ringSnapshotValid(qp.sqProducerTail, qp.sqConsumerHead,
+                               qp.capabilities.maxSendWr) ||
+            !ringSnapshotValid(qp.rqProducerTail, qp.rqConsumerHead,
+                               qp.capabilities.maxRecvWr) ||
+            (qp.state == QpState::Reset &&
+             (qp.sqProducerTail != qp.sqConsumerHead ||
+              qp.rqProducerTail != qp.rqConsumerHead)) ||
             std::any_of(qp.pages.begin(), qp.pages.end(),
                 [](uint64_t page) { return !alignedPage(page); }))
             return false;
@@ -1659,9 +1865,7 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
             attrs.currentQpState == qp->state;
     const uint32_t transition_mask = mask & ~QpAttrCurrentState;
     if (success && attrs.qpState == QpState::Reset) {
-        success = transition_mask == QpAttrState &&
-            qp->sqProducerTail == qp->sqConsumerHead &&
-            qp->rqProducerTail == qp->rqConsumerHead;
+        success = transition_mask == QpAttrState;
         if (success) {
             qp->state = QpState::Reset;
             qp->attributes = {};
@@ -1980,6 +2184,7 @@ class Pvrdma : public PciDevice
 
     Tick read(PacketPtr pkt) override;
     Tick write(PacketPtr pkt) override;
+    void startup() override;
     DrainState drain() override;
 
     void serialize(CheckpointOut &cp) const override;
@@ -2016,12 +2221,87 @@ class Pvrdma : public PciDevice
     bool intxAsserted = false;
     const Tick controlCompletionLatency;
 
+    struct QueueDmaState
+    {
+        pvrdma::QueueKind kind = pvrdma::QueueKind::None;
+        uint32_t handle = 0;
+        uint32_t generation = 0;
+        uint32_t uar = 0;
+        uint32_t depth = 0;
+        uint64_t ringAddress = 0;
+        pvrdma::Ring ring{};
+
+        bool active() const { return kind != pvrdma::QueueKind::None; }
+        void reset() { *this = {}; }
+    } queueDma;
+
+    struct QueueStats : public statistics::Group
+    {
+        QueueStats(Pvrdma &parent);
+        void preDumpStats() override;
+
+        Pvrdma &device;
+        statistics::Scalar sqDepth;
+        statistics::Scalar rqDepth;
+        statistics::Scalar cqDepth;
+        statistics::Scalar sqOutstanding;
+        statistics::Scalar rqAvailable;
+        statistics::Scalar cqOutstanding;
+        statistics::Scalar sqOutstandingAtReset;
+        statistics::Scalar rqAvailableAtReset;
+        statistics::Scalar cqOutstandingAtReset;
+        statistics::Scalar sqPosted;
+        statistics::Scalar rqPosted;
+        statistics::Scalar cqReclaimed;
+        statistics::Scalar sqResetDiscarded;
+        statistics::Scalar rqResetDiscarded;
+        statistics::Scalar cqResetDiscarded;
+        statistics::Scalar doorbellWrites;
+        statistics::Scalar sqDoorbells;
+        statistics::Scalar rqDoorbells;
+        statistics::Scalar cqPollDoorbells;
+        statistics::Scalar cqArmDoorbells;
+        statistics::Scalar cqArmSolicitedDoorbells;
+        statistics::Scalar doorbellWritesRejected;
+        statistics::Scalar ringObservationsRejected;
+        statistics::Scalar conservationViolations;
+        statistics::Distribution sqOccupancy;
+        statistics::Distribution rqOccupancy;
+        statistics::Distribution cqOccupancy;
+    } queueStats;
+
+    uint64_t sqDirty = 0;
+    uint64_t rqDirty = 0;
+    uint64_t cqDirty = 0;
+    uint32_t observationCursor = 0;
+    Tick lastQueueSample = 0;
+
     EventFunctionWrapper dsrReadEvent;
     EventFunctionWrapper capsWriteEvent;
     EventFunctionWrapper commandReadEvent;
     EventFunctionWrapper objectDirectoryReadEvent;
     EventFunctionWrapper objectTableReadEvent;
     EventFunctionWrapper responseWriteEvent;
+    EventFunctionWrapper observationEvent;
+    EventFunctionWrapper queueDmaEvent;
+
+    bool observationQueued() const;
+    bool commandBlockedByObservation() const;
+    bool validDoorbell(const pvrdma::Doorbell &doorbell) const;
+    void writeDoorbell(uint64_t offset, PacketPtr pkt);
+    void markDirty(pvrdma::QueueKind kind, uint32_t handle);
+    void scheduleObservation();
+    void startObservation();
+    bool selectObservation();
+    bool revalidateObservation() const;
+    void queueDmaDone();
+    void finishObservation();
+    void clearObservations();
+    void sampleQueueOccupancy();
+    void sampleCurrentQueueOccupancy();
+    void refreshQueueGauges();
+    void queueStatsReset();
+    void checkQueueConservation();
 
     void startDsr();
     void dsrReadDone();
