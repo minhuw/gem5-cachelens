@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <tuple>
 #include <utility>
 
@@ -157,6 +158,45 @@ buildQp(const CommandRequest &request, ObjectTables &objects,
 {
     return prepareCreateQp(request, objects, cqs, qps, build) &&
         walkPages(build, first_page);
+}
+
+QueuePair
+testQueuePair(uint32_t send_wr = 64, uint32_t recv_wr = 256)
+{
+    QueuePair qp;
+    qp.valid = true;
+    qp.generation = 2;
+    qp.qpHandle = 1;
+    qp.qpn = (qp.generation << SlotBits) | qp.qpHandle;
+    qp.pdHandle = 1;
+    qp.capabilities.maxSendWr = send_wr;
+    qp.capabilities.maxRecvWr = recv_wr;
+    qp.capabilities.maxSendSge = 1;
+    qp.capabilities.maxRecvSge = 1;
+    qp.sendChunks = detail::chunksFor(send_wr, SqStride);
+    qp.recvChunks = detail::chunksFor(recv_wr, RqStride);
+    qp.totalChunks = 1 + qp.sendChunks + qp.recvChunks;
+    for (uint32_t i = 0; i < qp.totalChunks; ++i)
+        qp.pages.push_back(0x8000 + uint64_t{i} * PageSize);
+    return qp;
+}
+
+std::array<uint8_t, SqStride>
+sqSlot(const SendWqeHeader &header, const Sge &sge)
+{
+    std::array<uint8_t, SqStride> slot{};
+    std::memcpy(slot.data(), &header, sizeof(header));
+    std::memcpy(slot.data() + sizeof(header), &sge, sizeof(sge));
+    return slot;
+}
+
+std::array<uint8_t, RqStride>
+rqSlot(const ReceiveWqeHeader &header, const Sge &sge)
+{
+    std::array<uint8_t, RqStride> slot{};
+    std::memcpy(slot.data(), &header, sizeof(header));
+    std::memcpy(slot.data() + sizeof(header), &sge, sizeof(sge));
+    return slot;
 }
 
 CommandResult
@@ -1068,6 +1108,84 @@ TEST(PvrdmaMrTest, TranslatesOneSgeWithinAndAcrossPages)
                            chunks));
 }
 
+TEST(PvrdmaMrTest, AcquiresAndReleasesGenerationSafeLocalKeys)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    MemoryRegionTable mrs{};
+    MemoryRegionBuild build{};
+    ASSERT_TRUE(buildMr(mrRequest(0x1003, 5000, 2,
+                                  AccessLocalWrite | AccessRemoteRead),
+                        objects, mrs, build, 0x8000));
+    ASSERT_TRUE(mrs.commit(std::move(build), objects));
+    auto qp = testQueuePair();
+
+    MemoryRegionLease lease{9, 9, {{1, 2}}};
+    auto wrong_pd = qp;
+    wrong_pd.pdHandle = 2;
+    EXPECT_FALSE(acquireLocalMr(mrs, wrong_pd, QueueKind::Sq, 1,
+                                0x1ff0, 32, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+    EXPECT_EQ(lease.slot, 9);
+    EXPECT_EQ(lease.generation, 9);
+    EXPECT_EQ(lease.chunks, (std::vector<DmaChunk>{{1, 2}}));
+
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Sq, 2,
+                                0x1ff0, 32, lease));
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::None, 1,
+                                0x1ff0, 32, lease));
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Sq, 1,
+                                0x1002, 1, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+    const uint32_t access = mrs.entries[1].accessFlags;
+    mrs.entries[1].accessFlags = 0;
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Rq, 1,
+                                0x1003, 1, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+    ASSERT_TRUE(acquireLocalMr(mrs, qp, QueueKind::Sq, 1,
+                               0x1003, 1, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 1);
+    EXPECT_TRUE(releaseMr(mrs, lease));
+    mrs.entries[1].accessFlags = access;
+
+    ASSERT_TRUE(acquireLocalMr(mrs, qp, QueueKind::Rq, 1,
+                               0x1ff0, 32, lease));
+    EXPECT_EQ(lease.slot, 1);
+    EXPECT_EQ(lease.generation, 0);
+    EXPECT_EQ(lease.chunks, (std::vector<DmaChunk>{{0x8ff0, 16},
+                                                   {0x9000, 16}}));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 1);
+    EXPECT_FALSE(mrs.destroy(1, objects));
+    const auto stale = lease;
+    EXPECT_TRUE(releaseMr(mrs, lease));
+    EXPECT_FALSE(releaseMr(mrs, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+
+    for (const uint64_t address : {uint64_t{0x1003},
+                                   mrs.entries[1].end}) {
+        ASSERT_TRUE(acquireLocalMr(mrs, qp, QueueKind::Rq, 1,
+                                   address, 0, lease));
+        EXPECT_TRUE(lease.chunks.empty());
+        EXPECT_TRUE(releaseMr(mrs, lease));
+    }
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Sq, 1,
+                                0x1002, 0, lease));
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Sq, 1,
+                                mrs.entries[1].end + 1, 0, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+
+    ASSERT_TRUE(mrs.destroy(1, objects));
+    ASSERT_TRUE(buildMr(mrRequest(0x1003, 5000, 2,
+                                  AccessLocalWrite | AccessRemoteRead),
+                        objects, mrs, build, 0xa000));
+    ASSERT_TRUE(mrs.commit(std::move(build), objects));
+    ASSERT_TRUE(acquireLocalMr(mrs, qp, QueueKind::Rq, 65,
+                               0x1003, 1, lease));
+    EXPECT_FALSE(releaseMr(mrs, stale));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 1);
+    EXPECT_TRUE(releaseMr(mrs, lease));
+}
+
 TEST(PvrdmaMrTest, ValidatesRestoreConsistency)
 {
     ObjectTables objects{};
@@ -1276,6 +1394,162 @@ TEST(PvrdmaQpTest, EnforcesFrozenGeometryAndCreateValidation)
     malformed = qpRequest(32, 128);
     malformed.createQp.totalChunks = htole(uint16_t{4});
     EXPECT_FALSE(prepareCreateQp(malformed, objects, cqs, qps, build));
+}
+
+TEST(PvrdmaQpTest, ComputesExactSqAndRqWqeAddresses)
+{
+    const auto qp = testQueuePair();
+    uint64_t address = 0;
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Sq, 0, address));
+    EXPECT_EQ(address, 0x9000);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Sq, 31, address));
+    EXPECT_EQ(address, 0x9f80);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Sq, 32, address));
+    EXPECT_EQ(address, 0xa000);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Sq, 64, address));
+    EXPECT_EQ(address, 0x9000);
+
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Rq, 0, address));
+    EXPECT_EQ(address, 0xb000);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Rq, 127, address));
+    EXPECT_EQ(address, 0xbfe0);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Rq, 128, address));
+    EXPECT_EQ(address, 0xc000);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Rq, 256, address));
+    EXPECT_EQ(address, 0xb000);
+}
+
+TEST(PvrdmaQpTest, RejectsMalformedWqeAddressGeometry)
+{
+    const auto qp = testQueuePair();
+    uint64_t address = 0xdeadbeef;
+    EXPECT_FALSE(wqeAddress({}, QueueKind::Sq, 0, address));
+    EXPECT_FALSE(wqeAddress(qp, QueueKind::None, 0, address));
+    EXPECT_FALSE(wqeAddress(qp, QueueKind::Cq, 0, address));
+    EXPECT_FALSE(wqeAddress(qp, static_cast<QueueKind>(0xff), 0, address));
+
+    auto malformed = qp;
+    malformed.capabilities.maxSendWr = 3;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 0, address));
+    malformed = qp;
+    malformed.sendChunks++;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 0, address));
+    malformed = qp;
+    malformed.totalChunks--;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Rq, 0, address));
+    malformed = qp;
+    malformed.pages.resize(1);
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 32, address));
+    malformed = qp;
+    malformed.pages[1] = 0;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 0, address));
+    malformed = qp;
+    malformed.pages.back()++;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Rq, 128, address));
+    malformed = qp;
+    malformed.generation++;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 0, address));
+    EXPECT_EQ(address, 0xdeadbeef);
+}
+
+TEST(PvrdmaWqeTest, DecodesLittleEndianSqAndSignalPolicy)
+{
+    SendWqeHeader header{};
+    header.workRequestId = htole(uint64_t{0x1122334455667788});
+    header.numSge = htole(uint32_t{1});
+    header.reservedLength = htole(uint32_t{0xffffffff});
+    header.opcode = htole(
+        static_cast<uint32_t>(WorkRequestOpcode::Send));
+    Sge sge{htole(uint64_t{0x8877665544332211}),
+            htole(uint32_t{MaxMessageSize}), htole(uint32_t{0x12345678})};
+    auto slot = sqSlot(header, sge);
+    slot.back() = 0xaa;
+    PreparedWqe prepared;
+    auto qp = testQueuePair();
+    auto invalid_qp = qp;
+    invalid_qp.valid = false;
+    EXPECT_FALSE(decodeSqWqe(invalid_qp, slot, prepared));
+    ASSERT_TRUE(decodeSqWqe(qp, slot, prepared));
+    EXPECT_EQ(prepared.kind, QueueKind::Sq);
+    EXPECT_EQ(prepared.workRequestId, 0x1122334455667788);
+    EXPECT_EQ(prepared.address, 0x8877665544332211);
+    EXPECT_EQ(prepared.length, MaxMessageSize);
+    EXPECT_EQ(prepared.lkey, 0x12345678);
+    EXPECT_FALSE(prepared.signaled);
+
+    header.sendFlags = htole(SendSignaled);
+    ASSERT_TRUE(decodeSqWqe(qp, sqSlot(header, sge), prepared));
+    EXPECT_TRUE(prepared.signaled);
+    header.sendFlags = 0;
+    qp.signalAllSendWr = true;
+    ASSERT_TRUE(decodeSqWqe(qp, sqSlot(header, sge), prepared));
+    EXPECT_TRUE(prepared.signaled);
+}
+
+TEST(PvrdmaWqeTest, RejectsEachUnsupportedSqField)
+{
+    SendWqeHeader header{};
+    header.numSge = htole(uint32_t{1});
+    header.opcode = htole(
+        static_cast<uint32_t>(WorkRequestOpcode::Send));
+    Sge sge{htole(uint64_t{0x1000}), htole(uint32_t{1}),
+            htole(uint32_t{1})};
+    PreparedWqe prepared;
+    const auto qp = testQueuePair();
+
+    auto malformed = header;
+    malformed.numSge = htole(uint32_t{2});
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.opcode = htole(
+        static_cast<uint32_t>(WorkRequestOpcode::RdmaWrite));
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.sendFlags = htole(SendFence);
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.sendFlags = htole(SendSignaled | SendFence);
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.invalidateRkey = htole(uint32_t{1});
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.reserved = htole(uint32_t{1});
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.operationData[47] = 1;
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    auto long_sge = sge;
+    long_sge.length = htole(MaxMessageSize + 1);
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(header, long_sge), prepared));
+}
+
+TEST(PvrdmaWqeTest, DecodesAndValidatesLittleEndianRq)
+{
+    ReceiveWqeHeader header{};
+    header.workRequestId = htole(uint64_t{0x1122334455667788});
+    header.numSge = htole(uint32_t{1});
+    header.reservedLength = htole(uint32_t{0xffffffff});
+    Sge sge{htole(uint64_t{0x8877665544332211}),
+            htole(uint32_t{MaxMessageSize}), htole(uint32_t{0x12345678})};
+    PreparedWqe prepared;
+    const auto qp = testQueuePair();
+    auto invalid_qp = qp;
+    invalid_qp.valid = false;
+    EXPECT_FALSE(decodeRqWqe(invalid_qp, rqSlot(header, sge), prepared));
+    ASSERT_TRUE(decodeRqWqe(qp, rqSlot(header, sge), prepared));
+    EXPECT_EQ(prepared.kind, QueueKind::Rq);
+    EXPECT_EQ(prepared.workRequestId, 0x1122334455667788);
+    EXPECT_EQ(prepared.address, 0x8877665544332211);
+    EXPECT_EQ(prepared.length, MaxMessageSize);
+    EXPECT_EQ(prepared.lkey, 0x12345678);
+    EXPECT_FALSE(prepared.signaled);
+
+    header.numSge = htole(uint32_t{2});
+    EXPECT_FALSE(decodeRqWqe(qp, rqSlot(header, sge), prepared));
+    header.numSge = htole(uint32_t{1});
+    sge.length = htole(MaxMessageSize + 1);
+    EXPECT_FALSE(decodeRqWqe(qp, rqSlot(header, sge), prepared));
 }
 
 TEST(PvrdmaQpTest, TracksDependenciesDirectHandleAndGenerationSafeQpn)

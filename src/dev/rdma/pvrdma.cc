@@ -90,7 +90,8 @@ Pvrdma::QueueStats::preDumpStats()
 }
 
 Pvrdma::Pvrdma(const Params &p)
-    : PciDevice(p), controlCompletionLatency(p.control_completion_latency),
+    : PciDevice(p), interface(name() + ".interface"),
+      controlCompletionLatency(p.control_completion_latency),
       queueStats(*this),
       dsrReadEvent([this] { dsrReadDone(); }, name() + ".dsrRead"),
       capsWriteEvent([this] { capsWriteDone(); }, name() + ".capsWrite"),
@@ -123,6 +124,14 @@ Pvrdma::Pvrdma(const Params &p)
     capabilities = pvrdma::makeCapabilities(regs.macLow, regs.macHigh);
     queueStatsReset();
     statistics::registerResetCallback([this] { queueStatsReset(); });
+}
+
+Port &
+Pvrdma::getPort(const std::string &if_name, PortID idx)
+{
+    if (if_name == "interface")
+        return interface;
+    return PciDevice::getPort(if_name, idx);
 }
 
 void

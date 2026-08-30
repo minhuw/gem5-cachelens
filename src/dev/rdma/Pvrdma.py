@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
+from m5.objects.Ethernet import EtherInt
 from m5.objects.PciDevice import PciDevice, PciMemBar
 from m5.params import *
 
@@ -24,6 +25,8 @@ class Pvrdma(PciDevice):
     BAR0 = PciMemBar(size="16KiB")
     BAR1 = PciMemBar(size="256B")
     BAR2 = PciMemBar(size="2MiB")
+
+    interface = EtherInt("PVRDMA Ethernet interface")
 
     hardware_address = Param.EthernetAddr(
         NextEthernetAddr, "PVRDMA MAC address"

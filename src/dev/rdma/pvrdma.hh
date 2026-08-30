@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <vector>
 
 #include "base/statistics.hh"
+#include "dev/net/etherint.hh"
 #include "dev/pci/device.hh"
 #include "dev/rdma/pvrdma_abi.hh"
 #include "dev/rdma/pvrdma_ring.hh"
@@ -602,6 +604,23 @@ struct DmaChunk
     }
 };
 
+struct MemoryRegionLease
+{
+    uint32_t slot = 0;
+    uint32_t generation = 0;
+    std::vector<DmaChunk> chunks;
+};
+
+struct PreparedWqe
+{
+    QueueKind kind = QueueKind::None;
+    uint64_t workRequestId = 0;
+    uint64_t address = 0;
+    uint32_t length = 0;
+    uint32_t lkey = 0;
+    bool signaled = false;
+};
+
 enum class MrKeyType
 {
     Local,
@@ -924,6 +943,105 @@ struct QueuePairTable
         return true;
     }
 };
+
+inline bool
+wqeAddress(const QueuePair &qp, QueueKind kind, uint32_t consumer,
+           uint64_t &address)
+{
+    if (!qp.valid || !qp.qpHandle || qp.qpHandle >= ObjectTableEntries ||
+        qp.generation > MaxGeneration ||
+        qp.qpn != ((qp.generation << SlotBits) | qp.qpHandle) ||
+        (kind != QueueKind::Sq && kind != QueueKind::Rq))
+        return false;
+
+    const auto valid_depth = [](uint32_t depth) {
+        return depth && !(depth & (depth - 1)) && depth <= 256;
+    };
+    if (!valid_depth(qp.capabilities.maxSendWr) ||
+        !valid_depth(qp.capabilities.maxRecvWr) ||
+        qp.capabilities.maxSendSge != 1 ||
+        qp.capabilities.maxRecvSge != 1 ||
+        qp.capabilities.maxInlineData || qp.capabilities.reserved ||
+        qp.sendChunks !=
+            (static_cast<uint64_t>(qp.capabilities.maxSendWr) * SqStride +
+             PageSize - 1) / PageSize ||
+        qp.recvChunks !=
+            (static_cast<uint64_t>(qp.capabilities.maxRecvWr) * RqStride +
+             PageSize - 1) / PageSize ||
+        PageSize % SqStride || PageSize % RqStride ||
+        qp.totalChunks != 1 + qp.sendChunks + qp.recvChunks ||
+        qp.pages.size() != qp.totalChunks ||
+        std::any_of(qp.pages.begin(), qp.pages.end(), [](uint64_t page) {
+            return !page || page % PageSize;
+        }))
+        return false;
+
+    const uint32_t depth = kind == QueueKind::Sq ?
+        qp.capabilities.maxSendWr : qp.capabilities.maxRecvWr;
+    const uint32_t stride = kind == QueueKind::Sq ? SqStride : RqStride;
+    const uint32_t chunks = kind == QueueKind::Sq ?
+        qp.sendChunks : qp.recvChunks;
+    const uint64_t offset =
+        static_cast<uint64_t>(consumer & (depth - 1)) * stride;
+    const uint32_t page = offset / PageSize;
+    const uint32_t page_offset = offset % PageSize;
+    const uint32_t first = 1 +
+        (kind == QueueKind::Rq ? qp.sendChunks : 0);
+    if (page >= chunks || first + page >= qp.pages.size() ||
+        page_offset + stride > PageSize)
+        return false;
+    address = qp.pages[first + page] + page_offset;
+    return true;
+}
+
+inline bool
+decodeSqWqe(const QueuePair &qp,
+            const std::array<uint8_t, SqStride> &slot,
+            PreparedWqe &prepared)
+{
+    if (!qp.valid)
+        return false;
+    SendWqeHeader header;
+    Sge sge;
+    std::memcpy(&header, slot.data(), sizeof(header));
+    std::memcpy(&sge, slot.data() + sizeof(header), sizeof(sge));
+    const uint32_t flags = letoh(header.sendFlags);
+    if (letoh(header.numSge) != 1 ||
+        letoh(header.opcode) !=
+            static_cast<uint32_t>(WorkRequestOpcode::Send) ||
+        (flags != 0 && flags != SendSignaled) ||
+        letoh(header.beImmediateData) || letoh(header.reserved) ||
+        std::any_of(std::begin(header.operationData),
+                    std::end(header.operationData),
+                    [](uint8_t byte) { return byte != 0; }) ||
+        letoh(sge.length) > MaxMessageSize)
+        return false;
+
+    prepared = {QueueKind::Sq, letoh(header.workRequestId),
+                letoh(sge.address), letoh(sge.length), letoh(sge.lkey),
+                qp.signalAllSendWr || (flags & SendSignaled)};
+    return true;
+}
+
+inline bool
+decodeRqWqe(const QueuePair &qp,
+            const std::array<uint8_t, RqStride> &slot,
+            PreparedWqe &prepared)
+{
+    if (!qp.valid)
+        return false;
+    ReceiveWqeHeader header;
+    Sge sge;
+    std::memcpy(&header, slot.data(), sizeof(header));
+    std::memcpy(&sge, slot.data() + sizeof(header), sizeof(sge));
+    if (letoh(header.numSge) != 1 || letoh(sge.length) > MaxMessageSize)
+        return false;
+
+    prepared = {QueueKind::Rq, letoh(header.workRequestId),
+                letoh(sge.address), letoh(sge.length), letoh(sge.lkey),
+                false};
+    return true;
+}
 
 inline bool
 validDoorbell(const Doorbell &doorbell, ControlState control_state,
@@ -2111,6 +2229,60 @@ translate(const MemoryRegionTable &mrs, MrKeyType key_type, uint32_t key,
                              required_access, chunks);
 }
 
+inline bool
+acquireLocalMr(MemoryRegionTable &mrs, const QueuePair &qp, QueueKind kind,
+               uint32_t lkey, uint64_t address, uint64_t length,
+               MemoryRegionLease &lease)
+{
+    const uint32_t slot = lkey & MrSlotMask;
+    const uint32_t required_access = kind == QueueKind::Rq ?
+        AccessLocalWrite : 0;
+    if (!qp.valid || !qp.qpHandle || qp.qpHandle >= ObjectTableEntries ||
+        qp.generation > MaxGeneration ||
+        qp.qpn != ((qp.generation << SlotBits) | qp.qpHandle) ||
+        !qp.pdHandle || qp.pdHandle >= ObjectTableEntries || !slot ||
+        slot >= ObjectTableEntries ||
+        (kind != QueueKind::Sq && kind != QueueKind::Rq))
+        return false;
+
+    auto &mr = mrs.entries[slot];
+    if (!mr.valid || mr.generation > MaxMrGeneration ||
+        mr.mrHandle != ((mr.generation << MrSlotBits) | slot) ||
+        mr.lkey != lkey || mr.mrHandle != lkey ||
+        mr.pdHandle != qp.pdHandle ||
+        (mr.accessFlags & required_access) != required_access ||
+        mr.activeReferences == std::numeric_limits<uint32_t>::max())
+        return false;
+
+    std::vector<DmaChunk> chunks;
+    if (length) {
+        if (!detail::translate(mrs, MrKeyType::Local, lkey, address, length,
+                               required_access, chunks))
+            return false;
+    } else if (address < mr.start || address > mr.end) {
+        return false;
+    }
+
+    ++mr.activeReferences;
+    lease = {slot, mr.generation, std::move(chunks)};
+    return true;
+}
+
+inline bool
+releaseMr(MemoryRegionTable &mrs, const MemoryRegionLease &lease)
+{
+    if (!lease.slot || lease.slot >= ObjectTableEntries)
+        return false;
+    auto &mr = mrs.entries[lease.slot];
+    if (!mr.valid || mr.generation > MaxMrGeneration ||
+        mr.generation != lease.generation ||
+        mr.mrHandle != ((mr.generation << MrSlotBits) | lease.slot) ||
+        !mr.activeReferences)
+        return false;
+    --mr.activeReferences;
+    return true;
+}
+
 inline DeviceCaps
 makeCapabilities(uint32_t mac_low, uint32_t mac_high)
 {
@@ -2234,6 +2406,8 @@ class Pvrdma : public PciDevice
     PARAMS(Pvrdma);
     Pvrdma(const Params &params);
 
+    Port &getPort(const std::string &if_name,
+                  PortID idx = InvalidPortID) override;
     Tick read(PacketPtr pkt) override;
     Tick write(PacketPtr pkt) override;
     void startup() override;
@@ -2244,6 +2418,14 @@ class Pvrdma : public PciDevice
 
   private:
     friend class PvrdmaTester;
+
+    class Interface : public EtherInt
+    {
+      public:
+        Interface(const std::string &name) : EtherInt(name) {}
+        bool recvPacket(EthPacketPtr) override { return false; }
+        void sendDone() override {}
+    } interface;
 
     pvrdma::RegisterState regs;
     pvrdma::ControlState controlState = pvrdma::ControlState::Unconfigured;

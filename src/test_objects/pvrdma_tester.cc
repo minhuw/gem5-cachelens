@@ -96,6 +96,13 @@ PvrdmaTester::startup()
 {
     rdma = dynamic_cast<Pvrdma *>(SimObject::find("system.rdma"));
     panic_if(!rdma, "PVRDMA tester could not find system.rdma");
+    auto &interface = rdma->getPort("interface");
+    panic_if(&interface != &rdma->interface ||
+                 &rdma->getPort("dma") == &interface,
+             "PVRDMA Ethernet and PCI DMA ports are not independent");
+    panic_if(rdma->interface.recvPacket(nullptr),
+             "PVRDMA foundation accepted an inbound packet");
+    rdma->interface.sendDone();
     schedule(testEvent, curTick());
 }
 
