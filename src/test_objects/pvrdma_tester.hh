@@ -4,21 +4,39 @@
 #define __TEST_OBJECTS_PVRDMA_TESTER_HH__
 
 #include <string>
+#include <vector>
 
 #include "dev/platform.hh"
 #include "dev/rdma/pvrdma.hh"
 #include "mem/port.hh"
 #include "params/PvrdmaTester.hh"
 #include "sim/eventq.hh"
+#include "test_objects/pvrdma_test_link.hh"
 
 namespace gem5
 {
 
 class Pvrdma;
+class PvrdmaTestLink;
 
 class PvrdmaTester : public Platform
 {
   private:
+    class FaultPort : public EtherInt
+    {
+      public:
+        FaultPort(const std::string &name, PvrdmaTester &tester, int side)
+            : EtherInt(name), tester(tester), side(side)
+        {}
+
+        bool recvPacket(EthPacketPtr packet) override;
+        void sendDone() override;
+
+      private:
+        PvrdmaTester &tester;
+        const int side;
+    };
+
     class TestPort : public RequestPort
     {
       public:
@@ -83,22 +101,58 @@ class PvrdmaTester : public Platform
         PairPostShort,
         PairVerifyShort,
         PairVerifyMalformed,
+        FaultCheckBackpressure,
+        FaultCheckHeld,
+        FaultCheckReleased,
+        FaultCheckDelayed,
         PairPostCq,
         PairVerifyCqBlocked,
         PairVerifyCqRecovered,
         PairVerifyStale,
+        ReliabilityPostSq,
+        ReliabilityVerify,
+        ReliabilityRnrPostRq,
+        ReliabilityDeadlineRelease,
+        ReliabilityTimeoutZeroObserve,
+        ReliabilityTimeoutZeroVerify,
+        ReliabilityInvalidInject,
+        ReliabilityInvalidVerify,
+        ReliabilityUnrelatedInject,
+        ReliabilityUnrelatedVerify,
+        ReliabilityUnrelatedComplete,
+        ReliabilityCqBlocked,
+        ReliabilityCqVerify,
+        ReliabilityCqAbortHeld,
+        ReliabilityCqAbortVerify,
+        ReliabilityPrecommitInject,
+        ReliabilityPrecommitVerify,
+        ReliabilityCommitInject,
+        ReliabilityCommitVerify,
+        ReliabilityCommitReplayVerify,
+        ReliabilityBoundaryInject,
+        ReliabilityBoundaryTryAck,
+        ReliabilityBoundaryVerify,
     };
 
     TestPort port;
+    FaultPort faultPort0;
+    FaultPort faultPort1;
     RequestorID requestorId;
     EventFunctionWrapper testEvent;
     Pvrdma *rdma = nullptr;
     Pvrdma *peerRdma = nullptr;
+    PvrdmaTestLink *testLink = nullptr;
     const bool commandTest;
     const std::string testMode;
     bool dsrConfigured = false;
     TimingStage timingStage = TimingStage::Configure;
     uint32_t pioError = 0;
+    uint64_t faultSendDone[2] = {};
+    bool faultRejectOnce[2] = {};
+    bool faultDrainWhileRejected = false;
+    std::vector<uint64_t> faultReceived[2];
+    size_t reliabilityCase = 0;
+    uint64_t reliabilityRxDmasBefore = 0;
 
     template <typename T>
     void write(Addr addr, const T &value, Request::Flags flags = 0);
@@ -157,8 +211,28 @@ class PvrdmaTester : public Platform
                            const pvrdma::transport::MacAddress &remote_mac,
                            uint32_t send_psn, uint32_t receive_psn);
     void setupPair();
+    void setupReliabilityPair();
+    void postReliabilityReceive(uint32_t length);
+    void postReliabilitySend(uint32_t length);
     void testInboundFrames();
     void runPair();
+    void runReliabilityPair();
+    void runReliabilityRnrPair();
+    void runReliabilityTimeoutZeroPair();
+    void runReliabilityInvalidPair();
+    void runReliabilityUnrelatedPair();
+    void runReliabilityCqPair();
+    void runReliabilityCqAbortPair();
+    void runReliabilityPrecommitAbortPair();
+    void runReliabilityCommitPair();
+    void runReliabilityCommitBoundaryPair();
+    void runFaultLink();
+    EthPacketPtr faultPacket(uint32_t psn, uint64_t message_id);
+    EthPacketPtr controlPacket(pvrdma::transport::Kind kind,
+        pvrdma::CompletionStatus status, uint32_t psn,
+        uint64_t message_id,
+        const pvrdma::transport::MacAddress &source,
+        const pvrdma::transport::MacAddress &destination);
 
   public:
     PARAMS(PvrdmaTester);

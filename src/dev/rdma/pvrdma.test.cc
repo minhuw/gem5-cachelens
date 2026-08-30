@@ -450,9 +450,26 @@ TEST(PvrdmaCompletionTest, EncodesOnlySupportedSendAndReceiveCqes)
     record.opcode = CompletionOpcode::RdmaWrite;
     EXPECT_FALSE(validCompletionRecord(record));
     record.opcode = CompletionOpcode::Send;
-    record.status = CompletionStatus::LocalLengthError;
+    record.byteLength = record.sourceQp = 0;
+    for (const auto status : {
+             CompletionStatus::LocalLengthError,
+             CompletionStatus::LocalQpOperationError,
+             CompletionStatus::LocalProtectionError,
+             CompletionStatus::LocalAccessError,
+             CompletionStatus::RemoteInvalidRequestError,
+             CompletionStatus::RemoteAccessError,
+             CompletionStatus::RemoteOperationError,
+             CompletionStatus::RetryExceededError,
+             CompletionStatus::RnrRetryExceededError,
+             CompletionStatus::GeneralError}) {
+        record.status = status;
+        EXPECT_TRUE(validCompletionRecord(record));
+    }
+    record.opcode = CompletionOpcode::Receive;
+    record.status = CompletionStatus::RetryExceededError;
     EXPECT_FALSE(validCompletionRecord(record));
     record.status = CompletionStatus::Success;
+    record.opcode = CompletionOpcode::Send;
     record.byteLength = 1;
     EXPECT_FALSE(validCompletionRecord(record));
 }
@@ -866,6 +883,8 @@ TEST(PvrdmaControlTest, CheckpointsOnlyStableIdleState)
     EXPECT_FALSE(checkpointStable(ControlState::Active, true));
     EXPECT_FALSE(checkpointStable(ControlState::Active, false, true));
     EXPECT_FALSE(checkpointStable(ControlState::Active, false, false, true));
+    EXPECT_FALSE(checkpointStable(ControlState::Active, false, false, false,
+                                  false, false, false, true));
     EXPECT_FALSE(checkpointStable(ControlState::ReadingDsr, false));
     EXPECT_FALSE(checkpointStable(ControlState::WritingCaps, false));
     EXPECT_FALSE(checkpointStable(ControlState::ReadingCommand, false));
@@ -1408,6 +1427,67 @@ TEST(PvrdmaQpTest, LooksUpOnlyExactGenerationDerivedQpn)
     EXPECT_EQ(findQueuePair(qps, (2 << SlotBits) | 1), nullptr);
 }
 
+TEST(PvrdmaTransportTest, DecodesReliabilityTimersAndRetries)
+{
+    EXPECT_EQ(ackTimeoutNanoseconds(0), 0);
+    EXPECT_EQ(ackTimeoutNanoseconds(1), 8192);
+    EXPECT_EQ(ackTimeoutNanoseconds(8), 1048576);
+    EXPECT_EQ(ackTimeoutNanoseconds(31), uint64_t{4096} << 31);
+    EXPECT_EQ(saturatingMultiply(5, 7, 100), 35);
+    EXPECT_EQ(saturatingMultiply(51, 2, 100), 100);
+    EXPECT_EQ(saturatingAdd(40, 50, 100), 90);
+    EXPECT_EQ(saturatingAdd(40, 61, 100), 100);
+    constexpr std::array<uint32_t, 32> expected = {
+        655360, 10, 20, 30, 40, 60, 80, 120,
+        160, 240, 320, 480, 640, 960, 1280, 1920,
+        2560, 3840, 5120, 7680, 10240, 15360, 20480, 30720,
+        40960, 61440, 81920, 122880, 163840, 245760, 327680, 491520,
+    };
+    EXPECT_EQ(RnrTimerMicros, expected);
+
+    uint8_t retry = 0;
+    EXPECT_FALSE(useRetry(retry));
+    retry = 2;
+    EXPECT_TRUE(useRetry(retry));
+    EXPECT_EQ(retry, 1);
+    EXPECT_TRUE(useRetry(retry));
+    EXPECT_EQ(retry, 0);
+    EXPECT_FALSE(useRetry(retry));
+    retry = 7;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        EXPECT_TRUE(useRetry(retry));
+        EXPECT_EQ(retry, 7);
+    }
+}
+
+TEST(PvrdmaTransportTest, ComputesCanonicalSegmentsAndLeaseRanges)
+{
+    for (const auto &[length, count] : {
+             std::pair{0U, uint16_t{1}}, {1U, uint16_t{1}},
+             {1023U, uint16_t{1}}, {1024U, uint16_t{1}},
+             {1025U, uint16_t{2}}, {MaxMessageSize, uint16_t{65535}}}) {
+        uint16_t actual = 0;
+        EXPECT_TRUE(segmentGeometry(length, actual));
+        EXPECT_EQ(actual, count);
+    }
+    uint16_t count = 0;
+    EXPECT_FALSE(segmentGeometry(MaxMessageSize + 1, count));
+
+    MemoryRegionLease lease{1, 0, {{0x1000, 3}, {0x2000, 4}}};
+    size_t chunk = 0;
+    size_t offset = 0;
+    EXPECT_TRUE(leaseRange(lease, 2, 4, chunk, offset));
+    EXPECT_EQ(chunk, 0);
+    EXPECT_EQ(offset, 2);
+    EXPECT_TRUE(leaseRange(lease, 3, 4, chunk, offset));
+    EXPECT_EQ(chunk, 1);
+    EXPECT_EQ(offset, 0);
+    EXPECT_TRUE(leaseRange(lease, 7, 0, chunk, offset));
+    EXPECT_EQ(chunk, 1);
+    EXPECT_EQ(offset, 4);
+    EXPECT_FALSE(leaseRange(lease, 4, 4, chunk, offset));
+}
+
 TEST(PvrdmaQpTest, ComputesExactConsumerAddressesAndPsnWrap)
 {
     const auto qp = testQueuePair();
@@ -1703,11 +1783,34 @@ TEST(PvrdmaQpTest, ReachesRtsQueriesStoredAttributesAndResets)
     EXPECT_EQ(letoh(attr.capabilities.maxSendSge), 1);
     EXPECT_EQ(letoh(attr.capabilities.maxRecvSge), 1);
 
+    auto &stored = qps.entries[1];
+    stored.state = QpState::Error;
+    stored.attributes.qpState = stored.attributes.currentQpState =
+        QpState::Error;
+    stored.finalReplay.valid = true;
+    stored.finalReplay.qpGeneration = stored.generation;
+    stored.finalReplay.localMac = {0x02, 0, 0, 0, 0, 2};
+    stored.finalReplay.localQpn = stored.qpn;
+    stored.finalReplay.remoteQpn = stored.attributes.destinationQpNumber;
+    stored.finalReplay.finalPsn =
+        (stored.attributes.receivePsn - 1) & transport::PsnMask;
+    stored.finalReplay.messageId = 1;
+    stored.finalReplay.totalLength = 1;
+    stored.finalReplay.segmentCount = 1;
+    EXPECT_TRUE(detail::validFinalReplay(stored));
+    ASSERT_EQ(detail::queryQp(query, response, qps).error, 0);
+    EXPECT_EQ(letoh(static_cast<uint32_t>(
+                  response.queryQp.attributes.qpState)),
+              static_cast<uint32_t>(QpState::Error));
+    EXPECT_EQ(modify(qps, QpState::Error, QpAttrState,
+                     {}, response).error, CommandError);
+
     QpAttr reset{};
     ASSERT_EQ(modify(qps, QpState::Reset, QpAttrState,
                      reset, response).error, 0);
     EXPECT_EQ(qps.entries[1].state, QpState::Reset);
     EXPECT_EQ(qps.entries[1].attributes.capabilities.maxSendWr, 32);
+    EXPECT_FALSE(qps.entries[1].finalReplay.valid);
     EXPECT_TRUE(validQueueObjects(cqs, qps, MemoryRegionTable{}, objects));
 }
 

@@ -38,3 +38,6 @@ if env['CONF']['USE_TEST_OBJECTS']:
 
     SimObject('PvrdmaTester.py', sim_objects=['PvrdmaTester'])
     Source('pvrdma_tester.cc')
+
+    SimObject('PvrdmaTestLink.py', sim_objects=['PvrdmaTestLink'])
+    Source('pvrdma_test_link.cc')

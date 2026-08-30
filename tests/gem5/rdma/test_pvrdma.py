@@ -51,6 +51,66 @@ for name, mode, marker in (
     )
 
 
+for name, marker in (
+    (
+        "precommit-abort-pair",
+        "PVRDMA_RELIABILITY_PRECOMMIT_ABORT_PAIR_OK",
+    ),
+    ("commit-pair", "PVRDMA_RELIABILITY_COMMIT_PAIR_OK"),
+    (
+        "commit-boundary-pair",
+        "PVRDMA_RELIABILITY_COMMIT_BOUNDARY_PAIR_OK",
+    ),
+):
+    gem5_verify_config(
+        name=f"pvrdma-timing-reliability-{name}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(marker)),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=("--mode", f"timing-reliability-{name}"),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
+
+
+for name, marker in (
+    ("reliability-pair", "PVRDMA_RELIABILITY_PAIR_OK"),
+    ("reliability-rnr-pair", "PVRDMA_RELIABILITY_RNR_PAIR_OK"),
+    (
+        "reliability-timeout-zero-pair",
+        "PVRDMA_RELIABILITY_TIMEOUT_ZERO_PAIR_OK",
+    ),
+    ("reliability-invalid-pair", "PVRDMA_RELIABILITY_INVALID_PAIR_OK"),
+    (
+        "reliability-unrelated-pair",
+        "PVRDMA_RELIABILITY_UNRELATED_PAIR_OK",
+    ),
+    ("reliability-cq-pair", "PVRDMA_RELIABILITY_CQ_PAIR_OK"),
+    (
+        "reliability-cq-abort-pair",
+        "PVRDMA_RELIABILITY_CQ_ABORT_PAIR_OK",
+    ),
+    ("fault-link", "PVRDMA_FAULT_LINK_OK"),
+):
+    for prefix in ("", "timing-"):
+        mode = f"{prefix}{name}"
+        gem5_verify_config(
+            name=f"pvrdma-{mode}",
+            fixtures=(),
+            verifiers=(verifier.MatchRegex(re.compile(marker)),),
+            config=joinpath(
+                absdirpath(__file__), "configs", "pvrdma_runtime.py"
+            ),
+            config_args=("--mode", mode),
+            valid_isas=(constants.x86_tag,),
+            valid_hosts=constants.supported_hosts,
+            length=constants.quick_tag,
+        )
+
+
 for name, mode, marker in (
     ("mr-walk", "timing-mr", "PVRDMA_TIMING_MR_OK"),
     ("queue-walk", "timing-queues", "PVRDMA_TIMING_QUEUES_OK"),
@@ -153,16 +213,13 @@ def pvrdma_observation_checkpoint_test(host):
             assert result.returncode == 0
             assert marker in result.stdout
             if phase == "save":
-                path = checkpoint / "m5.cpt"
-                contents, replacements = re.subn(
-                    r"(\[system\.rdma\.cq1\][\s\S]*?^producerTail=)0$",
-                    r"\g<1>3",
-                    path.read_text(),
-                    count=1,
+                contents = (checkpoint / "m5.cpt").read_text()
+                match = re.search(
+                    r"\[system\.rdma\.cq1\][\s\S]*?^producerTail=(\d+)$",
+                    contents,
                     flags=re.MULTILINE,
                 )
-                assert replacements == 1
-                path.write_text(contents)
+                assert match and match.group(1) == "3"
 
     name = f"pvrdma-checkpoint-queue-observation-{host}-opt"
     TestSuite(

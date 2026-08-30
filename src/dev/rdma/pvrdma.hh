@@ -48,7 +48,15 @@ inline constexpr uint32_t RqStride = 32;
 inline constexpr uint32_t SupportedMrAccess = AccessLocalWrite |
     AccessRemoteWrite | AccessRemoteRead | AccessRemoteAtomic;
 inline constexpr uint32_t FixedMtu = 1024;
-inline constexpr uint32_t MaxMessageSize = uint32_t{1} << 31;
+inline constexpr uint32_t MaxMessageSegments =
+    std::numeric_limits<uint16_t>::max();
+inline constexpr uint32_t MaxMessageSize = MaxMessageSegments * FixedMtu;
+inline constexpr std::array<uint32_t, 32> RnrTimerMicros = {
+    655360, 10, 20, 30, 40, 60, 80, 120,
+    160, 240, 320, 480, 640, 960, 1280, 1920,
+    2560, 3840, 5120, 7680, 10240, 15360, 20480, 30720,
+    40960, 61440, 81920, 122880, 163840, 245760, 327680, 491520,
+};
 inline constexpr uint16_t FullMembershipPkey = 0xffff;
 inline constexpr uint32_t QpDoorbellOffset = 0x00;
 inline constexpr uint32_t CqDoorbellOffset = 0x04;
@@ -107,16 +115,37 @@ struct CompletionRecord
 };
 
 inline bool
+supportedCompletionStatus(CompletionStatus status)
+{
+    switch (status) {
+      case CompletionStatus::Success:
+      case CompletionStatus::LocalLengthError:
+      case CompletionStatus::LocalQpOperationError:
+      case CompletionStatus::LocalProtectionError:
+      case CompletionStatus::LocalAccessError:
+      case CompletionStatus::RemoteInvalidRequestError:
+      case CompletionStatus::RemoteAccessError:
+      case CompletionStatus::RemoteOperationError:
+      case CompletionStatus::RetryExceededError:
+      case CompletionStatus::RnrRetryExceededError:
+      case CompletionStatus::GeneralError:
+        return true;
+      default:
+        return false;
+    }
+}
+
+inline bool
 validCompletionRecord(const CompletionRecord &record)
 {
+    const bool send = record.opcode == CompletionOpcode::Send;
     return record.cqHandle && record.cqHandle < ObjectTableEntries &&
         record.qpHandle && record.qpHandle < ObjectTableEntries &&
-        (record.opcode == CompletionOpcode::Send ||
-         record.opcode == CompletionOpcode::Receive) &&
-        (record.status == CompletionStatus::Success ||
-         record.status == CompletionStatus::GeneralError) &&
-        (record.opcode == CompletionOpcode::Receive ||
-         (!record.byteLength && !record.sourceQp));
+        (send || record.opcode == CompletionOpcode::Receive) &&
+        supportedCompletionStatus(record.status) &&
+        (send || (record.status != CompletionStatus::RetryExceededError &&
+                  record.status != CompletionStatus::RnrRetryExceededError)) &&
+        (!send || (!record.byteLength && !record.sourceQp));
 }
 
 inline CompletionQueueElement
@@ -382,11 +411,12 @@ checkpointStable(ControlState state, bool dma_pending,
                  bool observation_active = false,
                  bool completion_active = false,
                  bool transport_active = false,
-                 bool runnable_sq = false)
+                 bool runnable_sq = false,
+                 bool active_mr = false)
 {
     return stable(state) && !dma_pending && !observation_queued &&
            !observation_active && !completion_active && !transport_active &&
-           !runnable_sq;
+           !runnable_sq && !active_mr;
 }
 
 constexpr Register
@@ -786,6 +816,21 @@ struct CompletionQueueTable
     }
 };
 
+struct FinalReplay
+{
+    bool valid = false;
+    uint32_t qpGeneration = 0;
+    transport::MacAddress localMac{};
+    transport::MacAddress remoteMac{};
+    uint32_t localQpn = 0;
+    uint32_t remoteQpn = 0;
+    uint32_t finalPsn = 0;
+    uint64_t messageId = 0;
+    uint32_t totalLength = 0;
+    uint16_t segmentIndex = 0;
+    uint16_t segmentCount = 0;
+};
+
 struct QueuePair
 {
     bool valid = false;
@@ -808,6 +853,7 @@ struct QueuePair
     uint32_t sqConsumerHead = 0;
     uint32_t rqProducerTail = 0;
     uint32_t rqConsumerHead = 0;
+    FinalReplay finalReplay{};
     std::vector<uint64_t> pages;
 };
 
@@ -982,6 +1028,93 @@ advancePsn(uint32_t psn)
     return (psn + 1) & transport::PsnMask;
 }
 
+constexpr uint32_t
+psnDistance(uint32_t from, uint32_t to)
+{
+    return (to - from) & transport::PsnMask;
+}
+
+constexpr uint64_t
+saturatingMultiply(uint64_t value, uint64_t scale, uint64_t maximum)
+{
+    return scale && value > maximum / scale ? maximum : value * scale;
+}
+
+constexpr uint64_t
+saturatingAdd(uint64_t value, uint64_t addend, uint64_t maximum)
+{
+    return addend > maximum - value ? maximum : value + addend;
+}
+
+constexpr uint64_t
+ackTimeoutNanoseconds(uint8_t timeout)
+{
+    return timeout ? uint64_t{4096} << timeout : 0;
+}
+
+constexpr bool
+useRetry(uint8_t &remaining)
+{
+    if (remaining == 7)
+        return true;
+    if (!remaining)
+        return false;
+    --remaining;
+    return true;
+}
+
+inline bool
+segmentGeometry(uint32_t length, uint16_t &count)
+{
+    const uint64_t segments = length ?
+        (uint64_t{length} + FixedMtu - 1) / FixedMtu : 1;
+    if (segments > MaxMessageSegments)
+        return false;
+    count = segments;
+    return true;
+}
+
+inline bool
+canonicalData(const transport::Frame &frame)
+{
+    uint16_t count = 0;
+    if (!segmentGeometry(frame.totalLength, count) ||
+        frame.segmentCount != count || frame.segmentIndex >= count)
+        return false;
+    const uint32_t offset = uint32_t{frame.segmentIndex} * FixedMtu;
+    const uint32_t length = frame.totalLength == 0 ? 0 :
+        std::min(FixedMtu, frame.totalLength - offset);
+    return frame.payloadOffset == offset && frame.payload.size == length &&
+        frame.flags == ((frame.segmentIndex == 0 ? transport::First : 0) |
+            (frame.segmentIndex + 1 == count ? transport::Last : 0));
+}
+
+inline bool
+leaseRange(const MemoryRegionLease &lease, size_t offset, size_t length,
+           size_t &chunk_index, size_t &chunk_offset)
+{
+    size_t cursor = 0;
+    for (chunk_index = 0; chunk_index < lease.chunks.size(); ++chunk_index) {
+        const size_t next = cursor + lease.chunks[chunk_index].length;
+        if (offset < next || (offset == next && !length)) {
+            chunk_offset = offset - cursor;
+            size_t available = lease.chunks[chunk_index].length -
+                chunk_offset;
+            for (size_t i = chunk_index + 1; available < length &&
+                 i < lease.chunks.size(); ++i)
+                available += lease.chunks[i].length;
+            return available >= length;
+        }
+        cursor = next;
+    }
+    if (!length && offset == cursor) {
+        chunk_index = lease.chunks.size();
+        chunk_offset = 0;
+        return true;
+    }
+    return false;
+}
+
 inline bool
 queueConsumerAddress(const QueuePair &qp, QueueKind kind, uint64_t &address)
 {
@@ -1114,7 +1247,8 @@ validDoorbell(const Doorbell &doorbell, ControlState control_state,
     return qp.valid && qp.qpHandle == doorbell.handle &&
         qp.uar == doorbell.uar &&
         (kind == QueueKind::Sq ? qp.state == QpState::ReadyToSend :
-                                qp.state != QpState::Reset);
+            (qp.state == QpState::ReadyToReceive ||
+             qp.state == QpState::ReadyToSend));
 }
 
 inline bool
@@ -1257,7 +1391,7 @@ validSupportedState(QpState state)
 {
     return state == QpState::Reset || state == QpState::Init ||
         state == QpState::ReadyToReceive ||
-        state == QpState::ReadyToSend;
+        state == QpState::ReadyToSend || state == QpState::Error;
 }
 
 inline bool
@@ -1335,9 +1469,37 @@ validStoredQpAttributes(const QueuePair &qp)
         return !attr.sendPsn && !attr.maxReadAtomic && !attr.timeout &&
             !attr.retryCount && !attr.rnrRetry;
 
-    return qp.state == QpState::ReadyToSend && validPsn(attr.sendPsn) &&
+    return (qp.state == QpState::ReadyToSend ||
+            qp.state == QpState::Error) && validPsn(attr.sendPsn) &&
         attr.maxReadAtomic <= 1 && attr.timeout <= 31 &&
         attr.retryCount <= 7 && attr.rnrRetry <= 7;
+}
+
+inline bool
+validFinalReplay(const QueuePair &qp)
+{
+    const auto &replay = qp.finalReplay;
+    const auto zero_mac = [](const auto &mac) {
+        return std::all_of(mac.begin(), mac.end(),
+                           [](uint8_t byte) { return byte == 0; });
+    };
+    if (!replay.valid)
+        return replay.qpGeneration == 0 && replay.localQpn == 0 &&
+            replay.remoteQpn == 0 && replay.finalPsn == 0 &&
+            replay.messageId == 0 && replay.totalLength == 0 &&
+            replay.segmentIndex == 0 && replay.segmentCount == 0 &&
+            zero_mac(replay.localMac) && zero_mac(replay.remoteMac);
+    uint16_t count = 0;
+    return replay.qpGeneration == qp.generation &&
+        replay.localQpn == qp.qpn &&
+        replay.remoteQpn == qp.attributes.destinationQpNumber &&
+        std::equal(replay.remoteMac.begin(), replay.remoteMac.end(),
+                   qp.attributes.addressHandle.destinationMac) &&
+        validPsn(replay.finalPsn) && replay.messageId &&
+        segmentGeometry(replay.totalLength, count) &&
+        replay.segmentCount == count &&
+        replay.segmentIndex + 1 == replay.segmentCount &&
+        advancePsn(replay.finalPsn) == qp.attributes.receivePsn;
 }
 
 inline bool
@@ -1472,7 +1634,7 @@ validQueueObjects(const CompletionQueueTable &cqs,
                 !validStoredQpAttributes(qp) ||
                 qp.sqProducerTail || qp.sqConsumerHead ||
                 qp.rqProducerTail || qp.rqConsumerHead ||
-                !qp.pages.empty())
+                !validFinalReplay(qp) || !qp.pages.empty())
                 return false;
             continue;
         }
@@ -1505,7 +1667,7 @@ validQueueObjects(const CompletionQueueTable &cqs,
             qp.totalChunks != 1 + qp.sendChunks + qp.recvChunks ||
             qp.pages.size() != qp.totalChunks ||
             !validSupportedState(qp.state) ||
-            !validStoredQpAttributes(qp) ||
+            !validStoredQpAttributes(qp) || !validFinalReplay(qp) ||
             !ringSnapshotValid(qp.sqProducerTail, qp.sqConsumerHead,
                                qp.capabilities.maxSendWr) ||
             !ringSnapshotValid(qp.rqProducerTail, qp.rqConsumerHead,
@@ -2079,7 +2241,7 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
                   QpAttrAlternatePath | QpAttrPathMigrationState |
                   QpAttrCapabilities)) &&
         convertQpAttrFromAbi(request.modifyQp.attributes, attrs) &&
-        validSupportedState(attrs.qpState);
+        validSupportedState(attrs.qpState) && attrs.qpState != QpState::Error;
     auto *qp = success ? &qps.entries[handle] : nullptr;
     if (success && (mask & QpAttrCurrentState))
         success = validSupportedState(attrs.currentQpState) &&
@@ -2093,6 +2255,7 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
             qp->attributes.capabilities = qp->capabilities;
             qp->sqProducerTail = qp->sqConsumerHead = 0;
             qp->rqProducerTail = qp->rqConsumerHead = 0;
+            qp->finalReplay = {};
         }
     } else if (success && qp->state == QpState::Reset &&
                attrs.qpState == QpState::Init) {
@@ -2562,8 +2725,10 @@ class Pvrdma : public PciDevice
             ReadSqPayload,
             TryData,
             WaitResponse,
+            RetryWait,
             ReadRqWqe,
             WriteRqPayload,
+            WaitReceiveData,
             WaitReceiveCq,
             WriteSqConsumer,
             WriteRqConsumer,
@@ -2587,8 +2752,15 @@ class Pvrdma : public PciDevice
         bool leaseHeld = false;
         bool dmaBusy = false;
         bool completionBackpressured = false;
+        bool keepAfterControl = false;
+        bool terminalQpError = false;
+        bool abortAfterDma = false;
+        bool retryPending = false;
         size_t chunkIndex = 0;
         size_t chunkOffset = 0;
+        size_t dmaPayloadOffset = 0;
+        size_t dmaRemaining = 0;
+        size_t dmaChunkLength = 0;
         std::array<uint8_t, pvrdma::SqStride> sqSlot{};
         std::array<uint8_t, pvrdma::RqStride> rqSlot{};
         std::vector<uint8_t> payload;
@@ -2599,7 +2771,15 @@ class Pvrdma : public PciDevice
         uint32_t remoteQpn = 0;
         uint32_t psn = 0;
         uint32_t livePsn = 0;
+        uint32_t initialPsn = 0;
+        uint32_t acceptedPsn = 0;
         uint64_t messageId = 0;
+        uint32_t totalLength = 0;
+        uint16_t segmentIndex = 0;
+        uint16_t segmentCount = 0;
+        uint16_t acceptedSegmentIndex = 0;
+        uint8_t retryRemaining = 0;
+        uint8_t rnrRetryRemaining = 0;
         pvrdma::transport::Kind responseKind =
             pvrdma::transport::Kind::Data;
         pvrdma::CompletionStatus status =
@@ -2611,7 +2791,12 @@ class Pvrdma : public PciDevice
 
     EthPacketPtr pendingRxPacket;
     EthPacketPtr pendingErrorPacket;
+    EthPacketPtr precommitCompletionAbortPacket;
+    bool precommitCompletionAbort = false;
     bool transportPaused = false;
+    uint64_t receivePayloadDmaStarts = 0;
+    enum class TransportTimerKind : uint8_t { None, Ack, Rnr };
+    TransportTimerKind transportTimerKind = TransportTimerKind::None;
 
     struct QueueStats : public statistics::Group
     {
@@ -2671,6 +2856,7 @@ class Pvrdma : public PciDevice
     EventFunctionWrapper completionDmaEvent;
     EventFunctionWrapper transportEvent;
     EventFunctionWrapper transportDmaEvent;
+    EventFunctionWrapper transportTimerEvent;
 
     bool observationQueued() const;
     bool commandBlockedByObservation() const;
@@ -2694,8 +2880,11 @@ class Pvrdma : public PciDevice
     bool transportActive() const;
     bool transportDmaBusy() const;
     bool runnableSq() const;
+    bool activeMr() const;
     bool revalidateTransport(bool requireCq = false) const;
     bool revalidateTransportLease() const;
+    bool finalReceiveCommitted() const;
+    bool cancelUncommittedTransportCompletion();
     bool recvTransportPacket(EthPacketPtr packet);
     void transportSendDone();
     void scheduleTransport();
@@ -2708,10 +2897,13 @@ class Pvrdma : public PciDevice
     void startInbound();
     void startTransportDma(bool write, uint64_t address, size_t size,
                            uint8_t *data);
+    bool beginPayloadDma(bool write, size_t offset, size_t length);
     void startPayloadDma(bool write);
     void submitTransportCompletion();
     void transportCompletionDone(pvrdma::CompletionSubmitResult result);
-    void failSend();
+    void failSend(pvrdma::CompletionStatus status =
+                      pvrdma::CompletionStatus::GeneralError,
+                  bool notifyRemote = false, bool qpError = false);
     void prepareControl(pvrdma::transport::Kind kind,
                         pvrdma::CompletionStatus status =
                             pvrdma::CompletionStatus::Success);
@@ -2719,6 +2911,12 @@ class Pvrdma : public PciDevice
     void publishConsumer(pvrdma::QueueKind kind);
     void finishTransport(bool releaseLease = true);
     void clearTransport();
+    void armTransportTimer(TransportTimerKind kind, Tick delay);
+    void cancelTransportTimer();
+    void transportTimerExpired();
+    bool handleInboundContinuation(
+        const pvrdma::transport::EthernetDecodeResult &decoded);
+    bool replayFinal(const pvrdma::transport::EthernetDecodeResult &decoded);
 
     pvrdma::CompletionSubmitResult submitCompletion(
         const pvrdma::CompletionRecord &record,
