@@ -28,6 +28,12 @@ for name, args, marker in (
 
 
 for name, mode, marker in (
+    ("transport-pair", "transport-pair", "PVRDMA_TRANSPORT_PAIR_OK"),
+    (
+        "transport-pair-timing",
+        "timing-transport-pair",
+        "PVRDMA_TRANSPORT_PAIR_OK",
+    ),
     ("publication", "completion", "PVRDMA_COMPLETION_OK"),
     ("errors", "completion-errors", "PVRDMA_COMPLETION_ERRORS_OK"),
 ):

@@ -1396,6 +1396,34 @@ TEST(PvrdmaQpTest, EnforcesFrozenGeometryAndCreateValidation)
     EXPECT_FALSE(prepareCreateQp(malformed, objects, cqs, qps, build));
 }
 
+TEST(PvrdmaQpTest, LooksUpOnlyExactGenerationDerivedQpn)
+{
+    QueuePairTable qps;
+    qps.entries[1] = testQueuePair();
+    EXPECT_EQ(findQueuePair(qps, qps.entries[1].qpn), &qps.entries[1]);
+    EXPECT_EQ(findQueuePair(qps, 1), nullptr);
+    EXPECT_EQ(findQueuePair(qps, qps.entries[1].qpn + ObjectTableEntries),
+              nullptr);
+    qps.entries[1].valid = false;
+    EXPECT_EQ(findQueuePair(qps, (2 << SlotBits) | 1), nullptr);
+}
+
+TEST(PvrdmaQpTest, ComputesExactConsumerAddressesAndPsnWrap)
+{
+    const auto qp = testQueuePair();
+    uint64_t address = 0;
+    ASSERT_TRUE(queueConsumerAddress(qp, QueueKind::Sq, address));
+    EXPECT_EQ(address, qp.pages[0] + offsetof(RingState, tx) +
+                           offsetof(Ring, consumerHead));
+    ASSERT_TRUE(queueConsumerAddress(qp, QueueKind::Rq, address));
+    EXPECT_EQ(address, qp.pages[0] + offsetof(RingState, rx) +
+                           offsetof(Ring, consumerHead));
+    EXPECT_FALSE(queueConsumerAddress(qp, QueueKind::Cq, address));
+    EXPECT_TRUE(validPsn(transport::PsnMask));
+    EXPECT_FALSE(validPsn(transport::PsnMask + 1));
+    EXPECT_EQ(advancePsn(transport::PsnMask), 0);
+}
+
 TEST(PvrdmaQpTest, ComputesExactSqAndRqWqeAddresses)
 {
     const auto qp = testQueuePair();
@@ -1757,6 +1785,13 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
                      QpAttrMinRnrTimer | QpAttrDestinationQpn,
                      rtr, response).error, CommandError);
     rtr.maxDestinationReadAtomic = 0;
+    rtr.receivePsn = htole(transport::PsnMask + 1);
+    EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
+                     QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
+                     QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
+                     QpAttrMinRnrTimer | QpAttrDestinationQpn,
+                     rtr, response).error, CommandError);
+    rtr.receivePsn = htole(uint32_t{0x123456});
     ASSERT_EQ(modify(qps, QpState::ReadyToReceive,
                      QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
                      QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
@@ -1781,6 +1816,10 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
     EXPECT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, CommandError);
     rts.rnrRetry = 7;
+    rts.sendPsn = htole(transport::PsnMask + 1);
+    EXPECT_EQ(modify(qps, QpState::ReadyToSend,
+                     RtsMask, rts, response).error, CommandError);
+    rts.sendPsn = htole(uint32_t{0x654321});
     ASSERT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, 0);
 

@@ -3,6 +3,8 @@
 #ifndef __DEV_RDMA_PVRDMA_TRANSPORT_HH__
 #define __DEV_RDMA_PVRDMA_TRANSPORT_HH__
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +20,7 @@ namespace transport
 {
 
 inline constexpr uint16_t EtherType = 0x88b5;
+inline constexpr size_t EthernetHeaderSize = 14;
 inline constexpr size_t HeaderSize = 48;
 inline constexpr uint8_t Version = 1;
 inline constexpr size_t MaxPayloadSize = 1024;
@@ -52,6 +55,7 @@ enum class CodecError
     Truncated,
     ExtraPayload,
     BadMagic,
+    BadEtherType,
     BadVersion,
     BadKind,
     BadFlags,
@@ -66,6 +70,8 @@ enum class CodecError
     PayloadTooLarge,
     LengthOverflow,
 };
+
+using MacAddress = std::array<uint8_t, 6>;
 
 struct Frame
 {
@@ -98,6 +104,12 @@ struct DecodeResult
     Frame frame;
 
     explicit operator bool() const { return error == CodecError::None; }
+};
+
+struct EthernetDecodeResult : DecodeResult
+{
+    MacAddress destination;
+    MacAddress source;
 };
 
 namespace detail
@@ -327,6 +339,45 @@ decode(Bytes input, size_t logicalLength)
 
     const CodecError error = detail::validate(frame);
     return {error, error == CodecError::None ? frame : Frame{}};
+}
+
+inline EncodeResult
+encodeEthernet(const Frame &frame, const MacAddress &source,
+               const MacAddress &destination, MutableBytes output)
+{
+    if (!output.data || output.size < EthernetHeaderSize)
+        return {CodecError::BufferTooSmall, 0};
+    std::copy(destination.begin(), destination.end(), output.data);
+    std::copy(source.begin(), source.end(), output.data + 6);
+    detail::put16(output.data, 12, EtherType);
+    auto result = encode(frame,
+        {output.data + EthernetHeaderSize, output.size - EthernetHeaderSize});
+    if (result)
+        result.size += EthernetHeaderSize;
+    return result;
+}
+
+inline EthernetDecodeResult
+decodeEthernet(Bytes input, size_t logicalLength)
+{
+    EthernetDecodeResult result;
+    if (!input.data || logicalLength > input.size ||
+        logicalLength < EthernetHeaderSize) {
+        result.error = CodecError::Truncated;
+        return result;
+    }
+    std::copy_n(input.data, 6, result.destination.begin());
+    std::copy_n(input.data + 6, 6, result.source.begin());
+    if (detail::get16(input.data, 12) != EtherType) {
+        result.error = CodecError::BadEtherType;
+        return result;
+    }
+    const auto decoded = decode(
+        {input.data + EthernetHeaderSize, input.size - EthernetHeaderSize},
+        logicalLength - EthernetHeaderSize);
+    result.error = decoded.error;
+    result.frame = decoded.frame;
+    return result;
 }
 
 } // namespace transport

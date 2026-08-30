@@ -90,10 +90,43 @@ expectRoundTrip(const Frame &frame)
 TEST(PvrdmaTransportTest, Constants)
 {
     EXPECT_EQ(EtherType, 0x88b5);
+    EXPECT_EQ(EthernetHeaderSize, 14);
     EXPECT_EQ(HeaderSize, 48);
     EXPECT_EQ(Version, 1);
     EXPECT_EQ(MaxPayloadSize, 1024);
     EXPECT_EQ(PsnMask, 0x00ffffff);
+}
+
+TEST(PvrdmaTransportTest, EthernetEnvelopeRoundTripAndFiltering)
+{
+    const MacAddress source = {0x02, 0, 0, 0, 0, 1};
+    const MacAddress destination = {0x02, 0, 0, 0, 0, 2};
+    const std::array<uint8_t, 2> payload = {0xaa, 0xbb};
+    const auto frame = baseData(payload.data(), payload.size());
+    std::array<uint8_t, EthernetHeaderSize + HeaderSize + 2> bytes{};
+    const auto encoded = encodeEthernet(
+        frame, source, destination, {bytes.data(), bytes.size()});
+    ASSERT_TRUE(encoded);
+    EXPECT_EQ(encoded.size, bytes.size());
+    EXPECT_TRUE(std::equal(destination.begin(), destination.end(),
+                           bytes.begin()));
+    EXPECT_TRUE(std::equal(source.begin(), source.end(), bytes.begin() + 6));
+    EXPECT_EQ(bytes[12], 0x88);
+    EXPECT_EQ(bytes[13], 0xb5);
+
+    const auto decoded = decodeEthernet(
+        {bytes.data(), bytes.size()}, bytes.size());
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.source, source);
+    EXPECT_EQ(decoded.destination, destination);
+    EXPECT_EQ(decoded.frame.sourceQpn, frame.sourceQpn);
+    EXPECT_EQ(decoded.frame.payload.size, payload.size());
+
+    bytes[13] ^= 1;
+    EXPECT_EQ(decodeEthernet({bytes.data(), bytes.size()}, bytes.size()).error,
+              CodecError::BadEtherType);
+    EXPECT_EQ(decodeEthernet({bytes.data(), bytes.size()}, 13).error,
+              CodecError::Truncated);
 }
 
 TEST(PvrdmaTransportTest, GoldenDataHeader)

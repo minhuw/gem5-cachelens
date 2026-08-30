@@ -16,6 +16,7 @@
 #include "dev/pci/device.hh"
 #include "dev/rdma/pvrdma_abi.hh"
 #include "dev/rdma/pvrdma_ring.hh"
+#include "dev/rdma/pvrdma_transport.hh"
 #include "params/Pvrdma.hh"
 #include "sim/byteswap.hh"
 #include "sim/eventq.hh"
@@ -379,10 +380,13 @@ constexpr bool
 checkpointStable(ControlState state, bool dma_pending,
                  bool observation_queued = false,
                  bool observation_active = false,
-                 bool completion_active = false)
+                 bool completion_active = false,
+                 bool transport_active = false,
+                 bool runnable_sq = false)
 {
     return stable(state) && !dma_pending && !observation_queued &&
-           !observation_active && !completion_active;
+           !observation_active && !completion_active && !transport_active &&
+           !runnable_sq;
 }
 
 constexpr Register
@@ -944,6 +948,53 @@ struct QueuePairTable
     }
 };
 
+inline QueuePair *
+findQueuePair(QueuePairTable &qps, uint32_t qpn)
+{
+    const uint32_t slot = qpn & SlotMask;
+    if (!slot || slot >= ObjectTableEntries)
+        return nullptr;
+    auto &qp = qps.entries[slot];
+    return qp.valid && qp.qpn == qpn &&
+        qp.generation == (qpn >> SlotBits) ? &qp : nullptr;
+}
+
+inline const QueuePair *
+findQueuePair(const QueuePairTable &qps, uint32_t qpn)
+{
+    const uint32_t slot = qpn & SlotMask;
+    if (!slot || slot >= ObjectTableEntries)
+        return nullptr;
+    const auto &qp = qps.entries[slot];
+    return qp.valid && qp.qpn == qpn &&
+        qp.generation == (qpn >> SlotBits) ? &qp : nullptr;
+}
+
+constexpr bool
+validPsn(uint32_t psn)
+{
+    return !(psn & ~transport::PsnMask);
+}
+
+constexpr uint32_t
+advancePsn(uint32_t psn)
+{
+    return (psn + 1) & transport::PsnMask;
+}
+
+inline bool
+queueConsumerAddress(const QueuePair &qp, QueueKind kind, uint64_t &address)
+{
+    if (!qp.valid || qp.pages.empty() ||
+        (kind != QueueKind::Sq && kind != QueueKind::Rq))
+        return false;
+    address = qp.pages[0] +
+        (kind == QueueKind::Sq ? offsetof(RingState, tx) :
+                                 offsetof(RingState, rx)) +
+        offsetof(Ring, consumerHead);
+    return true;
+}
+
 inline bool
 wqeAddress(const QueuePair &qp, QueueKind kind, uint32_t consumer,
            uint64_t &address)
@@ -1276,6 +1327,7 @@ validStoredQpAttributes(const QueuePair &qp)
             zeroAddressVector(attr.addressHandle);
 
     if (attr.pathMtu != Mtu::Mtu1024 || !attr.destinationQpNumber ||
+        !validPsn(attr.receivePsn) ||
         attr.maxDestinationReadAtomic > 1 || attr.minRnrTimer > 31 ||
         !validAddressVector(attr.addressHandle))
         return false;
@@ -1283,8 +1335,9 @@ validStoredQpAttributes(const QueuePair &qp)
         return !attr.sendPsn && !attr.maxReadAtomic && !attr.timeout &&
             !attr.retryCount && !attr.rnrRetry;
 
-    return qp.state == QpState::ReadyToSend && attr.maxReadAtomic <= 1 &&
-        attr.timeout <= 31 && attr.retryCount <= 7 && attr.rnrRetry <= 7;
+    return qp.state == QpState::ReadyToSend && validPsn(attr.sendPsn) &&
+        attr.maxReadAtomic <= 1 && attr.timeout <= 31 &&
+        attr.retryCount <= 7 && attr.rnrRetry <= 7;
 }
 
 inline bool
@@ -2055,7 +2108,7 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
                attrs.qpState == QpState::ReadyToReceive) {
         success = transition_mask == RtrMask &&
             attrs.pathMtu == Mtu::Mtu1024 &&
-            attrs.destinationQpNumber &&
+            attrs.destinationQpNumber && validPsn(attrs.receivePsn) &&
             attrs.maxDestinationReadAtomic <= 1 &&
             attrs.minRnrTimer <= 31 &&
             validAddressVector(attrs.addressHandle);
@@ -2072,7 +2125,7 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
         }
     } else if (success && qp->state == QpState::ReadyToReceive &&
                attrs.qpState == QpState::ReadyToSend) {
-        success = transition_mask == RtsMask &&
+        success = transition_mask == RtsMask && validPsn(attrs.sendPsn) &&
             attrs.maxReadAtomic <= 1 && attrs.timeout <= 31 &&
             attrs.retryCount <= 7 && attrs.rnrRetry <= 7;
         if (success) {
@@ -2422,9 +2475,14 @@ class Pvrdma : public PciDevice
     class Interface : public EtherInt
     {
       public:
-        Interface(const std::string &name) : EtherInt(name) {}
-        bool recvPacket(EthPacketPtr) override { return false; }
-        void sendDone() override {}
+        Interface(const std::string &name, Pvrdma &device)
+            : EtherInt(name), device(device)
+        {}
+        bool recvPacket(EthPacketPtr packet) override;
+        void sendDone() override;
+
+      private:
+        Pvrdma &device;
     } interface;
 
     pvrdma::RegisterState regs;
@@ -2495,6 +2553,66 @@ class Pvrdma : public PciDevice
         void reset() { *this = {}; }
     } completionDma;
 
+    struct TransportState
+    {
+        enum class Stage : uint8_t
+        {
+            Idle,
+            ReadSqWqe,
+            ReadSqPayload,
+            TryData,
+            WaitResponse,
+            ReadRqWqe,
+            WriteRqPayload,
+            WaitReceiveCq,
+            WriteSqConsumer,
+            WriteRqConsumer,
+            TryAck,
+            TryRnr,
+            TryError,
+            WaitSendCq,
+        } stage = Stage::Idle;
+
+        pvrdma::QueueKind kind = pvrdma::QueueKind::None;
+        uint32_t qpHandle = 0;
+        uint32_t qpGeneration = 0;
+        uint32_t cqHandle = 0;
+        uint32_t cqGeneration = 0;
+        uint32_t consumer = 0;
+        uint32_t nextConsumer = 0;
+        uint32_t consumerLe = 0;
+        uint64_t wqeAddress = 0;
+        pvrdma::PreparedWqe wqe{};
+        pvrdma::MemoryRegionLease lease{};
+        bool leaseHeld = false;
+        bool dmaBusy = false;
+        bool completionBackpressured = false;
+        size_t chunkIndex = 0;
+        size_t chunkOffset = 0;
+        std::array<uint8_t, pvrdma::SqStride> sqSlot{};
+        std::array<uint8_t, pvrdma::RqStride> rqSlot{};
+        std::vector<uint8_t> payload;
+        EthPacketPtr packet;
+        pvrdma::transport::MacAddress localMac{};
+        pvrdma::transport::MacAddress remoteMac{};
+        uint32_t localQpn = 0;
+        uint32_t remoteQpn = 0;
+        uint32_t psn = 0;
+        uint32_t livePsn = 0;
+        uint64_t messageId = 0;
+        pvrdma::transport::Kind responseKind =
+            pvrdma::transport::Kind::Data;
+        pvrdma::CompletionStatus status =
+            pvrdma::CompletionStatus::Success;
+
+        bool active() const { return stage != Stage::Idle; }
+        void reset() { *this = {}; }
+    } transport;
+
+    EthPacketPtr pendingRxPacket;
+    EthPacketPtr pendingErrorPacket;
+    bool transportPaused = false;
+
     struct QueueStats : public statistics::Group
     {
         QueueStats(Pvrdma &parent);
@@ -2512,6 +2630,8 @@ class Pvrdma : public PciDevice
         statistics::Scalar cqOutstandingAtReset;
         statistics::Scalar sqPosted;
         statistics::Scalar rqPosted;
+        statistics::Scalar sqConsumed;
+        statistics::Scalar rqConsumed;
         statistics::Scalar cqReclaimed;
         statistics::Scalar cqPublished;
         statistics::Scalar cqErrorPublished;
@@ -2549,6 +2669,8 @@ class Pvrdma : public PciDevice
     EventFunctionWrapper observationEvent;
     EventFunctionWrapper queueDmaEvent;
     EventFunctionWrapper completionDmaEvent;
+    EventFunctionWrapper transportEvent;
+    EventFunctionWrapper transportDmaEvent;
 
     bool observationQueued() const;
     bool commandBlockedByObservation() const;
@@ -2568,6 +2690,35 @@ class Pvrdma : public PciDevice
     void refreshQueueGauges();
     void queueStatsReset();
     void checkQueueConservation();
+
+    bool transportActive() const;
+    bool transportDmaBusy() const;
+    bool runnableSq() const;
+    bool revalidateTransport(bool requireCq = false) const;
+    bool revalidateTransportLease() const;
+    bool recvTransportPacket(EthPacketPtr packet);
+    void transportSendDone();
+    void scheduleTransport();
+    void runTransport();
+    void transportDmaDone();
+    bool selectSend();
+    void queueReverseError(
+        const pvrdma::transport::Frame &received,
+        const pvrdma::transport::MacAddress &sourceMac);
+    void startInbound();
+    void startTransportDma(bool write, uint64_t address, size_t size,
+                           uint8_t *data);
+    void startPayloadDma(bool write);
+    void submitTransportCompletion();
+    void transportCompletionDone(pvrdma::CompletionSubmitResult result);
+    void failSend();
+    void prepareControl(pvrdma::transport::Kind kind,
+                        pvrdma::CompletionStatus status =
+                            pvrdma::CompletionStatus::Success);
+    bool tryTransportPacket();
+    void publishConsumer(pvrdma::QueueKind kind);
+    void finishTransport(bool releaseLease = true);
+    void clearTransport();
 
     pvrdma::CompletionSubmitResult submitCompletion(
         const pvrdma::CompletionRecord &record,

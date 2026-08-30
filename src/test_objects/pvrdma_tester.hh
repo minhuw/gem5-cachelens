@@ -76,12 +76,24 @@ class PvrdmaTester : public Platform
         CompletionMalformed,
         CompletionTimingCqe,
         CompletionTimingCqProducer,
+        PairPostSq,
+        PairMacWrite,
+        PairVerify,
+        PairVerifyRnr,
+        PairPostShort,
+        PairVerifyShort,
+        PairVerifyMalformed,
+        PairPostCq,
+        PairVerifyCqBlocked,
+        PairVerifyCqRecovered,
+        PairVerifyStale,
     };
 
     TestPort port;
     RequestorID requestorId;
     EventFunctionWrapper testEvent;
     Pvrdma *rdma = nullptr;
+    Pvrdma *peerRdma = nullptr;
     const bool commandTest;
     const std::string testMode;
     bool dsrConfigured = false;
@@ -140,6 +152,13 @@ class PvrdmaTester : public Platform
     void testCheckpointObservationRestore();
     void testCheckpointCompletionSave();
     void testCheckpointCompletionRestore();
+    void setupPairEndpoint(Pvrdma &device, Addr qp_page, Addr cq_page,
+                           Addr mr_page,
+                           const pvrdma::transport::MacAddress &remote_mac,
+                           uint32_t send_psn, uint32_t receive_psn);
+    void setupPair();
+    void testInboundFrames();
+    void runPair();
 
   public:
     PARAMS(PvrdmaTester);

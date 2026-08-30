@@ -7,6 +7,7 @@ import re
 import m5
 from m5.objects import (
     AddrRange,
+    EtherLink,
     GenericPciHost,
     Pvrdma,
     PvrdmaTester,
@@ -26,6 +27,8 @@ parser.add_argument(
         "timing-queues",
         "timing-observation",
         "timing-completion",
+        "transport-pair",
+        "timing-transport-pair",
         "completion",
         "completion-errors",
         "stats-reset",
@@ -69,6 +72,21 @@ system.rdma = Pvrdma(
     InterruptPin=2,
     hardware_address="02:00:00:00:00:01",
 )
+if args.mode.endswith("transport-pair"):
+    system.peer_rdma = Pvrdma(
+        host=system.pci_host,
+        pci_bus=0,
+        pci_dev=3,
+        pci_func=1,
+        InterruptLine=19,
+        InterruptPin=2,
+        hardware_address="02:00:00:00:00:02",
+    )
+    system.rdma_link = EtherLink(
+        speed="10Gbps", delay="10ns", delay_var="0ns"
+    )
+    system.rdma.interface = system.rdma_link.int0
+    system.peer_rdma.interface = system.rdma_link.int1
 
 system.system_port = system.bus.cpu_side_ports
 system.memory.port = system.bus.mem_side_ports
@@ -76,6 +94,9 @@ system.tester.port = system.bus.cpu_side_ports
 system.pci_host.pio = system.bus.mem_side_ports
 system.rdma.pio = system.bus.mem_side_ports
 system.rdma.dma = system.bus.cpu_side_ports
+if args.mode.endswith("transport-pair"):
+    system.peer_rdma.pio = system.bus.mem_side_ports
+    system.peer_rdma.dma = system.bus.cpu_side_ports
 
 root = Root(full_system=False, system=system)
 m5.instantiate(
@@ -83,7 +104,10 @@ m5.instantiate(
 )
 exit_event = m5.simulate()
 
-if args.mode == "timing-mr":
+if args.mode in ("transport-pair", "timing-transport-pair"):
+    assert exit_event.getCause() == "PVRDMA transport pair test passed"
+    print("PVRDMA_TRANSPORT_PAIR_OK")
+elif args.mode == "timing-mr":
     assert exit_event.getCause() == "PVRDMA timing MR test passed"
     print("PVRDMA_TIMING_MR_OK")
 elif args.mode == "timing-queues":
