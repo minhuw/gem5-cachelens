@@ -554,6 +554,24 @@ struct RegisterState
     }
 };
 
+inline transport::MacAddress
+transportMac(const RegisterState &regs, bool word_swap)
+{
+    transport::MacAddress mac = {
+        static_cast<uint8_t>(regs.macLow),
+        static_cast<uint8_t>(regs.macLow >> 8),
+        static_cast<uint8_t>(regs.macLow >> 16),
+        static_cast<uint8_t>(regs.macLow >> 24),
+        static_cast<uint8_t>(regs.macHigh),
+        static_cast<uint8_t>(regs.macHigh >> 8),
+    };
+    if (word_swap) {
+        for (size_t i = 0; i < mac.size(); i += 2)
+            std::swap(mac[i], mac[i + 1]);
+    }
+    return mac;
+}
+
 using GidTable = std::array<Gid, GidTableEntries>;
 using GidValidTable = std::array<uint8_t, GidTableEntries>;
 
@@ -2683,6 +2701,7 @@ class Pvrdma : public PciDevice
     uint32_t objectTableIndex = 0;
     pvrdma::OperationErrorState operationError;
     bool intxAsserted = false;
+    const bool companionMacWordSwap;
     const Tick controlCompletionLatency;
 
     struct QueueDmaState

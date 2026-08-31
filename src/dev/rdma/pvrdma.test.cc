@@ -322,6 +322,16 @@ TEST(PvrdmaRegisterTest, ResetRestoresMutableConstructorState)
     EXPECT_EQ(regs.macHigh, 0x6655);
 }
 
+TEST(PvrdmaRegisterTest, DerivesCompanionTransportMac)
+{
+    const RegisterState regs(0x00009002, 0x0100);
+    const transport::MacAddress configured = {0x02, 0x90, 0, 0, 0, 1};
+    const transport::MacAddress companion = {0x90, 0x02, 0, 0, 1, 0};
+
+    EXPECT_EQ(transportMac(regs, false), configured);
+    EXPECT_EQ(transportMac(regs, true), companion);
+}
+
 TEST(PvrdmaControlTest, PublishesFrozenCapabilitiesAndGuid)
 {
     const auto caps = makeCapabilities(0x33221100, 0x5544);

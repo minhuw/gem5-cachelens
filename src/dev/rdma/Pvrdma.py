@@ -31,6 +31,9 @@ class Pvrdma(PciDevice):
     hardware_address = Param.EthernetAddr(
         NextEthernetAddr, "PVRDMA MAC address"
     )
+    companion_mac_word_swap = Param.Bool(
+        False, "Swap bytes within companion NIC EEPROM words"
+    )
     control_completion_latency = Param.Latency(
         "10us", "Conservative DSR and command PIO completion latency"
     )

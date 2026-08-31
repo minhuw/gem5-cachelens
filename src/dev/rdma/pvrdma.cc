@@ -96,6 +96,7 @@ Pvrdma::QueueStats::preDumpStats()
 
 Pvrdma::Pvrdma(const Params &p)
     : PciDevice(p), interface(name() + ".interface", *this),
+      companionMacWordSwap(p.companion_mac_word_swap),
       controlCompletionLatency(p.control_completion_latency),
       queueStats(*this),
       dsrReadEvent([this] { dsrReadDone(); }, name() + ".dsrRead"),
@@ -640,19 +641,6 @@ namespace
 {
 
 pvrdma::transport::MacAddress
-deviceMac(const pvrdma::RegisterState &regs)
-{
-    return {
-        static_cast<uint8_t>(regs.macLow),
-        static_cast<uint8_t>(regs.macLow >> 8),
-        static_cast<uint8_t>(regs.macLow >> 16),
-        static_cast<uint8_t>(regs.macLow >> 24),
-        static_cast<uint8_t>(regs.macHigh),
-        static_cast<uint8_t>(regs.macHigh >> 8),
-    };
-}
-
-pvrdma::transport::MacAddress
 storedMac(const pvrdma::QueuePair &qp)
 {
     pvrdma::transport::MacAddress mac;
@@ -847,7 +835,8 @@ Pvrdma::recvTransportPacket(EthPacketPtr packet)
         return true;
     const auto decoded = pvrdma::transport::decodeEthernet(
         {packet->data, packet->bufLength}, packet->length);
-    if (!decoded || decoded.destination != deviceMac(regs))
+    if (!decoded || decoded.destination !=
+            pvrdma::transportMac(regs, companionMacWordSwap))
         return true;
 
     const auto &frame = decoded.frame;
@@ -1123,7 +1112,8 @@ Pvrdma::replayFinal(
     transport.cqGeneration = completionQueues.entries[
         qp->recvCqHandle].generation;
     transport.consumer = qp->rqConsumerHead;
-    transport.localMac = deviceMac(regs);
+    transport.localMac = pvrdma::transportMac(
+        regs, companionMacWordSwap);
     transport.remoteMac = decoded.source;
     transport.localQpn = qp->qpn;
     transport.remoteQpn = frame.sourceQpn;
@@ -1185,7 +1175,8 @@ Pvrdma::selectSend()
         transport.nextConsumer = pvrdma::ringAdvance(
             transport.consumer, qp.capabilities.maxSendWr);
         transport.consumerLe = htole(transport.nextConsumer);
-        transport.localMac = deviceMac(regs);
+        transport.localMac = pvrdma::transportMac(
+            regs, companionMacWordSwap);
         transport.remoteMac = storedMac(qp);
         transport.localQpn = qp.qpn;
         transport.remoteQpn = qp.attributes.destinationQpNumber;
@@ -1227,7 +1218,7 @@ Pvrdma::queueReverseError(
         pvrdma::transport::HeaderSize;
     pendingErrorPacket = std::make_shared<EthPacketData>(size);
     const auto encoded = pvrdma::transport::encodeEthernet(
-        error, deviceMac(regs), source_mac,
+        error, pvrdma::transportMac(regs, companionMacWordSwap), source_mac,
         {pendingErrorPacket->data, pendingErrorPacket->bufLength});
     if (!encoded) {
         pendingErrorPacket.reset();
@@ -1245,7 +1236,8 @@ Pvrdma::startInbound()
     const EthPacketPtr packet = std::move(pendingRxPacket);
     const auto decoded = pvrdma::transport::decodeEthernet(
         {packet->data, packet->bufLength}, packet->length);
-    if (!decoded || decoded.destination != deviceMac(regs))
+    if (!decoded || decoded.destination !=
+            pvrdma::transportMac(regs, companionMacWordSwap))
         return;
     if (replayFinal(decoded)) {
         scheduleTransport();
@@ -1277,7 +1269,8 @@ Pvrdma::startInbound()
     transport.nextConsumer = pvrdma::ringAdvance(
         transport.consumer, qp->capabilities.maxRecvWr);
     transport.consumerLe = htole(transport.nextConsumer);
-    transport.localMac = deviceMac(regs);
+    transport.localMac = pvrdma::transportMac(
+        regs, companionMacWordSwap);
     transport.remoteMac = decoded.source;
     transport.localQpn = qp->qpn;
     transport.remoteQpn = frame.sourceQpn;
