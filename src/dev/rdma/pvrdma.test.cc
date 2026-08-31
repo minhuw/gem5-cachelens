@@ -2060,6 +2060,8 @@ TEST(PvrdmaDoorbellTest, ValidatesLiveHandleUarAndQpState)
     ASSERT_TRUE(decodeDoorbell(2 * UarPageSize, 4,
                                RqDoorbellAction | 1, doorbell));
     EXPECT_TRUE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+    qp.state = QpState::Init;
+    EXPECT_TRUE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
     qp.state = QpState::Reset;
     EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
     qp.state = QpState::ReadyToSend;
@@ -2075,6 +2077,16 @@ TEST(PvrdmaDoorbellTest, ValidatesLiveHandleUarAndQpState)
     EXPECT_FALSE(validDoorbell(doorbell, ControlState::Ready, cqs, qps));
     cqs.entries[1].valid = false;
     EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+}
+
+TEST(PvrdmaDoorbellTest, EmptyCqPollsDoNotNeedObservation)
+{
+    CompletionQueue cq;
+    EXPECT_FALSE(cqPollNeedsObservation(cq));
+    cq.producerTail = 1;
+    EXPECT_TRUE(cqPollNeedsObservation(cq));
+    cq.consumerHead = 1;
+    EXPECT_FALSE(cqPollNeedsObservation(cq));
 }
 
 TEST(PvrdmaDoorbellTest, BlocksOnlyQueueDestroyAndResetTargets)

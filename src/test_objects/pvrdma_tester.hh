@@ -75,6 +75,8 @@ class PvrdmaTester : public Platform
         BadQpLate,
         DestroyCq,
         ObservationActive,
+        ObservationCommandActive,
+        ObservationCommandDone,
         ObservationMalformed,
         ObservationReset,
         ObservationDone,
@@ -95,7 +97,9 @@ class PvrdmaTester : public Platform
         CompletionTimingCqe,
         CompletionTimingCqProducer,
         PairPostSq,
+        PairPollSq,
         PairMacWrite,
+        PairPollInbound,
         PairVerify,
         PairVerifyRnr,
         PairPostShort,
@@ -161,6 +165,8 @@ class PvrdmaTester : public Platform
     std::vector<uint64_t> faultReceived[2];
     size_t reliabilityCase = 0;
     uint64_t reliabilityRxDmasBefore = 0;
+    uint32_t busyPolls = 0;
+    bool sawCqPublishPollRace = false;
 
     template <typename T>
     void write(Addr addr, const T &value, Request::Flags flags = 0);

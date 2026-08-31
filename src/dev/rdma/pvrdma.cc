@@ -290,13 +290,6 @@ Pvrdma::completionBusy() const
 }
 
 bool
-Pvrdma::commandBlockedByObservation() const
-{
-    return observationQueued() || queueDma.active() || completionBusy() ||
-        transportActive();
-}
-
-bool
 Pvrdma::validDoorbell(const pvrdma::Doorbell &doorbell) const
 {
     return pvrdma::validDoorbell(doorbell, controlState, completionQueues,
@@ -327,6 +320,14 @@ Pvrdma::writeDoorbell(uint64_t offset, PacketPtr pkt)
         queueStats.cqPollDoorbells++;
         if (transport.active() && transport.cqHandle == doorbell.handle)
             transport.completionBackpressured = false;
+        if (!pvrdma::cqPollNeedsObservation(
+                completionQueues.entries[doorbell.handle]) &&
+            !(completionDma.stage ==
+                  CompletionDmaState::Stage::PublishCqProducer &&
+              completionDma.record.cqHandle == doorbell.handle)) {
+            scheduleTransport();
+            return;
+        }
         break;
       case pvrdma::DoorbellAction::CqArmSolicited:
         queueStats.cqArmDoorbells++;
@@ -439,7 +440,8 @@ Pvrdma::revalidateObservation() const
         depth == queueDma.depth && address == queueDma.ringAddress &&
         (kind == pvrdma::QueueKind::Sq ?
              qp.state == pvrdma::QpState::ReadyToSend :
-             (qp.state == pvrdma::QpState::ReadyToReceive ||
+             (qp.state == pvrdma::QpState::Init ||
+              qp.state == pvrdma::QpState::ReadyToReceive ||
               qp.state == pvrdma::QpState::ReadyToSend));
 }
 
@@ -2188,7 +2190,7 @@ void
 Pvrdma::startCommand(uint32_t value)
 {
     regs.request = value;
-    if (value != 0 || commandBlockedByObservation() ||
+    if (value != 0 || completionBusy() || transportActive() ||
         !pvrdma::beginCommand(controlState)) {
         operationError.set(regs.error, pvrdma::CommandError);
         return;

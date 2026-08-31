@@ -975,7 +975,6 @@ PvrdmaTester::runTimingQueues()
                   htole(static_cast<uint16_t>(
                       pvrdma::SqDoorbellAction | 1)), MmioFlags);
             ringDoorbell(pvrdma::SqDoorbellAction, 2);
-            startQueryQp(0x8080808080808080);
             timingStage = TimingStage::ObservationActive;
         } else {
             startQueryQp(0x8080808080808080);
@@ -983,7 +982,7 @@ PvrdmaTester::runTimingQueues()
         }
         schedule(testEvent, curTick() +
             (timingStage == TimingStage::ObservationActive ?
-                 microseconds(1) : LongDelay));
+                 2 * sim_clock::as_int::ns : LongDelay));
         return;
       case TimingStage::DestroyQp: {
         const auto response = verifyResponse(pvrdma::Command::QueryQp,
@@ -1058,19 +1057,33 @@ PvrdmaTester::runTimingQueues()
         exitSimLoop("PVRDMA timing queue test passed");
         return;
       case TimingStage::ObservationActive:
+        panic_if(!rdma->queueDma.active(),
+                 "PVRDMA queue observation did not start");
+        startQueryQp(0x8080808080808080);
         panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
-                                MmioFlags) != pvrdma::CommandError,
-                 "PVRDMA queued observation did not reject command");
+                                MmioFlags) != 0,
+                 "PVRDMA active observation rejected command DMA");
+        timingStage = TimingStage::ObservationCommandActive;
+        schedule(testEvent, curTick() + microseconds(1));
+        return;
+      case TimingStage::ObservationCommandActive:
+        panic_if(!rdma->queueDma.active() ||
+                     rdma->controlState !=
+                         pvrdma::ControlState::ReadingCommand,
+                 "PVRDMA observation did not overlap command DMA");
+        timingStage = TimingStage::ObservationCommandDone;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::ObservationCommandDone:
+        verifyResponse(pvrdma::Command::QueryQp,
+                       0x8080808080808080);
         postObservedRings(4, 6);
         ringDoorbell(pvrdma::SqDoorbellAction);
         ringDoorbell(pvrdma::RqDoorbellAction);
-        write(RegisterBarAddress + pvrdma::RegControl,
-              htole(static_cast<uint32_t>(
-                  pvrdma::DeviceControl::Reset)), MmioFlags);
-        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
-                                MmioFlags) != pvrdma::CommandError,
-                 "PVRDMA reset raced active queue DMA");
         destroyQp();
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != 0,
+                 "PVRDMA queued observation rejected command DMA");
         timingStage = TimingStage::ObservationDone;
         schedule(testEvent, curTick() + LongDelay);
         return;
@@ -2024,11 +2037,54 @@ PvrdmaTester::setupPair()
         write(PairReceiverRq + i * pvrdma::RqStride, receive_slot);
     }
 
+    peerRdma->commandSlotAddress = CommandAddress;
+    peerRdma->responseSlotAddress = ResponseAddress;
+    peerRdma->commandSlotDmaAddress = peerRdma->pciToDma(CommandAddress);
+    peerRdma->responseSlotDmaAddress = peerRdma->pciToDma(ResponseAddress);
+
+    auto &receiver_qp = peerRdma->queuePairs.entries[1];
+    receiver_qp.state = pvrdma::QpState::Init;
+    receiver_qp.attributes = {};
+    receiver_qp.attributes.qpState = receiver_qp.attributes.currentQpState =
+        receiver_qp.state;
+    receiver_qp.attributes.qpAccessFlags = pvrdma::AccessLocalWrite;
+    receiver_qp.attributes.portNumber = 1;
+    receiver_qp.attributes.capabilities = receiver_qp.capabilities;
     pvrdma::RingState receiver_rings{};
     receiver_rings.rx.producerTail = htole(uint32_t{3});
     write(PairReceiverQp, receiver_rings);
     write(PeerUarBarAddress + pvrdma::UarPageSize,
           htole(pvrdma::RqDoorbellAction | 1), MmioFlags);
+
+    pvrdma::CommandRequest request{};
+    request.header.response = htole(uint64_t{0x6060606060606060});
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::ModifyQp));
+    request.modifyQp.qpHandle = htole(uint32_t{1});
+    request.modifyQp.attributeMask = htole(
+        pvrdma::QpAttrState | pvrdma::QpAttrAddressVector |
+        pvrdma::QpAttrPathMtu | pvrdma::QpAttrReceivePsn |
+        pvrdma::QpAttrMaxDestReadAtomic | pvrdma::QpAttrMinRnrTimer |
+        pvrdma::QpAttrDestinationQpn);
+    auto &attrs = request.modifyQp.attributes;
+    attrs.qpState = static_cast<pvrdma::QpState>(htole(
+        static_cast<uint32_t>(pvrdma::QpState::ReadyToReceive)));
+    attrs.pathMtu = static_cast<pvrdma::Mtu>(htole(
+        static_cast<uint32_t>(pvrdma::Mtu::Mtu1024)));
+    attrs.destinationQpNumber = htole(uint32_t{1});
+    attrs.receivePsn = htole(uint32_t{0x100});
+    attrs.maxDestinationReadAtomic = 1;
+    attrs.minRnrTimer = 12;
+    attrs.addressHandle.portNumber = 1;
+    std::copy(sender_mac.begin(), sender_mac.end(),
+              attrs.addressHandle.destinationMac);
+    write(CommandAddress, request);
+    write(ResponseAddress, pvrdma::CommandResponse{});
+    write(PeerRegisterBarAddress + pvrdma::RegRequest,
+          uint32_t{0}, MmioFlags);
+    panic_if(read<uint32_t>(PeerRegisterBarAddress + pvrdma::RegError,
+                            MmioFlags) != 0,
+             "PVRDMA immediate INIT-to-RTR command was rejected");
 }
 
 void
@@ -3893,18 +3949,54 @@ PvrdmaTester::runPair()
         schedule(testEvent, curTick() + microseconds(50));
         return;
       case TimingStage::PairPostSq: {
-        panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 3,
-                 "PVRDMA pair receiver RQ was not observed first");
+        const auto response = read<pvrdma::CommandResponse>(ResponseAddress);
+        const uint32_t cause = read<uint32_t>(
+            PeerRegisterBarAddress + pvrdma::RegInterruptCause, MmioFlags);
+        const auto &receiver_qp = peerRdma->queuePairs.entries[1];
+        panic_if(read<uint32_t>(
+                     PeerRegisterBarAddress + pvrdma::RegError,
+                     MmioFlags) != 0 ||
+                     !(cause & pvrdma::InterruptCauseResponse) ||
+                     letoh(response.header.response) !=
+                         0x6060606060606060 ||
+                     letoh(response.header.acknowledgement) !=
+                         pvrdma::responseCommand(
+                             pvrdma::Command::ModifyQp) ||
+                     response.header.error ||
+                     receiver_qp.state !=
+                         pvrdma::QpState::ReadyToReceive ||
+                     receiver_qp.rqProducerTail != 3 ||
+                     peerRdma->queueStats.rqPosted.value() != 3 ||
+                     peerRdma->queueStats.doorbellWritesRejected.value(),
+                 "PVRDMA INIT RQ/ immediate RTR command did not complete");
         peerRdma->transportPaused = true;
         pvrdma::RingState sender_rings{};
         sender_rings.tx.producerTail = htole(uint32_t{3});
         write(PairSenderQp, sender_rings);
         write(UarBarAddress + pvrdma::UarPageSize,
               htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
-        timingStage = TimingStage::PairMacWrite;
-        schedule(testEvent, curTick() + microseconds(50));
+        busyPolls = 0;
+        timingStage = TimingStage::PairPollSq;
+        schedule(testEvent, curTick() + sim_clock::as_int::ns);
         return;
       }
+      case TimingStage::PairPollSq:
+        if (rdma->transportActive() && peerRdma->pendingRxPacket) {
+            panic_if(busyPolls < 2,
+                     "PVRDMA SQ advanced without repeated empty CQ polls");
+            timingStage = TimingStage::PairMacWrite;
+            schedule(testEvent, curTick() + sim_clock::as_int::ns);
+            return;
+        }
+        write(UarBarAddress + pvrdma::UarPageSize +
+                  pvrdma::CqDoorbellOffset,
+              htole(pvrdma::CqPollAction | 1), MmioFlags);
+        panic_if(rdma->cqDirty & (uint64_t{1} << 1),
+                 "PVRDMA empty CQ poll queued an observation");
+        panic_if(++busyPolls > 100000,
+                 "PVRDMA empty CQ polls starved runnable SQ transport");
+        schedule(testEvent, curTick() + sim_clock::as_int::ns);
+        return;
       case TimingStage::PairMacWrite: {
         panic_if(!rdma->transportActive() || !peerRdma->pendingRxPacket,
                  "PVRDMA pair DATA was not active for MAC-write test");
@@ -3925,8 +4017,37 @@ PvrdmaTester::runPair()
                  "PVRDMA active MAC write was not rejected unchanged");
         peerRdma->transportPaused = false;
         peerRdma->scheduleTransport();
-        timingStage = TimingStage::PairVerify;
-        schedule(testEvent, curTick() + microseconds(1000));
+        busyPolls = 0;
+        sawCqPublishPollRace = false;
+        timingStage = TimingStage::PairPollInbound;
+        schedule(testEvent, curTick() + sim_clock::as_int::ns);
+        return;
+      }
+      case TimingStage::PairPollInbound: {
+        if (peerRdma->completionQueues.entries[1].producerTail !=
+                peerRdma->completionQueues.entries[1].consumerHead) {
+            panic_if(busyPolls < 2 ||
+                         (!system->isAtomicMode() &&
+                          !sawCqPublishPollRace),
+                     "PVRDMA inbound empty-poll race was not exercised");
+            timingStage = TimingStage::PairVerify;
+            schedule(testEvent, curTick() + microseconds(1000));
+            return;
+        }
+        const bool publish_in_flight =
+            peerRdma->completionDma.stage ==
+                Pvrdma::CompletionDmaState::Stage::PublishCqProducer &&
+            peerRdma->completionDma.record.cqHandle == 1;
+        write(PeerUarBarAddress + pvrdma::UarPageSize +
+                  pvrdma::CqDoorbellOffset,
+              htole(pvrdma::CqPollAction | 1), MmioFlags);
+        const bool dirty = peerRdma->cqDirty & (uint64_t{1} << 1);
+        panic_if(dirty != publish_in_flight,
+                 "PVRDMA empty CQ poll publication-race handling mismatch");
+        sawCqPublishPollRace |= publish_in_flight;
+        panic_if(++busyPolls > 100000,
+                 "PVRDMA empty CQ polls starved inbound transport");
+        schedule(testEvent, curTick() + sim_clock::as_int::ns);
         return;
       }
       case TimingStage::PairVerify: {
@@ -4161,6 +4282,8 @@ PvrdmaTester::runPair()
         write(PeerUarBarAddress + pvrdma::UarPageSize +
                   pvrdma::CqDoorbellOffset,
               htole(pvrdma::CqPollAction | 1), MmioFlags);
+        panic_if(!(peerRdma->cqDirty & (uint64_t{1} << 1)),
+                 "PVRDMA nonempty CQ poll skipped observation");
         timingStage = TimingStage::PairVerifyCqRecovered;
         schedule(testEvent, curTick() + microseconds(1000));
         return;

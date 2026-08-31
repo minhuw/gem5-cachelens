@@ -1247,8 +1247,15 @@ validDoorbell(const Doorbell &doorbell, ControlState control_state,
     return qp.valid && qp.qpHandle == doorbell.handle &&
         qp.uar == doorbell.uar &&
         (kind == QueueKind::Sq ? qp.state == QpState::ReadyToSend :
-            (qp.state == QpState::ReadyToReceive ||
+            (qp.state == QpState::Init ||
+             qp.state == QpState::ReadyToReceive ||
              qp.state == QpState::ReadyToSend));
+}
+
+inline bool
+cqPollNeedsObservation(const CompletionQueue &cq)
+{
+    return cq.producerTail != cq.consumerHead;
 }
 
 inline bool
@@ -2859,7 +2866,6 @@ class Pvrdma : public PciDevice
     EventFunctionWrapper transportTimerEvent;
 
     bool observationQueued() const;
-    bool commandBlockedByObservation() const;
     bool completionBusy() const;
     bool validDoorbell(const pvrdma::Doorbell &doorbell) const;
     void writeDoorbell(uint64_t offset, PacketPtr pkt);
