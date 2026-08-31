@@ -30,6 +30,8 @@ parser.add_argument(
         "timing-completion",
         "transport-pair",
         "timing-transport-pair",
+        "semantic-pair",
+        "timing-semantic-pair",
         "reliability-pair",
         "timing-reliability-pair",
         "reliability-rnr-pair",
@@ -92,7 +94,11 @@ system.rdma = Pvrdma(
     InterruptPin=2,
     hardware_address="02:00:00:00:00:01",
 )
-if args.mode.endswith("transport-pair") or "reliability" in args.mode:
+if (
+    args.mode.endswith("transport-pair")
+    or args.mode.endswith("semantic-pair")
+    or "reliability" in args.mode
+):
     system.peer_rdma = Pvrdma(
         host=system.pci_host,
         pci_bus=0,
@@ -133,6 +139,9 @@ exit_event = m5.simulate()
 if args.mode in ("transport-pair", "timing-transport-pair"):
     assert exit_event.getCause() == "PVRDMA transport pair test passed"
     print("PVRDMA_TRANSPORT_PAIR_OK")
+elif args.mode in ("semantic-pair", "timing-semantic-pair"):
+    assert exit_event.getCause() == "PVRDMA semantic pair test passed"
+    print("PVRDMA_SEMANTIC_PAIR_OK")
 elif args.mode in ("reliability-pair", "timing-reliability-pair"):
     assert exit_event.getCause() == "PVRDMA reliability pair test passed"
     print("PVRDMA_RELIABILITY_PAIR_OK")

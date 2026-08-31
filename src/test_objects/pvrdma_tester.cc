@@ -184,7 +184,9 @@ PvrdmaTester::startup()
         testMode == "timing-reliability-commit-pair" ||
         testMode == "timing-reliability-commit-boundary-pair";
     if (testMode == "transport-pair" ||
-        testMode == "timing-transport-pair" || reliability_pair) {
+        testMode == "timing-transport-pair" ||
+        testMode == "semantic-pair" ||
+        testMode == "timing-semantic-pair" || reliability_pair) {
         peerRdma = dynamic_cast<Pvrdma *>(
             SimObject::find("system.peer_rdma"));
         panic_if(!peerRdma, "PVRDMA pair tester could not find peer");
@@ -2106,6 +2108,372 @@ PvrdmaTester::postReliabilitySend(uint32_t length)
     write(PairSenderQp, rings);
     write(UarBarAddress + pvrdma::UarPageSize,
           htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+}
+
+void
+PvrdmaTester::runSemanticPair()
+{
+    static constexpr std::array<uint32_t, 6> Lengths =
+        {0, 1, 64, 1024, 1025, 4097};
+    static constexpr uint32_t InitialPsn = 0x00fffffb;
+    const pvrdma::transport::MacAddress sender_mac =
+        {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::transport::MacAddress receiver_mac =
+        {0x02, 0, 0, 0, 0, 2};
+    const auto expected_psn = [&](size_t last) {
+        uint32_t psn = InitialPsn;
+        for (size_t i = 0; i <= last; ++i) {
+            uint16_t segments = 0;
+            panic_if(!pvrdma::segmentGeometry(Lengths[i], segments),
+                     "PVRDMA semantic length was not segmentable");
+            while (segments--)
+                psn = pvrdma::advancePsn(psn);
+        }
+        return psn;
+    };
+    const auto clear_receive = [&] {
+        std::array<uint8_t, 4097> marker;
+        marker.fill(0xa5);
+        write(PairReceiverPayload, marker);
+    };
+
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        rdma->queuePairs.entries[1].attributes.sendPsn = InitialPsn;
+        peerRdma->queuePairs.entries[1].attributes.receivePsn = InitialPsn;
+        clear_receive();
+        postReliabilityReceive(Lengths[0]);
+        timingStage = TimingStage::SemanticPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::SemanticPostSq:
+        postReliabilitySend(Lengths[reliabilityCase]);
+        timingStage = TimingStage::SemanticVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      case TimingStage::SemanticVerify: {
+        const uint32_t length = Lengths[reliabilityCase];
+        const uint32_t completed = reliabilityCase + 1;
+        const auto received = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        for (size_t i = 0; i < received.size(); ++i) {
+            const uint8_t expected = i < length ?
+                static_cast<uint8_t>(i ^ reliabilityCase ^ 0x5a) : 0xa5;
+            panic_if(received[i] != expected,
+                     "PVRDMA semantic payload mismatch case %u byte %u",
+                     reliabilityCase, i);
+        }
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        uint64_t expected_bytes = 0;
+        uint64_t completed_bytes = 0;
+        for (size_t i = 0; i <= reliabilityCase; ++i) {
+            const auto send = read<pvrdma::CompletionQueueElement>(
+                PairSenderCqe + i * pvrdma::CqeSize);
+            const auto receive = read<pvrdma::CompletionQueueElement>(
+                PairReceiverCqe + i * pvrdma::CqeSize);
+            expected_bytes += Lengths[i];
+            completed_bytes += letoh(receive.byteLength);
+            panic_if(letoh(send.workRequestId) != 0x8000 + i ||
+                         letoh(send.opcode) != 0 || letoh(send.status) != 0 ||
+                         letoh(send.byteLength) != 0 || letoh(send.qp) != 1 ||
+                         letoh(send.sourceQp) != 0 ||
+                         letoh(receive.workRequestId) != 0x9000 + i ||
+                         letoh(receive.opcode) != 128 ||
+                         letoh(receive.status) != 0 ||
+                         letoh(receive.byteLength) != Lengths[i] ||
+                         letoh(receive.qp) != 1 ||
+                         letoh(receive.sourceQp) != 1,
+                     "PVRDMA semantic CQE mismatch case %u", i);
+        }
+        panic_if(letoh(sender_ring.tx.consumerHead) != completed ||
+                     letoh(receiver_ring.rx.consumerHead) != completed ||
+                     letoh(sender_cq.producerTail) != completed ||
+                     letoh(receiver_cq.producerTail) != completed ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != completed ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead !=
+                         completed ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn !=
+                         expected_psn(reliabilityCase) ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         expected_psn(reliabilityCase) ||
+                     completed_bytes != expected_bytes ||
+                     rdma->queueStats.sqPosted.value() != completed ||
+                     rdma->queueStats.sqConsumed.value() != completed ||
+                     rdma->queueStats.cqPublished.value() != completed ||
+                     rdma->queueStats.cqErrorPublished.value() != 0 ||
+                     peerRdma->queueStats.rqPosted.value() != completed ||
+                     peerRdma->queueStats.rqConsumed.value() != completed ||
+                     peerRdma->queueStats.cqPublished.value() != completed ||
+                     peerRdma->queueStats.cqErrorPublished.value() != 0 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA semantic accounting mismatch case %u",
+                 reliabilityCase);
+        if (++reliabilityCase < Lengths.size()) {
+            clear_receive();
+            postReliabilityReceive(Lengths[reliabilityCase]);
+            timingStage = TimingStage::SemanticPostSq;
+            schedule(testEvent, curTick() + microseconds(20));
+            return;
+        }
+
+        clear_receive();
+        postReliabilityReceive(128);
+        timingStage = TimingStage::SemanticMalformedPost;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      }
+      case TimingStage::SemanticMalformedPost: {
+        panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 7,
+                 "PVRDMA semantic malformed RQ was not observed");
+        const std::array<uint8_t, 64> payload = {0x5a};
+        pvrdma::transport::Frame malformed;
+        malformed.kind = pvrdma::transport::Kind::Data;
+        malformed.flags = pvrdma::transport::First;
+        malformed.sourceQpn = malformed.destinationQpn = 1;
+        malformed.psn = expected_psn(Lengths.size() - 1);
+        malformed.messageId = 0x100000007;
+        malformed.totalLength = 128;
+        malformed.segmentCount = 2;
+        malformed.payload = {payload.data(), payload.size()};
+        panic_if(!rdma->interface.sendPacket(transportPacket(
+                     malformed, sender_mac, receiver_mac)),
+                 "PVRDMA semantic EtherLink rejected malformed DATA");
+        timingStage = TimingStage::SemanticMalformedVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::SemanticMalformedVerify: {
+        const auto marker = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const uint32_t psn = expected_psn(Lengths.size() - 1);
+        panic_if(std::any_of(marker.begin(), marker.end(),
+                            [](uint8_t byte) { return byte != 0xa5; }) ||
+                     letoh(sender_ring.tx.consumerHead) != Lengths.size() ||
+                     letoh(receiver_ring.rx.producerTail) != 7 ||
+                     letoh(receiver_ring.rx.consumerHead) != Lengths.size() ||
+                     peerRdma->queuePairs.entries[1].rqProducerTail != 7 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead !=
+                         Lengths.size() ||
+                     letoh(sender_cq.producerTail) != Lengths.size() ||
+                     letoh(receiver_cq.producerTail) != Lengths.size() ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != psn ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         psn ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA malformed DATA changed receive-visible state");
+
+        postReliabilitySend(128);
+        timingStage = TimingStage::SemanticMalformedValidVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::SemanticMalformedValidVerify: {
+        const auto receive = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + Lengths.size() * pvrdma::CqeSize);
+        const auto marker = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        const uint32_t next_psn = pvrdma::advancePsn(
+            expected_psn(Lengths.size() - 1));
+        for (size_t i = 0; i < marker.size(); ++i) {
+            const uint8_t expected = i < 128 ?
+                static_cast<uint8_t>(i ^ reliabilityCase ^ 0x5a) : 0xa5;
+            panic_if(marker[i] != expected,
+                     "PVRDMA malformed follow-up payload mismatch byte %u",
+                     i);
+        }
+        panic_if(peerRdma->queuePairs.entries[1].rqConsumerHead != 7 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 7 ||
+                     letoh(receive.workRequestId) != 0x9006 ||
+                     letoh(receive.opcode) != 128 ||
+                     letoh(receive.status) != 0 ||
+                     letoh(receive.byteLength) != 128 ||
+                     letoh(receive.qp) != 1 || letoh(receive.sourceQp) != 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn !=
+                         next_psn ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         next_psn ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA malformed DATA consumed or damaged posted RQ");
+        clear_receive();
+        rdma->queuePairs.entries[1].attributes.rnrRetry = 0;
+        ++reliabilityCase;
+        postReliabilitySend(64);
+        timingStage = TimingStage::SemanticRnrVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::SemanticRnrVerify: {
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + Lengths.size() * pvrdma::CqeSize);
+        const auto marker = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        const auto untouched = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + (Lengths.size() + 1) * pvrdma::CqeSize);
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const uint32_t psn = pvrdma::advancePsn(
+            expected_psn(Lengths.size() - 1));
+        panic_if(rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != 8 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 7 ||
+                     rdma->completionQueues.entries[1].producerTail != 7 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 7 ||
+                     letoh(sender_ring.tx.consumerHead) != 8 ||
+                     letoh(sender_cq.producerTail) != 7 ||
+                     letoh(error.workRequestId) != 0x8007 ||
+                     letoh(error.opcode) != 0 || letoh(error.status) != 13 ||
+                     letoh(error.byteLength) != 0 || letoh(error.qp) != 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != psn ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         psn ||
+                     rdma->queueStats.sqPosted.value() != 8 ||
+                     rdma->queueStats.sqConsumed.value() != 8 ||
+                     rdma->queueStats.cqPublished.value() != 7 ||
+                     rdma->queueStats.cqErrorPublished.value() != 1 ||
+                     peerRdma->queueStats.rqPosted.value() != 7 ||
+                     peerRdma->queueStats.rqConsumed.value() != 7 ||
+                     peerRdma->queueStats.cqPublished.value() != 7 ||
+                     std::any_of(marker.begin(), marker.end(),
+                                 [](uint8_t byte) { return byte != 0xa5; }) ||
+                     letoh(untouched.workRequestId) ||
+                     letoh(untouched.status) ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA no-RQ/RNR accounting mismatch");
+
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::ModifyQp));
+        request.modifyQp.qpHandle = htole(uint32_t{1});
+        request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+        request.modifyQp.attributes.qpState = pvrdma::QpState::Reset;
+        pvrdma::CommandResponse response{};
+        panic_if(pvrdma::detail::modifyQp(
+                     request, response, rdma->queuePairs).error,
+                 "PVRDMA RNR terminal reset failed");
+        write(PairSenderQp, pvrdma::RingState{});
+        auto &qp = rdma->queuePairs.entries[1];
+        qp.state = pvrdma::QpState::ReadyToSend;
+        qp.attributes.qpState = qp.attributes.currentQpState = qp.state;
+        qp.attributes.pathMtu = pvrdma::Mtu::Mtu1024;
+        qp.attributes.destinationQpNumber = 1;
+        qp.attributes.qpAccessFlags = pvrdma::AccessLocalWrite;
+        qp.attributes.sendPsn = psn;
+        qp.attributes.portNumber = 1;
+        qp.attributes.addressHandle.portNumber = 1;
+        qp.attributes.capabilities = qp.capabilities;
+        std::copy(receiver_mac.begin(), receiver_mac.end(),
+                  qp.attributes.addressHandle.destinationMac);
+        reliabilityCase = 8;
+        postReliabilityReceive(32);
+        timingStage = TimingStage::SemanticShortPost;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      }
+      case TimingStage::SemanticShortPost:
+        panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 8,
+                 "PVRDMA semantic short RQ was not observed");
+        postReliabilitySend(64);
+        timingStage = TimingStage::SemanticShortVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      case TimingStage::SemanticShortVerify: {
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + 7 * pvrdma::CqeSize);
+        const auto marker = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        const auto untouched = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + (Lengths.size() + 1) * pvrdma::CqeSize);
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const uint32_t psn = pvrdma::advancePsn(
+            expected_psn(Lengths.size() - 1));
+        panic_if(rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != 1 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 7 ||
+                     rdma->completionQueues.entries[1].producerTail != 8 ||
+                     letoh(sender_ring.tx.consumerHead) != 1 ||
+                     letoh(sender_cq.producerTail) != 8 ||
+                     letoh(receiver_cq.producerTail) != 7 ||
+                     letoh(error.workRequestId) != 0x8008 ||
+                     letoh(error.opcode) != 0 || letoh(error.status) != 21 ||
+                     letoh(error.byteLength) != 0 || letoh(error.qp) != 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != psn ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         psn ||
+                     rdma->queueStats.sqPosted.value() != 9 ||
+                     rdma->queueStats.sqConsumed.value() != 9 ||
+                     rdma->queueStats.cqPublished.value() != 8 ||
+                     rdma->queueStats.cqErrorPublished.value() != 2 ||
+                     peerRdma->queueStats.rqPosted.value() != 8 ||
+                     peerRdma->queueStats.rqConsumed.value() != 7 ||
+                     peerRdma->queueStats.cqPublished.value() != 7 ||
+                     std::any_of(marker.begin(), marker.end(),
+                                 [](uint8_t byte) { return byte != 0xa5; }) ||
+                     letoh(untouched.workRequestId) ||
+                     letoh(untouched.status) ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA terminal ERROR accounting mismatch");
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::ModifyQp));
+        request.modifyQp.qpHandle = htole(uint32_t{1});
+        request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+        request.modifyQp.attributes.qpState = pvrdma::QpState::Reset;
+        pvrdma::CommandResponse response{};
+        panic_if(pvrdma::detail::modifyQp(
+                     request, response, rdma->queuePairs).error ||
+                     rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Reset ||
+                     rdma->queuePairs.entries[1].sqProducerTail ||
+                     rdma->queuePairs.entries[1].sqConsumerHead ||
+                     rdma->queuePairs.entries[1].finalReplay.valid,
+                 "PVRDMA terminal ERROR-to-Reset recovery failed");
+        inform("PVRDMA direct EtherLink semantic pair test passed");
+        exitSimLoop("PVRDMA semantic pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA semantic pair stage");
+    }
 }
 
 void
@@ -4049,6 +4417,11 @@ PvrdmaTester::run()
     if (testMode == "transport-pair" ||
         testMode == "timing-transport-pair") {
         runPair();
+        return;
+    }
+    if (testMode == "semantic-pair" ||
+        testMode == "timing-semantic-pair") {
+        runSemanticPair();
         return;
     }
     if (testMode == "timing-mr") {

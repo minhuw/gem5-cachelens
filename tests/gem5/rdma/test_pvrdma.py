@@ -51,6 +51,23 @@ for name, mode, marker in (
     )
 
 
+for mode in ("semantic-pair", "timing-semantic-pair"):
+    gem5_verify_config(
+        name=f"pvrdma-{mode}",
+        fixtures=(),
+        verifiers=(
+            verifier.MatchRegex(re.compile("PVRDMA_SEMANTIC_PAIR_OK")),
+        ),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=("--mode", mode),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
+
+
 for name, marker in (
     (
         "precommit-abort-pair",

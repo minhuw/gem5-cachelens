@@ -109,6 +109,14 @@ class PvrdmaTester : public Platform
         PairVerifyCqBlocked,
         PairVerifyCqRecovered,
         PairVerifyStale,
+        SemanticPostSq,
+        SemanticVerify,
+        SemanticMalformedPost,
+        SemanticMalformedVerify,
+        SemanticMalformedValidVerify,
+        SemanticRnrVerify,
+        SemanticShortPost,
+        SemanticShortVerify,
         ReliabilityPostSq,
         ReliabilityVerify,
         ReliabilityRnrPostRq,
@@ -216,6 +224,7 @@ class PvrdmaTester : public Platform
     void postReliabilitySend(uint32_t length);
     void testInboundFrames();
     void runPair();
+    void runSemanticPair();
     void runReliabilityPair();
     void runReliabilityRnrPair();
     void runReliabilityTimeoutZeroPair();
