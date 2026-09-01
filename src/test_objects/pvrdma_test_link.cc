@@ -4,6 +4,7 @@
 
 #include <algorithm>
 
+#include "base/logging.hh"
 #include "sim/cur_tick.hh"
 
 namespace gem5
@@ -43,9 +44,9 @@ PvrdmaTestLink::Interface::recvPacket(EthPacketPtr packet)
 bool
 PvrdmaTestLink::sameId(const FrameId &left, const FrameId &right)
 {
-    return left.direction == right.direction && left.kind == right.kind &&
-        left.psn == right.psn && left.messageId == right.messageId &&
-        left.segmentIndex == right.segmentIndex;
+    return left.direction == right.direction &&
+        left.opcode == right.opcode && left.syndrome == right.syndrome &&
+        left.psn == right.psn;
 }
 
 void
@@ -103,19 +104,24 @@ PvrdmaTestLink::receive(int source, EthPacketPtr packet)
 {
     if (!packet)
         return false;
+    panic_if(packet->length < pvrdma::rocev1::EthernetHeaderSize ||
+                 packet->data[12] != 0x89 || packet->data[13] != 0x15,
+             "PVRDMA test link observed a non-RoCEv1 production frame");
 
     const Direction direction = source == 0 ? Direction::Int0ToInt1 :
                                               Direction::Int1ToInt0;
     Action action = Action::Forward;
     Tick delay = 0;
     const auto decoded = packet->length <= packet->bufLength ?
-        pvrdma::transport::decodeEthernet(
+        pvrdma::rocev1::decode(
             {packet->data, packet->bufLength}, packet->length) :
-        pvrdma::transport::EthernetDecodeResult{};
+        pvrdma::rocev1::DecodeResult{};
     if (decoded) {
-        const FrameId id{direction, decoded.frame.kind, decoded.frame.psn,
-                         decoded.frame.messageId,
-                         decoded.frame.segmentIndex};
+        const auto &frame = decoded.packet;
+        const FrameId id{direction, frame.opcode,
+            frame.opcode == pvrdma::rocev1::Opcode::Acknowledge ?
+                frame.syndrome : pvrdma::rocev1::Syndrome::Ack,
+            frame.psn};
         const auto rule = std::find_if(rules.begin(), rules.end(),
             [&id](const Rule &candidate) {
                 return sameId(candidate.id, id);

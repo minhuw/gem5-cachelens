@@ -325,8 +325,8 @@ TEST(PvrdmaRegisterTest, ResetRestoresMutableConstructorState)
 TEST(PvrdmaRegisterTest, DerivesCompanionTransportMac)
 {
     const RegisterState regs(0x00009002, 0x0100);
-    const transport::MacAddress configured = {0x02, 0x90, 0, 0, 0, 1};
-    const transport::MacAddress companion = {0x90, 0x02, 0, 0, 1, 0};
+    const rocev1::MacAddress configured = {0x02, 0x90, 0, 0, 0, 1};
+    const rocev1::MacAddress companion = {0x90, 0x02, 0, 0, 1, 0};
 
     EXPECT_EQ(transportMac(regs, false), configured);
     EXPECT_EQ(transportMac(regs, true), companion);
@@ -1425,6 +1425,34 @@ TEST(PvrdmaQpTest, EnforcesFrozenGeometryAndCreateValidation)
     EXPECT_FALSE(prepareCreateQp(malformed, objects, cqs, qps, build));
 }
 
+TEST(PvrdmaQpTest, AllocatesOnlyUnicastTwentyFourBitQpns)
+{
+    ObjectTables objects{};
+    setupUserParent(objects);
+    CompletionQueueTable cqs{};
+    CompletionQueueBuild cq_build{};
+    ASSERT_TRUE(buildCq(cqRequest(64), objects, cqs, cq_build));
+    ASSERT_TRUE(cqs.commit(std::move(cq_build), objects));
+    QueuePairTable qps{};
+    for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot)
+        qps.entries[slot].valid = true;
+
+    qps.entries[1].valid = false;
+    qps.entries[1].generation = MaxQpGeneration;
+    QueuePairBuild build{};
+    ASSERT_TRUE(buildQp(qpRequest(32, 128), objects, cqs, qps, build));
+    EXPECT_EQ(build.qpn, (MaxQpGeneration << SlotBits) | 1);
+    EXPECT_TRUE(validQpn(build.qpn));
+
+    qps.entries[1].generation = MaxQpGeneration + 1;
+    qps.entries[ObjectTableEntries - 1].valid = false;
+    qps.entries[ObjectTableEntries - 1].generation = MaxQpGeneration;
+    EXPECT_FALSE(prepareCreateQp(
+        qpRequest(32, 128), objects, cqs, qps, build));
+    EXPECT_EQ(MaxMrGeneration, MaxGeneration);
+    EXPECT_GT(MaxGeneration, MaxQpGeneration);
+}
+
 TEST(PvrdmaQpTest, LooksUpOnlyExactGenerationDerivedQpn)
 {
     QueuePairTable qps;
@@ -1470,6 +1498,37 @@ TEST(PvrdmaTransportTest, DecodesReliabilityTimersAndRetries)
     }
 }
 
+TEST(PvrdmaTransportTest, BoundsSequenceNakProgressAndRetries)
+{
+    uint8_t retry = 2;
+    EXPECT_EQ(sequenceNakAction(0x100, 0, 3, 0x101, retry),
+              SequenceNakAction::Advance);
+    EXPECT_EQ(retry, 2);
+    EXPECT_EQ(sequenceNakAction(0x100, 0, 3, 0x102, retry),
+              SequenceNakAction::Invalid);
+    EXPECT_EQ(sequenceNakAction(0x100, 2, 3, 0x103, retry),
+              SequenceNakAction::Advance);
+    EXPECT_EQ(retry, 2);
+
+    EXPECT_EQ(sequenceNakAction(0x100, 1, 3, 0x101, retry),
+              SequenceNakAction::Restart);
+    EXPECT_EQ(retry, 1);
+    EXPECT_EQ(sequenceNakAction(0x100, 1, 3, 0x100, retry),
+              SequenceNakAction::Restart);
+    EXPECT_EQ(retry, 0);
+    EXPECT_EQ(sequenceNakAction(0x100, 1, 3, 0x101, retry),
+              SequenceNakAction::RetryExceeded);
+
+    retry = 1;
+    EXPECT_EQ(sequenceNakAction(rocev1::Field24Mask, 0, 2, 0, retry),
+              SequenceNakAction::Advance);
+    EXPECT_EQ(sequenceNakAction(rocev1::Field24Mask, 0, 2, 1, retry),
+              SequenceNakAction::Invalid);
+    EXPECT_EQ(sequenceNakAction(rocev1::Field24Mask, 1, 2,
+                                rocev1::Field24Mask, retry),
+              SequenceNakAction::Restart);
+}
+
 TEST(PvrdmaTransportTest, ComputesCanonicalSegmentsAndLeaseRanges)
 {
     for (const auto &[length, count] : {
@@ -1509,9 +1568,9 @@ TEST(PvrdmaQpTest, ComputesExactConsumerAddressesAndPsnWrap)
     EXPECT_EQ(address, qp.pages[0] + offsetof(RingState, rx) +
                            offsetof(Ring, consumerHead));
     EXPECT_FALSE(queueConsumerAddress(qp, QueueKind::Cq, address));
-    EXPECT_TRUE(validPsn(transport::PsnMask));
-    EXPECT_FALSE(validPsn(transport::PsnMask + 1));
-    EXPECT_EQ(advancePsn(transport::PsnMask), 0);
+    EXPECT_TRUE(validPsn(rocev1::Field24Mask));
+    EXPECT_FALSE(validPsn(rocev1::Field24Mask + 1));
+    EXPECT_EQ(advancePsn(rocev1::Field24Mask), 0);
 }
 
 TEST(PvrdmaQpTest, ComputesExactSqAndRqWqeAddresses)
@@ -1800,13 +1859,22 @@ TEST(PvrdmaQpTest, ReachesRtsQueriesStoredAttributesAndResets)
     stored.finalReplay.valid = true;
     stored.finalReplay.qpGeneration = stored.generation;
     stored.finalReplay.localMac = {0x02, 0, 0, 0, 0, 2};
+    stored.finalReplay.remoteMac = {0x02, 0, 0, 0, 0, 1};
+    std::copy(stored.finalReplay.remoteMac.begin(),
+              stored.finalReplay.remoteMac.end(),
+              stored.attributes.addressHandle.destinationMac);
+    stored.finalReplay.localGid[0] = stored.finalReplay.remoteGid[0] = 0xfe;
+    stored.finalReplay.localGid[1] = stored.finalReplay.remoteGid[1] = 0x80;
+    stored.finalReplay.localGid[15] = 2;
+    stored.finalReplay.remoteGid[15] = 1;
     stored.finalReplay.localQpn = stored.qpn;
     stored.finalReplay.remoteQpn = stored.attributes.destinationQpNumber;
     stored.finalReplay.finalPsn =
-        (stored.attributes.receivePsn - 1) & transport::PsnMask;
-    stored.finalReplay.messageId = 1;
-    stored.finalReplay.totalLength = 1;
-    stored.finalReplay.segmentCount = 1;
+        (stored.attributes.receivePsn - 1) & rocev1::Field24Mask;
+    stored.responderMsn = 1;
+    stored.finalReplay.finalOpcode = rocev1::Opcode::SendOnly;
+    stored.finalReplay.finalSegmentLength = 1;
+    stored.finalReplay.completedMsn = 1;
     EXPECT_TRUE(detail::validFinalReplay(stored));
     ASSERT_EQ(detail::queryQp(query, response, qps).error, 0);
     EXPECT_EQ(letoh(static_cast<uint32_t>(
@@ -1820,6 +1888,7 @@ TEST(PvrdmaQpTest, ReachesRtsQueriesStoredAttributesAndResets)
                      reset, response).error, 0);
     EXPECT_EQ(qps.entries[1].state, QpState::Reset);
     EXPECT_EQ(qps.entries[1].attributes.capabilities.maxSendWr, 32);
+    EXPECT_EQ(qps.entries[1].responderMsn, 0);
     EXPECT_FALSE(qps.entries[1].finalReplay.valid);
     EXPECT_TRUE(validQueueObjects(cqs, qps, MemoryRegionTable{}, objects));
 }
@@ -1884,12 +1953,15 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
                      rtr, response).error, CommandError);
     rtr.pathMtu = static_cast<Mtu>(
         htole(static_cast<uint32_t>(Mtu::Mtu1024)));
-    rtr.destinationQpNumber = 0;
-    EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
-                     QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
-                     QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
-                     QpAttrMinRnrTimer | QpAttrDestinationQpn,
-                     rtr, response).error, CommandError);
+    for (const uint32_t qpn : {0U, rocev1::Field24Mask,
+                               rocev1::Field24Mask + 1}) {
+        rtr.destinationQpNumber = htole(qpn);
+        EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
+                         QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
+                         QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
+                         QpAttrMinRnrTimer | QpAttrDestinationQpn,
+                         rtr, response).error, CommandError);
+    }
     rtr.destinationQpNumber = htole(uint32_t{1});
     rtr.maxDestinationReadAtomic = 2;
     EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
@@ -1898,7 +1970,7 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
                      QpAttrMinRnrTimer | QpAttrDestinationQpn,
                      rtr, response).error, CommandError);
     rtr.maxDestinationReadAtomic = 0;
-    rtr.receivePsn = htole(transport::PsnMask + 1);
+    rtr.receivePsn = htole(rocev1::Field24Mask + 1);
     EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
                      QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
                      QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
@@ -1929,7 +2001,7 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
     EXPECT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, CommandError);
     rts.rnrRetry = 7;
-    rts.sendPsn = htole(transport::PsnMask + 1);
+    rts.sendPsn = htole(rocev1::Field24Mask + 1);
     EXPECT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, CommandError);
     rts.sendPsn = htole(uint32_t{0x654321});
@@ -1985,10 +2057,17 @@ TEST(PvrdmaQpTest, ValidatesRestoreCountersGeometryStateAndGeneration)
     malformed_qps.entries[1].qpn = 65;
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
+    malformed_qps.entries[1].qpn = rocev1::Field24Mask;
+    EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
+    malformed_qps = qps;
     malformed_qps.entries[1].pages.pop_back();
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
     malformed_qps.entries[1].attributes.destinationQpNumber = 0;
+    EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
+    malformed_qps = qps;
+    malformed_qps.entries[1].attributes.destinationQpNumber =
+        rocev1::Field24Mask;
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
     malformed_qps.entries[1].attributes.timeout = 32;

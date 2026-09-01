@@ -101,6 +101,7 @@ for name, marker in (
         "PVRDMA_RELIABILITY_TIMEOUT_ZERO_PAIR_OK",
     ),
     ("reliability-invalid-pair", "PVRDMA_RELIABILITY_INVALID_PAIR_OK"),
+    ("reliability-sequence-pair", "PVRDMA_RELIABILITY_SEQUENCE_PAIR_OK"),
     (
         "reliability-unrelated-pair",
         "PVRDMA_RELIABILITY_UNRELATED_PAIR_OK",
@@ -118,6 +119,54 @@ for name, marker in (
             name=f"pvrdma-{mode}",
             fixtures=(),
             verifiers=(verifier.MatchRegex(re.compile(marker)),),
+            config=joinpath(
+                absdirpath(__file__), "configs", "pvrdma_runtime.py"
+            ),
+            config_args=("--mode", mode),
+            valid_isas=(constants.x86_tag,),
+            valid_hosts=constants.supported_hosts,
+            length=constants.quick_tag,
+        )
+
+
+for action, mode in (
+    ("reset", "sq-terminal-reset-no-peer"),
+    ("drain", "timing-sq-terminal-drain-no-peer"),
+):
+    gem5_verify_config(
+        name=f"pvrdma-{mode}",
+        fixtures=(),
+        verifiers=(
+            verifier.MatchRegex(
+                re.compile(f"PVRDMA_SQ_TERMINAL_{action.upper()}_OK")
+            ),
+        ),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=("--mode", mode),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
+
+
+for action, cause, prefixes in (
+    ("reset", "timeout", ("", "timing-")),
+    ("reset", "overflow", ("", "timing-")),
+    ("drain", "timeout", ("",)),
+    ("drain", "overflow", ("timing-",)),
+):
+    for prefix in prefixes:
+        mode = f"{prefix}terminal-{action}-{cause}-pair"
+        gem5_verify_config(
+            name=f"pvrdma-{mode}",
+            fixtures=(),
+            verifiers=(
+                verifier.MatchRegex(
+                    re.compile(f"PVRDMA_TERMINAL_{action.upper()}_OK")
+                ),
+            ),
             config=joinpath(
                 absdirpath(__file__), "configs", "pvrdma_runtime.py"
             ),
@@ -288,6 +337,56 @@ def pvrdma_completion_checkpoint_test(host):
     )
 
 
+def pvrdma_terminal_drain_checkpoint_test(host, queue=""):
+    prefix = f"{queue}-" if queue else ""
+    marker_prefix = f"{queue.upper()}_" if queue else ""
+
+    def run_test(params):
+        tempdir = Path(params.fixtures[constants.tempdir_fixture_name].path)
+        gem5 = params.fixtures[constants.gem5_binary_fixture_name].path
+        config_path = joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        )
+        checkpoint = tempdir / f"pvrdma-{prefix}terminal-drain-checkpoint"
+        for phase, marker in (
+            (
+                "save",
+                f"PVRDMA_{marker_prefix}TERMINAL_DRAIN_CHECKPOINT_SAVED",
+            ),
+            (
+                "restore",
+                f"PVRDMA_{marker_prefix}TERMINAL_DRAIN_CHECKPOINT_RESTORED",
+            ),
+        ):
+            result = subprocess.run(
+                [
+                    gem5,
+                    "-d",
+                    (tempdir / f"{prefix}terminal-drain-{phase}").as_posix(),
+                    config_path,
+                    "--mode",
+                    f"checkpoint-{prefix}terminal-drain-{phase}",
+                    "--checkpoint",
+                    checkpoint.as_posix(),
+                ],
+                cwd=config.base_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            print(result.stdout)
+            assert result.returncode == 0
+            assert marker in result.stdout
+
+    name = f"pvrdma-checkpoint-{prefix}terminal-drain-{host}-opt"
+    TestSuite(
+        name=name,
+        fixtures=[Gem5Fixture("x86", "opt"), TempdirFixture()],
+        tags=["X86", "opt", constants.quick_tag, host],
+        tests=[TestFunction(run_test, name=name)],
+    )
+
+
 def pvrdma_polling_only_source_test(_):
     root = Path(config.base_dir)
     implementation = "\n".join(
@@ -321,3 +420,5 @@ for host in constants.supported_hosts:
     pvrdma_checkpoint_test(host)
     pvrdma_observation_checkpoint_test(host)
     pvrdma_completion_checkpoint_test(host)
+    pvrdma_terminal_drain_checkpoint_test(host)
+    pvrdma_terminal_drain_checkpoint_test(host, "sq")

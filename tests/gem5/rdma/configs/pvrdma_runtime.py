@@ -40,6 +40,8 @@ parser.add_argument(
         "timing-reliability-timeout-zero-pair",
         "reliability-invalid-pair",
         "timing-reliability-invalid-pair",
+        "reliability-sequence-pair",
+        "timing-reliability-sequence-pair",
         "reliability-unrelated-pair",
         "timing-reliability-unrelated-pair",
         "reliability-cq-pair",
@@ -49,6 +51,14 @@ parser.add_argument(
         "timing-reliability-precommit-abort-pair",
         "timing-reliability-commit-pair",
         "timing-reliability-commit-boundary-pair",
+        "terminal-reset-timeout-pair",
+        "timing-terminal-reset-timeout-pair",
+        "terminal-reset-overflow-pair",
+        "timing-terminal-reset-overflow-pair",
+        "terminal-drain-timeout-pair",
+        "timing-terminal-drain-overflow-pair",
+        "sq-terminal-reset-no-peer",
+        "timing-sq-terminal-drain-no-peer",
         "fault-link",
         "timing-fault-link",
         "completion",
@@ -60,6 +70,10 @@ parser.add_argument(
         "checkpoint-observation-restore",
         "checkpoint-completion-save",
         "checkpoint-completion-restore",
+        "checkpoint-terminal-drain-save",
+        "checkpoint-terminal-drain-restore",
+        "checkpoint-sq-terminal-drain-save",
+        "checkpoint-sq-terminal-drain-restore",
     ),
     required=True,
 )
@@ -98,6 +112,7 @@ if (
     args.mode.endswith("transport-pair")
     or args.mode.endswith("semantic-pair")
     or "reliability" in args.mode
+    or ("terminal-" in args.mode and "sq-terminal" not in args.mode)
 ):
     system.peer_rdma = Pvrdma(
         host=system.pci_host,
@@ -165,6 +180,14 @@ elif args.mode in (
     )
     print("PVRDMA_RELIABILITY_INVALID_PAIR_OK")
 elif args.mode in (
+    "reliability-sequence-pair",
+    "timing-reliability-sequence-pair",
+):
+    assert exit_event.getCause() == (
+        "PVRDMA reliability sequence pair test passed"
+    )
+    print("PVRDMA_RELIABILITY_SEQUENCE_PAIR_OK")
+elif args.mode in (
     "reliability-unrelated-pair",
     "timing-reliability-unrelated-pair",
 ):
@@ -198,6 +221,21 @@ elif args.mode == "timing-reliability-commit-boundary-pair":
         "PVRDMA reliability receive commit-boundary test passed"
     )
     print("PVRDMA_RELIABILITY_COMMIT_BOUNDARY_PAIR_OK")
+elif args.mode == "sq-terminal-reset-no-peer":
+    assert exit_event.getCause() == "PVRDMA SQ terminal reset test passed"
+    print("PVRDMA_SQ_TERMINAL_RESET_OK")
+elif args.mode == "timing-sq-terminal-drain-no-peer":
+    assert exit_event.getCause() == "PVRDMA SQ terminal drain test passed"
+    print("PVRDMA_SQ_TERMINAL_DRAIN_OK")
+elif "terminal-reset-" in args.mode:
+    assert exit_event.getCause() == "PVRDMA terminal reset test passed"
+    print("PVRDMA_TERMINAL_RESET_OK")
+elif (
+    "terminal-drain-" in args.mode
+    and not args.mode.startswith("checkpoint-")
+):
+    assert exit_event.getCause() == "PVRDMA terminal drain test passed"
+    print("PVRDMA_TERMINAL_DRAIN_OK")
 elif args.mode in ("fault-link", "timing-fault-link"):
     assert exit_event.getCause() == "PVRDMA fault-link test passed"
     print("PVRDMA_FAULT_LINK_OK")
@@ -251,6 +289,30 @@ elif args.mode == "checkpoint-completion-save":
 elif args.mode == "checkpoint-completion-restore":
     assert exit_event.getCause() == "PVRDMA completion checkpoint restored"
     print("PVRDMA_COMPLETION_CHECKPOINT_RESTORED")
+elif args.mode == "checkpoint-terminal-drain-save":
+    assert exit_event.getCause() == (
+        "PVRDMA terminal drain checkpoint save ready"
+    )
+    args.checkpoint.mkdir(parents=True, exist_ok=True)
+    m5.checkpoint(args.checkpoint.as_posix())
+    print("PVRDMA_TERMINAL_DRAIN_CHECKPOINT_SAVED")
+elif args.mode == "checkpoint-terminal-drain-restore":
+    assert exit_event.getCause() == (
+        "PVRDMA terminal drain checkpoint restored"
+    )
+    print("PVRDMA_TERMINAL_DRAIN_CHECKPOINT_RESTORED")
+elif args.mode == "checkpoint-sq-terminal-drain-save":
+    assert exit_event.getCause() == (
+        "PVRDMA SQ terminal drain checkpoint save ready"
+    )
+    args.checkpoint.mkdir(parents=True, exist_ok=True)
+    m5.checkpoint(args.checkpoint.as_posix())
+    print("PVRDMA_SQ_TERMINAL_DRAIN_CHECKPOINT_SAVED")
+elif args.mode == "checkpoint-sq-terminal-drain-restore":
+    assert exit_event.getCause() == (
+        "PVRDMA SQ terminal drain checkpoint restored"
+    )
+    print("PVRDMA_SQ_TERMINAL_DRAIN_CHECKPOINT_RESTORED")
 elif args.mode == "checkpoint-observation-save":
     assert exit_event.getCause() == "PVRDMA observation checkpoint save ready"
     args.checkpoint.mkdir(parents=True, exist_ok=True)

@@ -104,7 +104,8 @@ class PvrdmaTester : public Platform
         PairVerifyRnr,
         PairPostShort,
         PairVerifyShort,
-        PairVerifyMalformed,
+        PairPostOversized,
+        PairVerifyOversized,
         FaultCheckBackpressure,
         FaultCheckHeld,
         FaultCheckReleased,
@@ -129,6 +130,10 @@ class PvrdmaTester : public Platform
         ReliabilityTimeoutZeroVerify,
         ReliabilityInvalidInject,
         ReliabilityInvalidVerify,
+        ReliabilitySequenceFutureInject,
+        ReliabilitySequenceFutureVerify,
+        ReliabilitySequenceRetryInject,
+        ReliabilitySequenceRetryVerify,
         ReliabilityUnrelatedInject,
         ReliabilityUnrelatedVerify,
         ReliabilityUnrelatedComplete,
@@ -137,6 +142,7 @@ class PvrdmaTester : public Platform
         ReliabilityCqAbortHeld,
         ReliabilityCqAbortVerify,
         ReliabilityPrecommitInject,
+        ReliabilityPrecommitCqInject,
         ReliabilityPrecommitVerify,
         ReliabilityCommitInject,
         ReliabilityCommitVerify,
@@ -144,6 +150,10 @@ class PvrdmaTester : public Platform
         ReliabilityBoundaryInject,
         ReliabilityBoundaryTryAck,
         ReliabilityBoundaryVerify,
+        TerminalInject,
+        TerminalPartial,
+        TerminalBackpressured,
+        TerminalVerify,
     };
 
     TestPort port;
@@ -222,7 +232,7 @@ class PvrdmaTester : public Platform
     void testCheckpointCompletionRestore();
     void setupPairEndpoint(Pvrdma &device, Addr qp_page, Addr cq_page,
                            Addr mr_page,
-                           const pvrdma::transport::MacAddress &remote_mac,
+                           const pvrdma::rocev1::MacAddress &remote_mac,
                            uint32_t send_psn, uint32_t receive_psn);
     void setupPair();
     void setupReliabilityPair();
@@ -235,19 +245,19 @@ class PvrdmaTester : public Platform
     void runReliabilityRnrPair();
     void runReliabilityTimeoutZeroPair();
     void runReliabilityInvalidPair();
+    void runReliabilitySequencePair();
     void runReliabilityUnrelatedPair();
     void runReliabilityCqPair();
     void runReliabilityCqAbortPair();
     void runReliabilityPrecommitAbortPair();
     void runReliabilityCommitPair();
     void runReliabilityCommitBoundaryPair();
+    void runTerminalBackpressurePair();
+    void testCheckpointTerminalDrainRestore();
+    void runSqTerminalBackpressure();
+    void testCheckpointSqTerminalDrainRestore();
     void runFaultLink();
-    EthPacketPtr faultPacket(uint32_t psn, uint64_t message_id);
-    EthPacketPtr controlPacket(pvrdma::transport::Kind kind,
-        pvrdma::CompletionStatus status, uint32_t psn,
-        uint64_t message_id,
-        const pvrdma::transport::MacAddress &source,
-        const pvrdma::transport::MacAddress &destination);
+    EthPacketPtr faultPacket(uint32_t psn);
 
   public:
     PARAMS(PvrdmaTester);
