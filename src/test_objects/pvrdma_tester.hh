@@ -232,7 +232,7 @@ class PvrdmaTester : public Platform
     void testCheckpointCompletionRestore();
     void setupPairEndpoint(Pvrdma &device, Addr qp_page, Addr cq_page,
                            Addr mr_page,
-                           const pvrdma::rocev1::MacAddress &remote_mac,
+                           const pvrdma::rocev2::MacAddress &remote_mac,
                            uint32_t send_psn, uint32_t receive_psn);
     void setupPair();
     void setupReliabilityPair();

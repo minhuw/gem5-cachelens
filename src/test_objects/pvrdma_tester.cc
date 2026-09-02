@@ -77,14 +77,18 @@ microseconds(uint64_t value)
     return value * sim_clock::as_int::us;
 }
 
-pvrdma::rocev1::Gid
-testGid(const pvrdma::rocev1::MacAddress &mac)
+constexpr uint8_t TestTrafficClass = 0x2a;
+constexpr uint32_t TestFlowLabel = 0x34567;
+constexpr uint8_t TestHopLimit = 0xff;
+
+pvrdma::rocev2::Gid
+testGid(const pvrdma::rocev2::MacAddress &mac)
 {
     const uint32_t low = uint32_t{mac[0]} | (uint32_t{mac[1]} << 8) |
         (uint32_t{mac[2]} << 16) | (uint32_t{mac[3]} << 24);
     const uint32_t high = uint32_t{mac[4]} | (uint32_t{mac[5]} << 8);
     const uint64_t guid = pvrdma::detail::macGuid(low, high);
-    pvrdma::rocev1::Gid gid{};
+    pvrdma::rocev2::Gid gid{};
     gid[0] = 0xfe;
     gid[1] = 0x80;
     for (size_t i = 0; i < 8; ++i)
@@ -93,22 +97,33 @@ testGid(const pvrdma::rocev1::MacAddress &mac)
 }
 
 EthPacketPtr
-rocePacket(pvrdma::rocev1::Packet frame,
-           const pvrdma::rocev1::MacAddress &source,
-           const pvrdma::rocev1::MacAddress &destination)
+rocePacket(pvrdma::rocev2::Packet frame,
+           const pvrdma::rocev2::MacAddress &source,
+           const pvrdma::rocev2::MacAddress &destination,
+           uint32_t source_qpn = 1)
 {
-    frame.sourceMac = source;
-    frame.destinationMac = destination;
-    frame.sourceGid = testGid(source);
-    frame.destinationGid = testGid(destination);
-    const size_t size = pvrdma::rocev1::encodedSize(frame);
+    if (frame.sourceMac == pvrdma::rocev2::MacAddress{})
+        frame.sourceMac = source;
+    if (frame.destinationMac == pvrdma::rocev2::MacAddress{})
+        frame.destinationMac = destination;
+    if (frame.sourceGid == pvrdma::rocev2::Gid{})
+        frame.sourceGid = testGid(source);
+    if (frame.destinationGid == pvrdma::rocev2::Gid{})
+        frame.destinationGid = testGid(destination);
+    frame.trafficClass = TestTrafficClass;
+    frame.flowLabel = TestFlowLabel;
+    frame.hopLimit = TestHopLimit;
+    frame.sourcePort = pvrdma::rocev2::udpSourcePort(
+        frame.flowLabel, source_qpn, frame.destinationQpn);
+    const size_t size = pvrdma::rocev2::encodedSize(frame);
     auto packet = std::make_shared<EthPacketData>(size);
-    const auto encoded = pvrdma::rocev1::encode(
+    const auto encoded = pvrdma::rocev2::encode(
         frame, {packet->data, packet->bufLength});
-    panic_if(!encoded, "PVRDMA test RoCEv1 frame failed encode");
+    panic_if(!encoded, "PVRDMA test RoCEv2 frame failed encode");
     packet->length = packet->simLength = encoded.size;
-    panic_if(packet->data[12] != 0x89 || packet->data[13] != 0x15,
-             "PVRDMA test emitted a non-RoCEv1 EtherType");
+    panic_if(packet->data[pvrdma::rocev2::EtherTypeOffset] != 0x86 ||
+                 packet->data[pvrdma::rocev2::EtherTypeOffset + 1] != 0xdd,
+             "PVRDMA test emitted a non-RoCEv2 EtherType");
     return packet;
 }
 
@@ -119,7 +134,7 @@ const Request::Flags MmioFlags = Request::UNCACHEABLE;
 bool
 PvrdmaTester::FaultPort::recvPacket(EthPacketPtr packet)
 {
-    const auto decoded = pvrdma::rocev1::decode(
+    const auto decoded = pvrdma::rocev2::decode(
         {packet->data, packet->bufLength}, packet->length);
     panic_if(!decoded, "PVRDMA fault-link endpoint received a bad frame");
     if (tester.faultRejectOnce[side] && decoded.packet.psn == 7) {
@@ -304,7 +319,7 @@ PvrdmaTester::testCapabilities()
     const auto caps = read<pvrdma::DeviceCaps>(
         DsrAddress + offsetof(pvrdma::DeviceSharedRegion, caps));
     panic_if(caps.mode != static_cast<uint8_t>(pvrdma::DeviceMode::Roce) ||
-                 caps.gidTypes != pvrdma::GidTypeRoceV1,
+                 caps.gidTypes != pvrdma::GidTypeRoceV2,
              "PVRDMA capabilities were not visible after DSR completion");
 }
 
@@ -1744,7 +1759,7 @@ PvrdmaTester::testCheckpointSave()
     qp.finalReplay.localGid = testGid(qp.finalReplay.localMac);
     qp.finalReplay.remoteGid = testGid(qp.finalReplay.remoteMac);
     qp.finalReplay.finalPsn = 0x12344;
-    qp.finalReplay.finalOpcode = pvrdma::rocev1::Opcode::SendOnly;
+    qp.finalReplay.finalOpcode = pvrdma::rocev2::Opcode::SendOnly;
     qp.finalReplay.finalSegmentLength = 1;
     qp.responderMsn = qp.finalReplay.completedMsn = 0xfeed;
     inform("PVRDMA checkpoint live MR/CQ/RTS-QP ready");
@@ -1937,7 +1952,7 @@ PvrdmaTester::testCheckpointObservationRestore()
 void
 PvrdmaTester::setupPairEndpoint(
     Pvrdma &device, Addr qp_page, Addr cq_page, Addr mr_page,
-    const pvrdma::rocev1::MacAddress &remote_mac,
+    const pvrdma::rocev2::MacAddress &remote_mac,
     uint32_t send_psn, uint32_t receive_psn)
 {
     device.controlState = pvrdma::ControlState::Active;
@@ -1977,6 +1992,9 @@ PvrdmaTester::setupPairEndpoint(
     qp.attributes.receivePsn = receive_psn;
     qp.attributes.portNumber = 1;
     qp.attributes.addressHandle.portNumber = 1;
+    qp.attributes.addressHandle.globalRoute.trafficClass = TestTrafficClass;
+    qp.attributes.addressHandle.globalRoute.flowLabel = TestFlowLabel;
+    qp.attributes.addressHandle.globalRoute.hopLimit = 0;
     qp.attributes.capabilities = qp.capabilities;
     std::copy(remote_mac.begin(), remote_mac.end(),
               qp.attributes.addressHandle.destinationMac);
@@ -2009,9 +2027,9 @@ PvrdmaTester::setupPair()
     write(PeerPciConfigAddress + PCI_COMMAND,
           htole(static_cast<uint16_t>(PCI_CMD_MSE | PCI_CMD_BME)), MmioFlags);
 
-    const pvrdma::rocev1::MacAddress sender_mac =
+    const pvrdma::rocev2::MacAddress sender_mac =
         {0x02, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress receiver_mac =
+    const pvrdma::rocev2::MacAddress receiver_mac =
         {0x02, 0, 0, 0, 0, 2};
     setupPairEndpoint(*rdma, PairSenderQp, PairSenderCq,
                       PairSenderPayload, receiver_mac, 0x100, 0x200);
@@ -2133,9 +2151,9 @@ PvrdmaTester::setupReliabilityPair()
     write(PeerPciConfigAddress + PCI_COMMAND,
           htole(static_cast<uint16_t>(PCI_CMD_MSE | PCI_CMD_BME)), MmioFlags);
 
-    const pvrdma::rocev1::MacAddress sender_mac =
+    const pvrdma::rocev2::MacAddress sender_mac =
         {0x02, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress receiver_mac =
+    const pvrdma::rocev2::MacAddress receiver_mac =
         {0x02, 0, 0, 0, 0, 2};
     setupPairEndpoint(*rdma, PairSenderQp, PairSenderCq,
                       PairSenderPayload, receiver_mac, 0x100, 0x200);
@@ -2205,9 +2223,9 @@ PvrdmaTester::runSemanticPair()
     static constexpr std::array<uint32_t, 6> Lengths =
         {0, 1, 64, 1024, 1025, 4097};
     static constexpr uint32_t InitialPsn = 0x00fffffb;
-    const pvrdma::rocev1::MacAddress sender_mac =
+    const pvrdma::rocev2::MacAddress sender_mac =
         {0x02, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress receiver_mac =
+    const pvrdma::rocev2::MacAddress receiver_mac =
         {0x02, 0, 0, 0, 0, 2};
     const auto expected_psn = [&](size_t last) {
         uint32_t psn = InitialPsn;
@@ -2326,8 +2344,8 @@ PvrdmaTester::runSemanticPair()
         panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 7,
                  "PVRDMA semantic malformed RQ was not observed");
         const std::array<uint8_t, pvrdma::FixedMtu> payload = {0x5a};
-        pvrdma::rocev1::Packet malformed;
-        malformed.opcode = pvrdma::rocev1::Opcode::SendMiddle;
+        pvrdma::rocev2::Packet malformed;
+        malformed.opcode = pvrdma::rocev2::Opcode::SendMiddle;
         malformed.destinationQpn = 1;
         malformed.psn = expected_psn(Lengths.size() - 1);
         malformed.payload = {payload.data(), payload.size()};
@@ -2580,9 +2598,9 @@ PvrdmaTester::runReliabilityPair()
     using Direction = PvrdmaTestLink::Direction;
     using FrameId = PvrdmaTestLink::FrameId;
     const auto frame_id = [](Direction direction,
-                             pvrdma::rocev1::Opcode opcode, uint32_t psn,
-                             pvrdma::rocev1::Syndrome syndrome =
-                                 pvrdma::rocev1::Syndrome::Ack) {
+                             pvrdma::rocev2::Opcode opcode, uint32_t psn,
+                             pvrdma::rocev2::Syndrome syndrome =
+                                 pvrdma::rocev2::Syndrome::Ack) {
         return FrameId{direction, opcode, syndrome, psn};
     };
 
@@ -2605,30 +2623,30 @@ PvrdmaTester::runReliabilityPair()
         const uint32_t psn = send_qp.attributes.sendPsn;
         if (reliabilityCase == 0) {
             testLink->dropOnce(frame_id(Direction::Int0ToInt1,
-                pvrdma::rocev1::Opcode::SendOnly, psn));
+                pvrdma::rocev2::Opcode::SendOnly, psn));
         } else if (reliabilityCase == 1) {
             reliabilityRxDmasBefore = peerRdma->receivePayloadDmaStarts;
             testLink->duplicateOnce(frame_id(Direction::Int0ToInt1,
-                pvrdma::rocev1::Opcode::SendOnly, psn));
+                pvrdma::rocev2::Opcode::SendOnly, psn));
         } else if (reliabilityCase == 2) {
             recv_qp.attributes.minRnrTimer = 5;
         } else if (reliabilityCase == 3) {
             testLink->holdOnce(frame_id(Direction::Int1ToInt0,
-                pvrdma::rocev1::Opcode::Acknowledge, psn));
+                pvrdma::rocev2::Opcode::Acknowledge, psn));
         } else if (reliabilityCase == 4) {
             testLink->duplicateOnce(frame_id(Direction::Int1ToInt0,
-                pvrdma::rocev1::Opcode::Acknowledge, psn));
+                pvrdma::rocev2::Opcode::Acknowledge, psn));
         } else if (reliabilityCase == 5) {
             testLink->dropOnce(frame_id(Direction::Int0ToInt1,
-                pvrdma::rocev1::Opcode::SendMiddle,
+                pvrdma::rocev2::Opcode::SendMiddle,
                 pvrdma::advancePsn(pvrdma::advancePsn(psn))));
             testLink->dropOnce(frame_id(Direction::Int0ToInt1,
-                pvrdma::rocev1::Opcode::SendLast,
-                (psn + 4) & pvrdma::rocev1::Field24Mask));
+                pvrdma::rocev2::Opcode::SendLast,
+                (psn + 4) & pvrdma::rocev2::Field24Mask));
         } else if (reliabilityCase == 6) {
             for (int retry = 0; retry < 3; ++retry)
                 testLink->dropOnce(frame_id(Direction::Int0ToInt1,
-                    pvrdma::rocev1::Opcode::SendMiddle,
+                    pvrdma::rocev2::Opcode::SendMiddle,
                     pvrdma::advancePsn(psn)));
         }
         postReliabilitySend(length);
@@ -2656,8 +2674,8 @@ PvrdmaTester::runReliabilityPair()
       case TimingStage::ReliabilityDeadlineRelease: {
         const auto &qp = rdma->queuePairs.entries[1];
         const PvrdmaTestLink::FrameId ack{
-            Direction::Int1ToInt0, pvrdma::rocev1::Opcode::Acknowledge,
-            pvrdma::rocev1::Syndrome::Ack, qp.attributes.sendPsn};
+            Direction::Int1ToInt0, pvrdma::rocev2::Opcode::Acknowledge,
+            pvrdma::rocev2::Syndrome::Ack, qp.attributes.sendPsn};
         panic_if(!rdma->transportTimerEvent.scheduled() ||
                      rdma->transport.stage !=
                          Pvrdma::TransportState::Stage::WaitResponse ||
@@ -2780,12 +2798,12 @@ PvrdmaTester::runReliabilityPair()
                  reliabilityCase);
         if (reliabilityCase == 1) {
             const auto replay = peerRdma->queuePairs.entries[1].finalReplay;
-            const pvrdma::rocev1::MacAddress changed_mac =
+            const pvrdma::rocev2::MacAddress changed_mac =
                 {0x02, 0, 0, 0, 0, 3};
             write(PeerRegisterBarAddress + pvrdma::RegMacHigh,
                   htole(uint32_t{0x0300}), MmioFlags);
             const uint8_t payload = 0x5b;
-            pvrdma::rocev1::Packet frame;
+            pvrdma::rocev2::Packet frame;
             frame.sourceMac = replay.remoteMac;
             frame.destinationMac = changed_mac;
             frame.sourceGid = replay.remoteGid;
@@ -2793,14 +2811,19 @@ PvrdmaTester::runReliabilityPair()
             frame.opcode = replay.finalOpcode;
             frame.destinationQpn = replay.localQpn;
             frame.psn = replay.finalPsn;
+            frame.trafficClass = TestTrafficClass;
+            frame.flowLabel = TestFlowLabel;
+            frame.hopLimit = TestHopLimit;
+            frame.sourcePort = pvrdma::rocev2::udpSourcePort(
+                frame.flowLabel, replay.remoteQpn, replay.localQpn);
             frame.payload = {&payload, 1};
-            const size_t size = pvrdma::rocev1::encodedSize(frame);
+            const size_t size = pvrdma::rocev2::encodedSize(frame);
             auto packet = std::make_shared<EthPacketData>(size);
-            const auto encoded = pvrdma::rocev1::encode(
+            const auto encoded = pvrdma::rocev2::encode(
                 frame, {packet->data, packet->bufLength});
             panic_if(!encoded, "PVRDMA mutated-MAC replay failed encode");
             packet->length = packet->simLength = encoded.size;
-            const auto decoded = pvrdma::rocev1::decode(
+            const auto decoded = pvrdma::rocev2::decode(
                 {packet->data, packet->bufLength}, packet->length);
             panic_if(!decoded || peerRdma->replayFinal(decoded.packet) ||
                          peerRdma->transportActive() ||
@@ -2893,8 +2916,8 @@ PvrdmaTester::runReliabilityTimeoutZeroPair()
         auto &qp = rdma->queuePairs.entries[1];
         qp.attributes.timeout = 0;
         testLink->dropOnce({Direction::Int0ToInt1,
-            pvrdma::rocev1::Opcode::SendOnly,
-            pvrdma::rocev1::Syndrome::Ack, qp.attributes.sendPsn});
+            pvrdma::rocev2::Opcode::SendOnly,
+            pvrdma::rocev2::Syndrome::Ack, qp.attributes.sendPsn});
         postReliabilitySend(64);
         timingStage = TimingStage::ReliabilityTimeoutZeroObserve;
         schedule(testEvent, curTick() + microseconds(100));
@@ -2957,7 +2980,7 @@ void
 PvrdmaTester::runReliabilityInvalidPair()
 {
     using Direction = PvrdmaTestLink::Direction;
-    using Opcode = pvrdma::rocev1::Opcode;
+    using Opcode = pvrdma::rocev2::Opcode;
     static constexpr uint32_t Length = 2049;
 
     switch (timingStage) {
@@ -2965,9 +2988,9 @@ PvrdmaTester::runReliabilityInvalidPair()
         setupReliabilityPair();
         reliabilityCase = 0;
         rdma->queuePairs.entries[1].attributes.sendPsn =
-            pvrdma::rocev1::Field24Mask;
+            pvrdma::rocev2::Field24Mask;
         peerRdma->queuePairs.entries[1].attributes.receivePsn =
-            pvrdma::rocev1::Field24Mask;
+            pvrdma::rocev2::Field24Mask;
         postReliabilityReceive(Length);
         timingStage = TimingStage::ReliabilityPostSq;
         schedule(testEvent, curTick() + microseconds(20));
@@ -2975,7 +2998,7 @@ PvrdmaTester::runReliabilityInvalidPair()
       case TimingStage::ReliabilityPostSq: {
         const auto &qp = rdma->queuePairs.entries[1];
         testLink->holdOnce({Direction::Int1ToInt0, Opcode::Acknowledge,
-                            pvrdma::rocev1::Syndrome::Ack,
+                            pvrdma::rocev2::Syndrome::Ack,
                             qp.attributes.sendPsn});
         postReliabilitySend(Length);
         timingStage = TimingStage::ReliabilityInvalidInject;
@@ -2992,15 +3015,15 @@ PvrdmaTester::runReliabilityInvalidPair()
                  "PVRDMA invalid continuation setup did not become partial");
         const auto &sender_qp = rdma->queuePairs.entries[1];
         const uint8_t payload = 0x5a;
-        pvrdma::rocev1::Packet frame;
+        pvrdma::rocev2::Packet frame;
         frame.opcode = Opcode::SendLast;
         frame.destinationQpn = 1;
         frame.psn = pvrdma::advancePsn(
             pvrdma::advancePsn(sender_qp.attributes.sendPsn));
         frame.payload = {&payload, 1};
-        const pvrdma::rocev1::MacAddress sender_mac =
+        const pvrdma::rocev2::MacAddress sender_mac =
             {0x02, 0, 0, 0, 0, 1};
-        const pvrdma::rocev1::MacAddress receiver_mac =
+        const pvrdma::rocev2::MacAddress receiver_mac =
             {0x02, 0, 0, 0, 0, 2};
         auto packet = rocePacket(frame, sender_mac, receiver_mac);
         panic_if(!receiver.recvTransportPacket(std::move(packet)),
@@ -3012,8 +3035,8 @@ PvrdmaTester::runReliabilityInvalidPair()
       case TimingStage::ReliabilityInvalidVerify: {
         const PvrdmaTestLink::FrameId ack{
             Direction::Int1ToInt0, Opcode::Acknowledge,
-            pvrdma::rocev1::Syndrome::Ack,
-            pvrdma::rocev1::Field24Mask};
+            pvrdma::rocev2::Syndrome::Ack,
+            pvrdma::rocev2::Field24Mask};
         if (!reliabilityCase++) {
             panic_if(!testLink->release(ack),
                      "PVRDMA stale held ACK was not releasable");
@@ -3054,12 +3077,12 @@ void
 PvrdmaTester::runReliabilitySequencePair()
 {
     using Direction = PvrdmaTestLink::Direction;
-    using Opcode = pvrdma::rocev1::Opcode;
-    using Syndrome = pvrdma::rocev1::Syndrome;
-    const pvrdma::rocev1::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+    using Opcode = pvrdma::rocev2::Opcode;
+    using Syndrome = pvrdma::rocev2::Syndrome;
+    const pvrdma::rocev2::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
     const auto sequence_nak = [&](uint32_t psn) {
-        pvrdma::rocev1::Packet frame;
+        pvrdma::rocev2::Packet frame;
         frame.opcode = Opcode::Acknowledge;
         frame.ackRequest = false;
         frame.destinationQpn = 1;
@@ -3187,12 +3210,12 @@ void
 PvrdmaTester::runReliabilityUnrelatedPair()
 {
     using Direction = PvrdmaTestLink::Direction;
-    using Opcode = pvrdma::rocev1::Opcode;
+    using Opcode = pvrdma::rocev2::Opcode;
     static constexpr uint32_t Length = 2049;
     static constexpr uint32_t UnrelatedPsn = 0x456;
-    const pvrdma::rocev1::MacAddress sender_mac =
+    const pvrdma::rocev2::MacAddress sender_mac =
         {0x02, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress receiver_mac =
+    const pvrdma::rocev2::MacAddress receiver_mac =
         {0x02, 0, 0, 0, 0, 2};
 
     switch (timingStage) {
@@ -3206,7 +3229,7 @@ PvrdmaTester::runReliabilityUnrelatedPair()
       case TimingStage::ReliabilityPostSq: {
         const auto &qp = rdma->queuePairs.entries[1];
         testLink->holdOnce({Direction::Int1ToInt0, Opcode::Acknowledge,
-                            pvrdma::rocev1::Syndrome::Ack,
+                            pvrdma::rocev2::Syndrome::Ack,
                             qp.attributes.sendPsn});
         postReliabilitySend(Length);
         timingStage = TimingStage::ReliabilityUnrelatedInject;
@@ -3222,7 +3245,7 @@ PvrdmaTester::runReliabilityUnrelatedPair()
                      receiver.transport.acceptedSegmentIndex != 0,
                  "PVRDMA unrelated continuation setup did not become partial");
         const uint8_t payload = 0xa5;
-        pvrdma::rocev1::Packet frame;
+        pvrdma::rocev2::Packet frame;
         frame.opcode = Opcode::SendOnly;
         frame.destinationQpn = 2;
         frame.psn = UnrelatedPsn;
@@ -3237,7 +3260,7 @@ PvrdmaTester::runReliabilityUnrelatedPair()
       case TimingStage::ReliabilityUnrelatedVerify: {
         const PvrdmaTestLink::FrameId ack{
             Direction::Int1ToInt0, Opcode::Acknowledge,
-            pvrdma::rocev1::Syndrome::Ack, 0x100};
+            pvrdma::rocev2::Syndrome::Ack, 0x100};
         const auto &receiver = *peerRdma;
         panic_if(testLink->pendingRules() || testLink->heldPackets() != 1 ||
                      receiver.pendingErrorPacket ||
@@ -3369,7 +3392,7 @@ PvrdmaTester::runReliabilityCqPair()
                          0x102 ||
                      !peerRdma->queuePairs.entries[1].finalReplay.valid ||
                      peerRdma->queuePairs.entries[1].finalReplay.finalOpcode !=
-                         pvrdma::rocev1::Opcode::SendLast ||
+                         pvrdma::rocev2::Opcode::SendLast ||
                      rdma->memoryRegions.entries[1].activeReferences ||
                      peerRdma->memoryRegions.entries[1].activeReferences ||
                      rdma->transportActive() || peerRdma->transportActive() ||
@@ -3389,10 +3412,10 @@ PvrdmaTester::runReliabilityCqPair()
 void
 PvrdmaTester::runReliabilityCqAbortPair()
 {
-    using Opcode = pvrdma::rocev1::Opcode;
+    using Opcode = pvrdma::rocev2::Opcode;
     static constexpr uint32_t Length = pvrdma::FixedMtu;
-    const pvrdma::rocev1::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+    const pvrdma::rocev2::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
     switch (timingStage) {
       case TimingStage::Configure:
         setupReliabilityPair();
@@ -3402,7 +3425,7 @@ PvrdmaTester::runReliabilityCqAbortPair()
         return;
       case TimingStage::ReliabilityCqBlocked: {
         std::array<uint8_t, Length> payload{};
-        pvrdma::rocev1::Packet first;
+        pvrdma::rocev2::Packet first;
         first.opcode = Opcode::SendFirst;
         first.destinationQpn = 1;
         first.psn = 0x100;
@@ -3425,7 +3448,7 @@ PvrdmaTester::runReliabilityCqAbortPair()
                      peerRdma->receivePayloadDmaStarts != 1,
                  "PVRDMA late-overflow FIRST did not become partial");
         const uint8_t payload = 0x5a;
-        pvrdma::rocev1::Packet last;
+        pvrdma::rocev2::Packet last;
         last.opcode = Opcode::SendLast;
         last.destinationQpn = 1;
         last.psn = 0x101;
@@ -3488,7 +3511,7 @@ PvrdmaTester::runReliabilityCqAbortPair()
 void
 PvrdmaTester::runTerminalBackpressurePair()
 {
-    using Opcode = pvrdma::rocev1::Opcode;
+    using Opcode = pvrdma::rocev2::Opcode;
     using TransportStage = Pvrdma::TransportState::Stage;
     static constexpr uint32_t Length = pvrdma::FixedMtu;
     static constexpr uint64_t Marker = 0xfeedfacecafebeef;
@@ -3496,8 +3519,8 @@ PvrdmaTester::runTerminalBackpressurePair()
     const bool reset = testMode.find("terminal-reset") !=
         std::string::npos;
     const bool checkpoint = testMode == "checkpoint-terminal-drain-save";
-    const pvrdma::rocev1::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+    const pvrdma::rocev2::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
 
     switch (timingStage) {
       case TimingStage::Configure: {
@@ -3527,7 +3550,7 @@ PvrdmaTester::runTerminalBackpressurePair()
             return;
         }
         std::array<uint8_t, Length> payload{};
-        pvrdma::rocev1::Packet first;
+        pvrdma::rocev2::Packet first;
         first.opcode = Opcode::SendFirst;
         first.destinationQpn = 1;
         first.psn = 0x100;
@@ -3554,7 +3577,7 @@ PvrdmaTester::runTerminalBackpressurePair()
                  "PVRDMA terminal receive did not hold its MR");
         if (overflow) {
             const uint8_t payload = 0x5a;
-            pvrdma::rocev1::Packet last;
+            pvrdma::rocev2::Packet last;
             last.opcode = Opcode::SendLast;
             last.destinationQpn = 1;
             last.psn = 0x101;
@@ -3762,7 +3785,7 @@ PvrdmaTester::runSqTerminalBackpressure()
     switch (timingStage) {
       case TimingStage::Configure: {
         configurePci();
-        const pvrdma::rocev1::MacAddress remote =
+        const pvrdma::rocev2::MacAddress remote =
             {0x02, 0, 0, 0, 0, 2};
         setupPairEndpoint(*rdma, PairSenderQp, PairSenderCq,
                           PairSenderPayload, remote, 0x100, 0x200);
@@ -3984,10 +4007,10 @@ PvrdmaTester::runReliabilityPrecommitAbortPair()
 {
     using CompletionStage = Pvrdma::CompletionDmaState::Stage;
     using TransportStage = Pvrdma::TransportState::Stage;
-    using Opcode = pvrdma::rocev1::Opcode;
+    using Opcode = pvrdma::rocev2::Opcode;
     static constexpr uint32_t Length = 64;
-    const pvrdma::rocev1::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+    const pvrdma::rocev2::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
     switch (timingStage) {
       case TimingStage::Configure:
         setupReliabilityPair();
@@ -3999,7 +4022,7 @@ PvrdmaTester::runReliabilityPrecommitAbortPair()
       case TimingStage::ReliabilityPrecommitInject: {
         if (!reliabilityCase) {
             std::array<uint8_t, Length> payload{};
-            pvrdma::rocev1::Packet frame;
+            pvrdma::rocev2::Packet frame;
             frame.opcode = Opcode::SendOnly;
             frame.destinationQpn = 1;
             frame.psn = 0x100;
@@ -4017,7 +4040,7 @@ PvrdmaTester::runReliabilityPrecommitAbortPair()
             return;
         }
         const auto dmas = peerRdma->receivePayloadDmaStarts;
-        pvrdma::rocev1::Packet duplicate;
+        pvrdma::rocev2::Packet duplicate;
         duplicate.opcode = Opcode::SendOnly;
         duplicate.destinationQpn = 1;
         duplicate.psn = 0x100;
@@ -4040,7 +4063,7 @@ PvrdmaTester::runReliabilityPrecommitAbortPair()
             return;
         }
         const auto dmas = peerRdma->receivePayloadDmaStarts;
-        pvrdma::rocev1::Packet duplicate;
+        pvrdma::rocev2::Packet duplicate;
         duplicate.opcode = Opcode::SendOnly;
         duplicate.destinationQpn = 1;
         duplicate.psn = 0x100;
@@ -4054,19 +4077,20 @@ PvrdmaTester::runReliabilityPrecommitAbortPair()
                          CompletionStage::ReadCqRing,
                  "PVRDMA accepted-segment retransmission was not absorbed");
         const uint8_t payload = 0xa5;
-        pvrdma::rocev1::Packet next;
+        pvrdma::rocev2::Packet next;
         next.opcode = Opcode::SendOnly;
         next.destinationQpn = 1;
         next.psn = 0x101;
         next.payload = {&payload, 1};
         auto malformed = rocePacket(next, sender, receiver);
-        malformed->data[54] = static_cast<uint8_t>(Opcode::SendFirst);
-        const size_t icrc = malformed->length - pvrdma::rocev1::IcrcSize;
-        pvrdma::rocev1::detail::put32Le(
+        malformed->data[pvrdma::rocev2::BthOffset] =
+            static_cast<uint8_t>(Opcode::SendFirst);
+        const size_t icrc = malformed->length - pvrdma::rocev2::IcrcSize;
+        pvrdma::rocev2::detail::put32Le(
             malformed->data, icrc,
-            pvrdma::rocev1::detail::icrc(
-                malformed->data + pvrdma::rocev1::EthernetHeaderSize,
-                icrc - pvrdma::rocev1::EthernetHeaderSize));
+            pvrdma::rocev2::detail::icrc(
+                malformed->data + pvrdma::rocev2::EthernetHeaderSize,
+                icrc - pvrdma::rocev2::EthernetHeaderSize));
         panic_if(!peerRdma->recvTransportPacket(std::move(malformed)) ||
                      peerRdma->transport.stage !=
                          TransportStage::WaitReceiveCq ||
@@ -4119,8 +4143,8 @@ PvrdmaTester::runReliabilityCommitPair()
         setupReliabilityPair();
         postReliabilityReceive(Length);
         testLink->duplicateOnce({Direction::Int0ToInt1,
-            pvrdma::rocev1::Opcode::SendOnly,
-            pvrdma::rocev1::Syndrome::Ack, 0x100});
+            pvrdma::rocev2::Opcode::SendOnly,
+            pvrdma::rocev2::Syndrome::Ack, 0x100});
         postReliabilitySend(Length);
         timingStage = TimingStage::ReliabilityCommitVerify;
         schedule(testEvent, curTick() + microseconds(1000));
@@ -4162,7 +4186,7 @@ PvrdmaTester::runReliabilityCommitBoundaryPair()
         const auto &replay = peerRdma->queuePairs.entries[1].finalReplay;
         const auto cqe = read<pvrdma::CompletionQueueElement>(PairReceiverCqe);
         panic_if(!replay.valid || replay.finalOpcode !=
-                         pvrdma::rocev1::Opcode::SendOnly ||
+                         pvrdma::rocev2::Opcode::SendOnly ||
                      replay.finalSegmentLength != Length ||
                      replay.completedMsn != 1 ||
                      letoh(cqe.byteLength) != Length ||
@@ -4181,12 +4205,12 @@ PvrdmaTester::runReliabilityCommitBoundaryPair()
 void
 PvrdmaTester::testInboundFrames()
 {
-    using namespace pvrdma::rocev1;
+    using namespace pvrdma::rocev2;
     const MacAddress sender = {0x02, 0, 0, 0, 0, 1};
     const MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
     std::array<uint8_t, pvrdma::FixedMtu> payload{};
 
-    pvrdma::rocev1::Packet unknown;
+    pvrdma::rocev2::Packet unknown;
     unknown.opcode = Opcode::SendOnly;
     unknown.destinationQpn = 2;
     unknown.psn = 0x103;
@@ -4196,7 +4220,66 @@ PvrdmaTester::testInboundFrames()
                  peerRdma->pendingErrorPacket,
              "PVRDMA unknown QPN did not drop silently");
 
-    const auto check_nak = [&](pvrdma::rocev1::Packet frame,
+    const auto fix_icrc = [](const EthPacketPtr &packet) {
+        const size_t offset = packet->length - IcrcSize;
+        detail::put32Le(packet->data, offset,
+                        detail::icrc(packet->data + EthernetHeaderSize,
+                                     offset - EthernetHeaderSize));
+    };
+    pvrdma::rocev2::Packet route_probe;
+    route_probe.opcode = Opcode::SendOnly;
+    route_probe.destinationQpn = 1;
+    route_probe.psn = 0x103;
+    route_probe.payload = {payload.data(), 1};
+    auto below_range = rocePacket(route_probe, sender, receiver);
+    detail::put16(below_range->data, UdpSourcePortOffset,
+                  MinUdpSourcePort - 1);
+    fix_icrc(below_range);
+    panic_if(!peerRdma->recvTransportPacket(std::move(below_range)) ||
+                 peerRdma->pendingErrorPacket || peerRdma->pendingRxPacket,
+             "PVRDMA accepted a below-range RoCEv2 source port");
+
+    auto unrelated_udp = rocePacket(route_probe, sender, receiver);
+    detail::put16(unrelated_udp->data, UdpDestinationPortOffset, 1234);
+    fix_icrc(unrelated_udp);
+    panic_if(!peerRdma->recvTransportPacket(std::move(unrelated_udp)) ||
+                 peerRdma->pendingErrorPacket || peerRdma->pendingRxPacket,
+             "PVRDMA answered unrelated IPv6/UDP traffic");
+
+    auto &route_qp = peerRdma->queuePairs.entries[1];
+    const auto saved_route = route_qp.attributes.addressHandle.globalRoute;
+    const auto saved_gid = peerRdma->gids[0];
+    const auto saved_gid_valid = peerRdma->gidValid[0];
+    const Gid mapped = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1,
+    };
+    const auto reject_mapped_route = [&](const Gid &local,
+                                          const Gid &remote,
+                                          const char *message) {
+        auto &route = route_qp.attributes.addressHandle.globalRoute;
+        route.sourceGidIndex = 0;
+        std::copy(local.begin(), local.end(), peerRdma->gids[0].raw);
+        peerRdma->gidValid[0] = 1;
+        std::copy(remote.begin(), remote.end(), route.destinationGid.raw);
+        auto frame = route_probe;
+        frame.sourceGid = remote;
+        frame.destinationGid = local;
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(frame, sender, receiver)) ||
+                     peerRdma->pendingErrorPacket ||
+                     peerRdma->pendingRxPacket,
+                 message);
+    };
+    reject_mapped_route(mapped, testGid(sender),
+                        "PVRDMA accepted an IPv4-mapped local GID route");
+    reject_mapped_route(testGid(receiver), mapped,
+                        "PVRDMA accepted an IPv4-mapped destination GID "
+                        "route");
+    route_qp.attributes.addressHandle.globalRoute = saved_route;
+    peerRdma->gids[0] = saved_gid;
+    peerRdma->gidValid[0] = saved_gid_valid;
+
+    const auto check_nak = [&](pvrdma::rocev2::Packet frame,
                                Syndrome syndrome) {
         panic_if(!peerRdma->recvTransportPacket(
                      rocePacket(frame, sender, receiver)),
@@ -4208,37 +4291,90 @@ PvrdmaTester::testInboundFrames()
             {peerRdma->pendingErrorPacket->data,
              peerRdma->pendingErrorPacket->bufLength},
             peerRdma->pendingErrorPacket->length);
+        const auto &route = peerRdma->queuePairs.entries[
+            1].attributes.addressHandle.globalRoute;
         panic_if(!decoded || decoded.packet.opcode != Opcode::Acknowledge ||
                      decoded.packet.syndrome != syndrome ||
                      decoded.packet.destinationQpn != 1 ||
                      decoded.packet.sourceMac != receiver ||
-                     decoded.packet.destinationMac != sender,
-                 "PVRDMA malformed RoCE NAK identity mismatch");
+                     decoded.packet.destinationMac != sender ||
+                     decoded.packet.trafficClass != route.trafficClass ||
+                     decoded.packet.flowLabel != route.flowLabel ||
+                     decoded.packet.hopLimit !=
+                         (route.hopLimit ? route.hopLimit : TestHopLimit) ||
+                     decoded.packet.sourcePort != udpSourcePort(
+                         route.flowLabel, 1, 1),
+                 "PVRDMA malformed RoCE NAK route mismatch");
         peerRdma->pendingErrorPacket.reset();
     };
 
-    pvrdma::rocev1::Packet future;
+    pvrdma::rocev2::Packet future;
     future.opcode = Opcode::SendOnly;
     future.destinationQpn = 1;
     future.psn = 0x104;
     future.payload = {payload.data(), 1};
-    check_nak(future, Syndrome::SequenceNak);
+    auto alternate_port = rocePacket(future, sender, receiver);
+    detail::put16(alternate_port->data, UdpSourcePortOffset,
+                  MinUdpSourcePort);
+    fix_icrc(alternate_port);
+    panic_if(!peerRdma->recvTransportPacket(std::move(alternate_port)) ||
+                 !peerRdma->pendingRxPacket,
+             "PVRDMA rejected a valid alternate RoCEv2 source port");
+    peerRdma->startInbound();
+    panic_if(!peerRdma->pendingErrorPacket,
+             "PVRDMA alternate source port bypassed PSN handling");
+    const auto alternate_nak = decode(
+        {peerRdma->pendingErrorPacket->data,
+         peerRdma->pendingErrorPacket->bufLength},
+        peerRdma->pendingErrorPacket->length);
+    panic_if(!alternate_nak ||
+                 alternate_nak.packet.syndrome != Syndrome::SequenceNak,
+             "PVRDMA alternate source port produced the wrong PSN result");
+    peerRdma->pendingErrorPacket.reset();
 
-    pvrdma::rocev1::Packet continuation;
+    const MacAddress last_hop = {0x02, 0, 0, 0, 0, 3};
+    auto routed = future;
+    routed.sourceGid = testGid(sender);
+    routed.destinationGid = testGid(receiver);
+    panic_if(!peerRdma->recvTransportPacket(
+                 rocePacket(routed, last_hop, receiver)) ||
+                 !peerRdma->pendingRxPacket,
+             "PVRDMA rejected a routed frame from a last-hop MAC");
+    peerRdma->startInbound();
+    const auto routed_nak = peerRdma->pendingErrorPacket ? decode(
+        {peerRdma->pendingErrorPacket->data,
+         peerRdma->pendingErrorPacket->bufLength},
+        peerRdma->pendingErrorPacket->length) : DecodeResult{};
+    panic_if(!routed_nak ||
+                 routed_nak.packet.syndrome != Syndrome::SequenceNak ||
+                 routed_nak.packet.destinationMac != sender ||
+                 routed_nak.packet.destinationMac == last_hop,
+             "PVRDMA routed response did not use the configured AV MAC");
+    peerRdma->pendingErrorPacket.reset();
+
+    pvrdma::rocev2::Packet continuation;
     continuation.opcode = Opcode::SendMiddle;
     continuation.destinationQpn = 1;
     continuation.psn = 0x103;
     continuation.payload = {payload.data(), payload.size()};
     check_nak(continuation, Syndrome::InvalidRequestNak);
 
+    auto stale_icrc = rocePacket(future, sender, receiver);
+    stale_icrc->data[pvrdma::rocev2::BthOffset] =
+        static_cast<uint8_t>(Opcode::SendFirst);
+    panic_if(!peerRdma->recvTransportPacket(std::move(stale_icrc)) ||
+                 peerRdma->pendingErrorPacket || peerRdma->pendingRxPacket,
+             "PVRDMA answered malformed frame with a stale ICRC");
+
     auto malformed = rocePacket(future, sender, receiver);
-    malformed->data[54] = static_cast<uint8_t>(Opcode::SendFirst);
-    const size_t icrc = malformed->length - pvrdma::rocev1::IcrcSize;
-    pvrdma::rocev1::detail::put32Le(
+    malformed->data[pvrdma::rocev2::BthOffset] =
+        static_cast<uint8_t>(Opcode::SendFirst);
+    const size_t icrc = malformed->length - pvrdma::rocev2::IcrcSize;
+    pvrdma::rocev2::detail::put32Le(
         malformed->data, icrc,
-        pvrdma::rocev1::detail::icrc(
-            malformed->data + pvrdma::rocev1::EthernetHeaderSize,
-            icrc - pvrdma::rocev1::EthernetHeaderSize));
+        pvrdma::rocev2::detail::icrc(
+            malformed->data + pvrdma::rocev2::EthernetHeaderSize,
+            icrc - pvrdma::rocev2::EthernetHeaderSize));
     panic_if(!peerRdma->recvTransportPacket(std::move(malformed)) ||
                  !peerRdma->pendingErrorPacket,
              "PVRDMA malformed wire length did not produce NAK");
@@ -4742,13 +4878,13 @@ EthPacketPtr
 PvrdmaTester::faultPacket(uint32_t psn)
 {
     const uint8_t payload = static_cast<uint8_t>(psn);
-    pvrdma::rocev1::Packet frame;
-    frame.opcode = pvrdma::rocev1::Opcode::SendOnly;
+    pvrdma::rocev2::Packet frame;
+    frame.opcode = pvrdma::rocev2::Opcode::SendOnly;
     frame.destinationQpn = 1;
     frame.psn = psn;
     frame.payload = {&payload, 1};
-    const pvrdma::rocev1::MacAddress source = {2, 0, 0, 0, 0, 1};
-    const pvrdma::rocev1::MacAddress destination = {2, 0, 0, 0, 0, 2};
+    const pvrdma::rocev2::MacAddress source = {2, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress destination = {2, 0, 0, 0, 0, 2};
     return rocePacket(frame, source, destination);
 }
 
@@ -4758,8 +4894,8 @@ PvrdmaTester::runFaultLink()
     using Direction = PvrdmaTestLink::Direction;
     using FrameId = PvrdmaTestLink::FrameId;
     const auto id = [](Direction direction, uint32_t psn) {
-        return FrameId{direction, pvrdma::rocev1::Opcode::SendOnly,
-                       pvrdma::rocev1::Syndrome::Ack, psn};
+        return FrameId{direction, pvrdma::rocev2::Opcode::SendOnly,
+                       pvrdma::rocev2::Syndrome::Ack, psn};
     };
 
     switch (timingStage) {

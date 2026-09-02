@@ -9,7 +9,7 @@
 #include <map>
 
 #include "dev/net/etherint.hh"
-#include "dev/rdma/pvrdma_rocev1.hh"
+#include "dev/rdma/pvrdma_rocev2.hh"
 #include "params/PvrdmaTestLink.hh"
 #include "sim/eventq.hh"
 #include "sim/sim_object.hh"
@@ -29,8 +29,8 @@ class PvrdmaTestLink : public SimObject
     struct FrameId
     {
         Direction direction;
-        pvrdma::rocev1::Opcode opcode;
-        pvrdma::rocev1::Syndrome syndrome;
+        pvrdma::rocev2::Opcode opcode;
+        pvrdma::rocev2::Syndrome syndrome;
         uint32_t psn;
     };
 

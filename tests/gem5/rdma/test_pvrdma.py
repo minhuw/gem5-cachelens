@@ -217,7 +217,26 @@ def pvrdma_checkpoint_test(host):
         for phase, marker in (
             ("save", "PVRDMA_CHECKPOINT_SAVED"),
             ("restore", "PVRDMA_CHECKPOINT_RESTORED"),
+            (
+                "incompatible",
+                "PVRDMA checkpoint transport is not RoCEv2",
+            ),
         ):
+            if phase == "incompatible":
+                cpt = checkpoint / "m5.cpt"
+                contents = cpt.read_text()
+                match = re.search(
+                    r"^capabilities=(.*)$", contents, re.MULTILINE
+                )
+                assert match
+                capabilities = match.group(1).split()
+                assert len(capabilities) == 208 and capabilities[203] == "2"
+                capabilities[203] = "1"
+                cpt.write_text(
+                    contents[: match.start(1)]
+                    + " ".join(capabilities)
+                    + contents[match.end(1) :]
+                )
             result = subprocess.run(
                 [
                     gem5,
@@ -225,7 +244,9 @@ def pvrdma_checkpoint_test(host):
                     (tempdir / phase).as_posix(),
                     config_path,
                     "--mode",
-                    f"checkpoint-{phase}",
+                    "checkpoint-restore"
+                    if phase == "incompatible"
+                    else f"checkpoint-{phase}",
                     "--checkpoint",
                     checkpoint.as_posix(),
                 ],
@@ -235,7 +256,7 @@ def pvrdma_checkpoint_test(host):
                 text=True,
             )
             print(result.stdout)
-            assert result.returncode == 0
+            assert (result.returncode != 0) == (phase == "incompatible")
             assert marker in result.stdout
 
     name = f"pvrdma-checkpoint-live-mr-{host}-opt"

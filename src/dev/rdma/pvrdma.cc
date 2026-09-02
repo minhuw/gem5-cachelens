@@ -640,30 +640,30 @@ Pvrdma::checkQueueConservation()
 namespace
 {
 
-pvrdma::rocev1::MacAddress
+pvrdma::rocev2::MacAddress
 storedMac(const pvrdma::QueuePair &qp)
 {
-    pvrdma::rocev1::MacAddress mac;
+    pvrdma::rocev2::MacAddress mac;
     std::copy_n(qp.attributes.addressHandle.destinationMac, mac.size(),
                 mac.begin());
     return mac;
 }
 
 bool
-zeroGid(const pvrdma::rocev1::Gid &gid)
+zeroGid(const pvrdma::rocev2::Gid &gid)
 {
     return std::all_of(gid.begin(), gid.end(),
                        [](uint8_t byte) { return byte == 0; });
 }
 
-pvrdma::rocev1::Gid
-linkLocalGid(const pvrdma::rocev1::MacAddress &mac)
+pvrdma::rocev2::Gid
+linkLocalGid(const pvrdma::rocev2::MacAddress &mac)
 {
     const uint32_t low = uint32_t{mac[0]} | (uint32_t{mac[1]} << 8) |
         (uint32_t{mac[2]} << 16) | (uint32_t{mac[3]} << 24);
     const uint32_t high = uint32_t{mac[4]} | (uint32_t{mac[5]} << 8);
     const uint64_t guid = pvrdma::detail::macGuid(low, high);
-    pvrdma::rocev1::Gid gid{};
+    pvrdma::rocev2::Gid gid{};
     gid[0] = 0xfe;
     gid[1] = 0x80;
     for (size_t i = 0; i < 8; ++i)
@@ -674,9 +674,9 @@ linkLocalGid(const pvrdma::rocev1::MacAddress &mac)
 bool
 routeGids(const pvrdma::QueuePair &qp, const pvrdma::GidTable &gids,
           const pvrdma::GidValidTable &valid,
-          const pvrdma::rocev1::MacAddress &local_mac,
-          pvrdma::rocev1::Gid &local_gid,
-          pvrdma::rocev1::Gid &remote_gid)
+          const pvrdma::rocev2::MacAddress &local_mac,
+          pvrdma::rocev2::Gid &local_gid,
+          pvrdma::rocev2::Gid &remote_gid)
 {
     const auto &route = qp.attributes.addressHandle.globalRoute;
     const bool local_configured = route.sourceGidIndex < valid.size() &&
@@ -689,22 +689,23 @@ routeGids(const pvrdma::QueuePair &qp, const pvrdma::GidTable &gids,
     if (local_configured) {
         std::copy_n(gids[route.sourceGidIndex].raw, local_gid.size(),
                     local_gid.begin());
-        return !zeroGid(local_gid);
+    } else {
+        local_gid = linkLocalGid(local_mac);
+        remote_gid = linkLocalGid(storedMac(qp));
     }
-    local_gid = linkLocalGid(local_mac);
-    remote_gid = linkLocalGid(storedMac(qp));
-    return true;
+    return !zeroGid(local_gid) &&
+        !pvrdma::detail::ipv4MappedGid(local_gid.data()) &&
+        !pvrdma::detail::ipv4MappedGid(remote_gid.data());
 }
 
 bool
 routeMatches(const pvrdma::QueuePair &qp,
-             const pvrdma::rocev1::Packet &packet,
-             const pvrdma::rocev1::MacAddress &local_mac,
-             const pvrdma::rocev1::Gid &local_gid,
-             const pvrdma::rocev1::Gid &remote_gid)
+             const pvrdma::rocev2::Packet &packet,
+             const pvrdma::rocev2::MacAddress &local_mac,
+             const pvrdma::rocev2::Gid &local_gid,
+             const pvrdma::rocev2::Gid &remote_gid)
 {
     return packet.destinationMac == local_mac &&
-        packet.sourceMac == storedMac(qp) &&
         packet.destinationGid == local_gid && packet.sourceGid == remote_gid &&
         packet.destinationQpn == qp.qpn &&
         packet.pKey == pvrdma::FullMembershipPkey &&
@@ -714,15 +715,16 @@ routeMatches(const pvrdma::QueuePair &qp,
 }
 
 bool
-nakableShapeError(pvrdma::rocev1::CodecError error)
+nakableShapeError(pvrdma::rocev2::CodecError error)
 {
-    using pvrdma::rocev1::CodecError;
+    using pvrdma::rocev2::CodecError;
     switch (error) {
       case CodecError::BadOpcode:
       case CodecError::BadBthVersion:
       case CodecError::BadReserved:
       case CodecError::BadAckRequest:
-      case CodecError::BadGrhLength:
+      case CodecError::BadIpv6Length:
+      case CodecError::BadUdpLength:
       case CodecError::ExtraBytes:
       case CodecError::BadPad:
       case CodecError::BadPayloadLength:
@@ -734,20 +736,37 @@ nakableShapeError(pvrdma::rocev1::CodecError error)
 
 bool
 routeFromMalformed(const uint8_t *bytes, size_t length,
-                   pvrdma::rocev1::Packet &packet)
+                   pvrdma::rocev2::Packet &packet)
 {
-    using namespace pvrdma::rocev1;
-    if (!bytes || length < SendHeaderSize ||
-        detail::get16(bytes, 12) != EtherType)
+    using namespace pvrdma::rocev2;
+    if (!bytes || length < SendHeaderSize + IcrcSize ||
+        detail::get32Le(bytes, length - IcrcSize) !=
+            detail::icrc(bytes + EthernetHeaderSize,
+                         length - EthernetHeaderSize - IcrcSize) ||
+        detail::get16(bytes, EtherTypeOffset) != EtherType ||
+        (bytes[Ipv6Offset] >> 4) != 6 ||
+        bytes[Ipv6NextHeaderOffset] != Ipv6NextHeader ||
+        detail::get16(bytes, UdpDestinationPortOffset) !=
+            RoceUdpDestinationPort ||
+        detail::get16(bytes, UdpSourcePortOffset) < MinUdpSourcePort)
         return false;
-    std::copy_n(bytes, 6, packet.destinationMac.begin());
-    std::copy_n(bytes + 6, 6, packet.sourceMac.begin());
-    std::copy_n(bytes + 22, 16, packet.sourceGid.begin());
-    std::copy_n(bytes + 38, 16, packet.destinationGid.begin());
-    packet.pKey = detail::get16(bytes, 56);
-    packet.opcode = static_cast<Opcode>(bytes[54]);
-    packet.destinationQpn = detail::get24(bytes, 59);
-    packet.psn = detail::get24(bytes, 63);
+    std::copy_n(bytes + EthernetDestinationOffset, 6,
+                packet.destinationMac.begin());
+    std::copy_n(bytes + EthernetSourceOffset, 6, packet.sourceMac.begin());
+    std::copy_n(bytes + Ipv6SourceOffset, 16, packet.sourceGid.begin());
+    std::copy_n(bytes + Ipv6DestinationOffset, 16,
+                packet.destinationGid.begin());
+    packet.trafficClass = ((bytes[Ipv6Offset] & 0x0f) << 4) |
+                          (bytes[Ipv6Offset + 1] >> 4);
+    packet.flowLabel = (uint32_t{bytes[Ipv6Offset + 1]} & 0x0f) << 16 |
+                       (uint32_t{bytes[Ipv6Offset + 2]} << 8) |
+                       bytes[Ipv6Offset + 3];
+    packet.hopLimit = bytes[Ipv6HopLimitOffset];
+    packet.sourcePort = detail::get16(bytes, UdpSourcePortOffset);
+    packet.pKey = detail::get16(bytes, BthPKeyOffset);
+    packet.opcode = static_cast<Opcode>(bytes[BthOffset]);
+    packet.destinationQpn = detail::get24(bytes, BthQpnOffset + 1);
+    packet.psn = detail::get24(bytes, BthPsnOffset);
     return pvrdma::validQpn(packet.destinationQpn);
 }
 
@@ -858,7 +877,7 @@ Pvrdma::revalidateTransport(bool require_cq) const
         qp.attributes.destinationQpNumber != transport.remoteQpn ||
         storedMac(qp) != transport.remoteMac)
         return false;
-    pvrdma::rocev1::Gid local_gid{}, remote_gid{};
+    pvrdma::rocev2::Gid local_gid{}, remote_gid{};
     if (!routeGids(qp, gids, gidValid, transport.localMac,
                    local_gid, remote_gid) ||
         local_gid != transport.localGid || remote_gid != transport.remoteGid)
@@ -905,12 +924,11 @@ Pvrdma::revalidateTransportLease() const
 }
 
 bool
-Pvrdma::receiveSegmentMatches(const pvrdma::rocev1::Packet &frame,
+Pvrdma::receiveSegmentMatches(const pvrdma::rocev2::Packet &frame,
                               bool accepted) const
 {
     if (!transport.active() || transport.kind != pvrdma::QueueKind::Rq ||
         (accepted && !transport.hasAcceptedSegment) ||
-        frame.sourceMac != transport.remoteMac ||
         frame.destinationMac != transport.localMac ||
         frame.sourceGid != transport.remoteGid ||
         frame.destinationGid != transport.localGid ||
@@ -939,7 +957,7 @@ Pvrdma::receiveSegmentMatches(const pvrdma::rocev1::Packet &frame,
 bool
 Pvrdma::recvTransportPacket(EthPacketPtr packet)
 {
-    using namespace pvrdma::rocev1;
+    using namespace pvrdma::rocev2;
     if (!packet)
         return false;
     if (packet->length > packet->bufLength || pendingRxPacket)
@@ -947,11 +965,11 @@ Pvrdma::recvTransportPacket(EthPacketPtr packet)
     const auto decoded = decode({packet->data, packet->bufLength},
                                 packet->length);
     if (!decoded) {
-        pvrdma::rocev1::Packet malformed;
+        pvrdma::rocev2::Packet malformed;
         if (nakableShapeError(decoded.error) &&
             routeFromMalformed(packet->data, packet->length, malformed)) {
             queueReverseError(malformed,
-                              pvrdma::rocev1::Syndrome::InvalidRequestNak,
+                              pvrdma::rocev2::Syndrome::InvalidRequestNak,
                               malformed.psn);
             scheduleTransport();
         }
@@ -1084,11 +1102,10 @@ Pvrdma::recvTransportPacket(EthPacketPtr packet)
 }
 
 bool
-Pvrdma::handleInboundContinuation(const pvrdma::rocev1::Packet &frame)
+Pvrdma::handleInboundContinuation(const pvrdma::rocev2::Packet &frame)
 {
-    using namespace pvrdma::rocev1;
-    const bool route = frame.sourceMac == transport.remoteMac &&
-        frame.destinationMac == transport.localMac &&
+    using namespace pvrdma::rocev2;
+    const bool route = frame.destinationMac == transport.localMac &&
         frame.sourceGid == transport.remoteGid &&
         frame.destinationGid == transport.localGid &&
         frame.destinationQpn == transport.localQpn;
@@ -1154,7 +1171,7 @@ Pvrdma::handleInboundContinuation(const pvrdma::rocev1::Packet &frame)
 }
 
 bool
-Pvrdma::replayFinal(const pvrdma::rocev1::Packet &frame)
+Pvrdma::replayFinal(const pvrdma::rocev2::Packet &frame)
 {
     auto *qp = pvrdma::findQueuePair(queuePairs, frame.destinationQpn);
     if (!qp || !pvrdma::finalOpcode(frame.opcode))
@@ -1162,7 +1179,6 @@ Pvrdma::replayFinal(const pvrdma::rocev1::Packet &frame)
     const auto &replay = qp->finalReplay;
     if (!replay.valid || replay.qpGeneration != qp->generation ||
         replay.localMac != frame.destinationMac ||
-        replay.remoteMac != frame.sourceMac ||
         replay.localGid != frame.destinationGid ||
         replay.remoteGid != frame.sourceGid ||
         replay.localQpn != frame.destinationQpn ||
@@ -1268,11 +1284,11 @@ Pvrdma::selectSend()
 }
 
 void
-Pvrdma::queueReverseError(const pvrdma::rocev1::Packet &received,
-                          pvrdma::rocev1::Syndrome syndrome,
+Pvrdma::queueReverseError(const pvrdma::rocev2::Packet &received,
+                          pvrdma::rocev2::Syndrome syndrome,
                           uint32_t response_psn)
 {
-    using namespace pvrdma::rocev1;
+    using namespace pvrdma::rocev2;
     if (pendingErrorPacket || received.opcode == Opcode::Acknowledge)
         return;
     auto *qp = pvrdma::findQueuePair(queuePairs, received.destinationQpn);
@@ -1283,8 +1299,8 @@ Pvrdma::queueReverseError(const pvrdma::rocev1::Packet &received,
     if (!routeGids(*qp, gids, gidValid, local_mac, local_gid, remote_gid) ||
         !routeMatches(*qp, received, local_mac, local_gid, remote_gid))
         return;
-    pvrdma::rocev1::Packet error;
-    error.destinationMac = received.sourceMac;
+    pvrdma::rocev2::Packet error;
+    error.destinationMac = storedMac(*qp);
     error.sourceMac = local_mac;
     error.destinationGid = received.sourceGid;
     error.sourceGid = local_gid;
@@ -1292,6 +1308,12 @@ Pvrdma::queueReverseError(const pvrdma::rocev1::Packet &received,
     error.ackRequest = false;
     error.destinationQpn = qp->attributes.destinationQpNumber;
     error.psn = response_psn;
+    const auto &route = qp->attributes.addressHandle.globalRoute;
+    error.trafficClass = route.trafficClass;
+    error.flowLabel = route.flowLabel;
+    error.hopLimit = route.hopLimit ? route.hopLimit : 0xff;
+    error.sourcePort = udpSourcePort(error.flowLabel, qp->qpn,
+                                     error.destinationQpn);
     error.syndrome = syndrome;
     error.ackCredit = 31;
     error.rnrTimer = syndrome == Syndrome::Rnr ?
@@ -1310,7 +1332,7 @@ Pvrdma::queueReverseError(const pvrdma::rocev1::Packet &received,
 void
 Pvrdma::startInbound()
 {
-    using namespace pvrdma::rocev1;
+    using namespace pvrdma::rocev2;
     if (!pendingRxPacket || transport.active())
         return;
     const EthPacketPtr packet = std::move(pendingRxPacket);
@@ -1368,7 +1390,7 @@ Pvrdma::startInbound()
         transport.consumer, qp->capabilities.maxRecvWr);
     transport.consumerLe = htole(transport.nextConsumer);
     transport.localMac = local_mac;
-    transport.remoteMac = frame.sourceMac;
+    transport.remoteMac = storedMac(*qp);
     transport.localGid = local_gid;
     transport.remoteGid = remote_gid;
     transport.localQpn = qp->qpn;
@@ -1436,7 +1458,7 @@ Pvrdma::startPayloadDma(bool write)
         } else {
             failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
                         true,
-                        pvrdma::rocev1::Syndrome::RemoteOperationNak);
+                        pvrdma::rocev2::Syndrome::RemoteOperationNak);
         }
         scheduleTransport();
         return;
@@ -1464,7 +1486,7 @@ Pvrdma::failSend(pvrdma::CompletionStatus status, bool qp_error)
 
 void
 Pvrdma::failReceive(pvrdma::CompletionStatus status, bool send_nak,
-                    pvrdma::rocev1::Syndrome syndrome)
+                    pvrdma::rocev2::Syndrome syndrome)
 {
     if (!transport.rqWqeSelected) {
         if (send_nak)
@@ -1492,7 +1514,7 @@ Pvrdma::failReceive(pvrdma::CompletionStatus status, bool send_nak,
 }
 
 void
-Pvrdma::prepareControl(pvrdma::rocev1::Syndrome syndrome,
+Pvrdma::prepareControl(pvrdma::rocev2::Syndrome syndrome,
                        uint32_t response_psn)
 {
     transport.responseSyndrome = syndrome;
@@ -1503,9 +1525,9 @@ Pvrdma::prepareControl(pvrdma::rocev1::Syndrome syndrome,
         transport.responseMsn = queuePairs.entries[
             transport.qpHandle].responderMsn;
     }
-    transport.stage = syndrome == pvrdma::rocev1::Syndrome::Ack ?
+    transport.stage = syndrome == pvrdma::rocev2::Syndrome::Ack ?
         TransportState::Stage::TryAck :
-        syndrome == pvrdma::rocev1::Syndrome::Rnr ?
+        syndrome == pvrdma::rocev2::Syndrome::Rnr ?
             TransportState::Stage::TryRnr :
             TransportState::Stage::TryError;
     scheduleTransport();
@@ -1514,7 +1536,7 @@ Pvrdma::prepareControl(pvrdma::rocev1::Syndrome syndrome,
 bool
 Pvrdma::tryTransportPacket()
 {
-    using namespace pvrdma::rocev1;
+    using namespace pvrdma::rocev2;
     const bool data = transport.stage == TransportState::Stage::TryData;
     if (data && !revalidateTransportLease()) {
         failSend(pvrdma::CompletionStatus::GeneralError, true);
@@ -1547,7 +1569,7 @@ Pvrdma::tryTransportPacket()
         }
     };
     if (!transport.packet) {
-        pvrdma::rocev1::Packet frame;
+        pvrdma::rocev2::Packet frame;
         frame.destinationMac = transport.remoteMac;
         frame.sourceMac = transport.localMac;
         frame.destinationGid = transport.remoteGid;
@@ -1565,6 +1587,9 @@ Pvrdma::tryTransportPacket()
                 hopLimit;
         if (!frame.hopLimit)
             frame.hopLimit = 0xff;
+        frame.sourcePort = udpSourcePort(frame.flowLabel,
+                                         transport.localQpn,
+                                         transport.remoteQpn);
         if (data) {
             const size_t offset = size_t{transport.segmentIndex} *
                 pvrdma::FixedMtu;
@@ -1648,7 +1673,7 @@ Pvrdma::submitTransportCompletion()
         if (transport.kind == pvrdma::QueueKind::Sq)
             finishTransport();
         else
-            prepareControl(pvrdma::rocev1::Syndrome::RemoteOperationNak,
+            prepareControl(pvrdma::rocev2::Syndrome::RemoteOperationNak,
                            transport.livePsn);
         return;
     }
@@ -1717,7 +1742,7 @@ Pvrdma::publishConsumer(pvrdma::QueueKind kind)
         if (kind == pvrdma::QueueKind::Sq)
             finishTransport();
         else
-            prepareControl(pvrdma::rocev1::Syndrome::RemoteOperationNak,
+            prepareControl(pvrdma::rocev2::Syndrome::RemoteOperationNak,
                            transport.livePsn);
         return;
     }
@@ -1727,7 +1752,7 @@ Pvrdma::publishConsumer(pvrdma::QueueKind kind)
         if (kind == pvrdma::QueueKind::Sq)
             failSend();
         else
-            prepareControl(pvrdma::rocev1::Syndrome::RemoteOperationNak,
+            prepareControl(pvrdma::rocev2::Syndrome::RemoteOperationNak,
                            transport.livePsn);
         return;
     }
@@ -1901,7 +1926,7 @@ Pvrdma::transportDmaDone()
             transport.stage = Stage::WaitReceiveCq;
         } else {
             transport.keepAfterControl = true;
-            prepareControl(pvrdma::rocev1::Syndrome::Ack,
+            prepareControl(pvrdma::rocev2::Syndrome::Ack,
                            transport.acceptedPsn);
         }
     };
@@ -1960,20 +1985,20 @@ Pvrdma::transportDmaDone()
         break;
       case Stage::ReadRqWqe: {
         if (!revalidateTransport(true)) {
-            prepareControl(pvrdma::rocev1::Syndrome::RemoteOperationNak,
+            prepareControl(pvrdma::rocev2::Syndrome::RemoteOperationNak,
                            transport.livePsn);
             break;
         }
         auto &qp = queuePairs.entries[transport.qpHandle];
         if (!pvrdma::decodeRqWqe(qp, transport.rqSlot, transport.wqe)) {
-            prepareControl(pvrdma::rocev1::Syndrome::InvalidRequestNak,
+            prepareControl(pvrdma::rocev2::Syndrome::InvalidRequestNak,
                            transport.livePsn);
             break;
         }
         transport.rqWqeSelected = true;
         if (transport.wqe.length < transport.totalLength) {
             failReceive(pvrdma::CompletionStatus::LocalLengthError, true,
-                        pvrdma::rocev1::Syndrome::InvalidRequestNak);
+                        pvrdma::rocev2::Syndrome::InvalidRequestNak);
             break;
         }
         if (!pvrdma::acquireLocalMr(
@@ -1982,7 +2007,7 @@ Pvrdma::transportDmaDone()
                 transport.wqe.length, transport.lease)) {
             failReceive(pvrdma::CompletionStatus::LocalProtectionError,
                         true,
-                        pvrdma::rocev1::Syndrome::RemoteAccessNak);
+                        pvrdma::rocev2::Syndrome::RemoteAccessNak);
             break;
         }
         transport.leaseHeld = true;
@@ -1993,7 +2018,7 @@ Pvrdma::transportDmaDone()
         if (!beginPayloadDma(true, 0, transport.totalLength)) {
             failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
                         true,
-                        pvrdma::rocev1::Syndrome::RemoteOperationNak);
+                        pvrdma::rocev2::Syndrome::RemoteOperationNak);
             break;
         }
         return;
@@ -2002,7 +2027,7 @@ Pvrdma::transportDmaDone()
         if (!revalidateTransportLease()) {
             failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
                         true,
-                        pvrdma::rocev1::Syndrome::RemoteOperationNak);
+                        pvrdma::rocev2::Syndrome::RemoteOperationNak);
             break;
         }
         transport.dmaPayloadOffset += transport.dmaChunkLength;
@@ -2071,7 +2096,7 @@ Pvrdma::transportDmaDone()
         sampleCurrentQueueOccupancy();
         checkQueueConservation();
         transport.keepAfterControl = false;
-        prepareControl(pvrdma::rocev1::Syndrome::Ack,
+        prepareControl(pvrdma::rocev2::Syndrome::Ack,
                        transport.acceptedPsn);
         transport.responseMsn = qp.responderMsn;
         break;
@@ -2950,6 +2975,8 @@ Pvrdma::unserialize(CheckpointIn &cp)
     arrayParamIn(cp, "capabilities",
                  reinterpret_cast<uint8_t *>(&capabilities),
                  sizeof(capabilities));
+    panic_if(capabilities.gidTypes != pvrdma::GidTypeRoceV2,
+             "PVRDMA checkpoint transport is not RoCEv2");
     arrayParamIn(cp, "gids", reinterpret_cast<uint8_t *>(gids.data()),
                  sizeof(gids));
     arrayParamIn(cp, "gidValid", gidValid.data(), gidValid.size());
@@ -3054,7 +3081,7 @@ Pvrdma::unserialize(CheckpointIn &cp)
         uint32_t replay_opcode = 0;
         paramIn(cp, "replayFinalOpcode", replay_opcode);
         qp.finalReplay.finalOpcode =
-            static_cast<pvrdma::rocev1::Opcode>(replay_opcode);
+            static_cast<pvrdma::rocev2::Opcode>(replay_opcode);
         paramIn(cp, "replayFinalSegmentLength",
                 qp.finalReplay.finalSegmentLength);
         paramIn(cp, "replayCompletedMsn", qp.finalReplay.completedMsn);

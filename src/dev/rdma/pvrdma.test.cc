@@ -325,8 +325,8 @@ TEST(PvrdmaRegisterTest, ResetRestoresMutableConstructorState)
 TEST(PvrdmaRegisterTest, DerivesCompanionTransportMac)
 {
     const RegisterState regs(0x00009002, 0x0100);
-    const rocev1::MacAddress configured = {0x02, 0x90, 0, 0, 0, 1};
-    const rocev1::MacAddress companion = {0x90, 0x02, 0, 0, 1, 0};
+    const rocev2::MacAddress configured = {0x02, 0x90, 0, 0, 0, 1};
+    const rocev2::MacAddress companion = {0x90, 0x02, 0, 0, 1, 0};
 
     EXPECT_EQ(transportMac(regs, false), configured);
     EXPECT_EQ(transportMac(regs, true), companion);
@@ -359,7 +359,7 @@ TEST(PvrdmaControlTest, PublishesFrozenCapabilitiesAndGuid)
     EXPECT_EQ(letoh(caps.maxPkeys), 1);
     EXPECT_EQ(caps.physicalPortCount, 1);
     EXPECT_EQ(caps.mode, static_cast<uint8_t>(DeviceMode::Roce));
-    EXPECT_EQ(caps.gidTypes, GidTypeRoceV1);
+    EXPECT_EQ(caps.gidTypes, GidTypeRoceV2);
     EXPECT_EQ(caps.atomicOps, 0);
     EXPECT_EQ(caps.bmmeFlags, 0);
     EXPECT_EQ(letoh(caps.deviceCapFlags), 0);
@@ -585,7 +585,7 @@ TEST(PvrdmaCommandTest, ValidatesGidBindBoundsMtuTypeAndDestroyMatch)
         static_cast<uint32_t>(Command::CreateBind));
     request.createBind.mtu = htole(FixedMtu);
     request.createBind.index = htole(uint32_t{7});
-    request.createBind.gidType = GidTypeRoceV1;
+    request.createBind.gidType = GidTypeRoceV2;
     std::copy(gid.begin(), gid.end(), request.createBind.newGid);
     auto result = processCommand(request, response, gids, valid, objects,
                                  range);
@@ -602,9 +602,20 @@ TEST(PvrdmaCommandTest, ValidatesGidBindBoundsMtuTypeAndDestroyMatch)
     EXPECT_EQ(processCommand(request, response, gids, valid, objects,
                              range).error, CommandError);
     request.createBind.mtu = htole(FixedMtu);
-    request.createBind.gidType = GidTypeRoceV2;
+    request.createBind.gidType = uint8_t{1};
     EXPECT_EQ(processCommand(request, response, gids, valid, objects,
                              range).error, CommandError);
+
+    const std::array<uint8_t, 16> mapped = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1,
+    };
+    request.createBind.index = htole(uint32_t{6});
+    request.createBind.gidType = GidTypeRoceV2;
+    std::copy(mapped.begin(), mapped.end(), request.createBind.newGid);
+    EXPECT_TRUE(detail::ipv4MappedGid(request.createBind.newGid));
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    EXPECT_EQ(valid[6], 0);
 
     request = {};
     request.header.command = htole(
@@ -1520,12 +1531,12 @@ TEST(PvrdmaTransportTest, BoundsSequenceNakProgressAndRetries)
               SequenceNakAction::RetryExceeded);
 
     retry = 1;
-    EXPECT_EQ(sequenceNakAction(rocev1::Field24Mask, 0, 2, 0, retry),
+    EXPECT_EQ(sequenceNakAction(rocev2::Field24Mask, 0, 2, 0, retry),
               SequenceNakAction::Advance);
-    EXPECT_EQ(sequenceNakAction(rocev1::Field24Mask, 0, 2, 1, retry),
+    EXPECT_EQ(sequenceNakAction(rocev2::Field24Mask, 0, 2, 1, retry),
               SequenceNakAction::Invalid);
-    EXPECT_EQ(sequenceNakAction(rocev1::Field24Mask, 1, 2,
-                                rocev1::Field24Mask, retry),
+    EXPECT_EQ(sequenceNakAction(rocev2::Field24Mask, 1, 2,
+                                rocev2::Field24Mask, retry),
               SequenceNakAction::Restart);
 }
 
@@ -1568,9 +1579,9 @@ TEST(PvrdmaQpTest, ComputesExactConsumerAddressesAndPsnWrap)
     EXPECT_EQ(address, qp.pages[0] + offsetof(RingState, rx) +
                            offsetof(Ring, consumerHead));
     EXPECT_FALSE(queueConsumerAddress(qp, QueueKind::Cq, address));
-    EXPECT_TRUE(validPsn(rocev1::Field24Mask));
-    EXPECT_FALSE(validPsn(rocev1::Field24Mask + 1));
-    EXPECT_EQ(advancePsn(rocev1::Field24Mask), 0);
+    EXPECT_TRUE(validPsn(rocev2::Field24Mask));
+    EXPECT_FALSE(validPsn(rocev2::Field24Mask + 1));
+    EXPECT_EQ(advancePsn(rocev2::Field24Mask), 0);
 }
 
 TEST(PvrdmaQpTest, ComputesExactSqAndRqWqeAddresses)
@@ -1870,9 +1881,9 @@ TEST(PvrdmaQpTest, ReachesRtsQueriesStoredAttributesAndResets)
     stored.finalReplay.localQpn = stored.qpn;
     stored.finalReplay.remoteQpn = stored.attributes.destinationQpNumber;
     stored.finalReplay.finalPsn =
-        (stored.attributes.receivePsn - 1) & rocev1::Field24Mask;
+        (stored.attributes.receivePsn - 1) & rocev2::Field24Mask;
     stored.responderMsn = 1;
-    stored.finalReplay.finalOpcode = rocev1::Opcode::SendOnly;
+    stored.finalReplay.finalOpcode = rocev2::Opcode::SendOnly;
     stored.finalReplay.finalSegmentLength = 1;
     stored.finalReplay.completedMsn = 1;
     EXPECT_TRUE(detail::validFinalReplay(stored));
@@ -1953,8 +1964,8 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
                      rtr, response).error, CommandError);
     rtr.pathMtu = static_cast<Mtu>(
         htole(static_cast<uint32_t>(Mtu::Mtu1024)));
-    for (const uint32_t qpn : {0U, rocev1::Field24Mask,
-                               rocev1::Field24Mask + 1}) {
+    for (const uint32_t qpn : {0U, rocev2::Field24Mask,
+                               rocev2::Field24Mask + 1}) {
         rtr.destinationQpNumber = htole(qpn);
         EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
                          QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
@@ -1970,7 +1981,7 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
                      QpAttrMinRnrTimer | QpAttrDestinationQpn,
                      rtr, response).error, CommandError);
     rtr.maxDestinationReadAtomic = 0;
-    rtr.receivePsn = htole(rocev1::Field24Mask + 1);
+    rtr.receivePsn = htole(rocev2::Field24Mask + 1);
     EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
                      QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
                      QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
@@ -2001,7 +2012,7 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
     EXPECT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, CommandError);
     rts.rnrRetry = 7;
-    rts.sendPsn = htole(rocev1::Field24Mask + 1);
+    rts.sendPsn = htole(rocev2::Field24Mask + 1);
     EXPECT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, CommandError);
     rts.sendPsn = htole(uint32_t{0x654321});
@@ -2057,7 +2068,7 @@ TEST(PvrdmaQpTest, ValidatesRestoreCountersGeometryStateAndGeneration)
     malformed_qps.entries[1].qpn = 65;
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
-    malformed_qps.entries[1].qpn = rocev1::Field24Mask;
+    malformed_qps.entries[1].qpn = rocev2::Field24Mask;
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
     malformed_qps.entries[1].pages.pop_back();
@@ -2067,7 +2078,7 @@ TEST(PvrdmaQpTest, ValidatesRestoreCountersGeometryStateAndGeneration)
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
     malformed_qps.entries[1].attributes.destinationQpNumber =
-        rocev1::Field24Mask;
+        rocev2::Field24Mask;
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
     malformed_qps.entries[1].attributes.timeout = 32;

@@ -16,7 +16,7 @@
 #include "dev/pci/device.hh"
 #include "dev/rdma/pvrdma_abi.hh"
 #include "dev/rdma/pvrdma_ring.hh"
-#include "dev/rdma/pvrdma_rocev1.hh"
+#include "dev/rdma/pvrdma_rocev2.hh"
 #include "params/Pvrdma.hh"
 #include "sim/byteswap.hh"
 #include "sim/eventq.hh"
@@ -38,7 +38,7 @@ inline constexpr uint32_t SlotMask = ObjectTableEntries - 1;
 inline constexpr uint32_t MaxGeneration =
     std::numeric_limits<uint32_t>::max() >> SlotBits;
 inline constexpr uint32_t MaxQpGeneration =
-    rocev1::Field24Mask >> SlotBits;
+    rocev2::Field24Mask >> SlotBits;
 inline constexpr uint32_t MrPageSize = PageSize;
 inline constexpr uint32_t MrEntriesPerPage = PageEntries;
 inline constexpr uint32_t MrSlotBits = SlotBits;
@@ -72,7 +72,7 @@ inline constexpr uint32_t CqPollAction = 0x80000000;
 constexpr bool
 validQpn(uint32_t qpn)
 {
-    return qpn && qpn < rocev1::Field24Mask;
+    return qpn && qpn < rocev2::Field24Mask;
 }
 
 enum class QueueKind : uint8_t
@@ -562,10 +562,10 @@ struct RegisterState
     }
 };
 
-inline rocev1::MacAddress
+inline rocev2::MacAddress
 transportMac(const RegisterState &regs, bool word_swap)
 {
-    rocev1::MacAddress mac = {
+    rocev2::MacAddress mac = {
         static_cast<uint8_t>(regs.macLow),
         static_cast<uint8_t>(regs.macLow >> 8),
         static_cast<uint8_t>(regs.macLow >> 16),
@@ -846,14 +846,14 @@ struct FinalReplay
 {
     bool valid = false;
     uint32_t qpGeneration = 0;
-    rocev1::MacAddress localMac{};
-    rocev1::MacAddress remoteMac{};
-    rocev1::Gid localGid{};
-    rocev1::Gid remoteGid{};
+    rocev2::MacAddress localMac{};
+    rocev2::MacAddress remoteMac{};
+    rocev2::Gid localGid{};
+    rocev2::Gid remoteGid{};
     uint32_t localQpn = 0;
     uint32_t remoteQpn = 0;
     uint32_t finalPsn = 0;
-    rocev1::Opcode finalOpcode = rocev1::Opcode::SendOnly;
+    rocev2::Opcode finalOpcode = rocev2::Opcode::SendOnly;
     uint16_t finalSegmentLength = 0;
     uint32_t completedMsn = 0;
 };
@@ -912,7 +912,7 @@ struct QueuePairTable
             const auto &entry = entries[slot];
             const uint32_t qpn = (entry.generation << SlotBits) | slot;
             if (!entry.valid && entry.generation <= MaxQpGeneration &&
-                qpn && qpn < rocev1::Field24Mask) {
+                qpn && qpn < rocev2::Field24Mask) {
                 build.slot = slot;
                 build.generation = entry.generation;
                 build.qpn = qpn;
@@ -1028,7 +1028,7 @@ struct QueuePairTable
 inline QueuePair *
 findQueuePair(QueuePairTable &qps, uint32_t qpn)
 {
-    if (!qpn || qpn >= rocev1::Field24Mask)
+    if (!qpn || qpn >= rocev2::Field24Mask)
         return nullptr;
     const uint32_t slot = qpn & SlotMask;
     if (!slot || slot >= ObjectTableEntries)
@@ -1041,7 +1041,7 @@ findQueuePair(QueuePairTable &qps, uint32_t qpn)
 inline const QueuePair *
 findQueuePair(const QueuePairTable &qps, uint32_t qpn)
 {
-    if (!qpn || qpn >= rocev1::Field24Mask)
+    if (!qpn || qpn >= rocev2::Field24Mask)
         return nullptr;
     const uint32_t slot = qpn & SlotMask;
     if (!slot || slot >= ObjectTableEntries)
@@ -1054,19 +1054,19 @@ findQueuePair(const QueuePairTable &qps, uint32_t qpn)
 constexpr bool
 validPsn(uint32_t psn)
 {
-    return !(psn & ~rocev1::Field24Mask);
+    return !(psn & ~rocev2::Field24Mask);
 }
 
 constexpr uint32_t
 advancePsn(uint32_t psn)
 {
-    return (psn + 1) & rocev1::Field24Mask;
+    return (psn + 1) & rocev2::Field24Mask;
 }
 
 constexpr uint32_t
 psnDistance(uint32_t from, uint32_t to)
 {
-    return (to - from) & rocev1::Field24Mask;
+    return (to - from) & rocev2::Field24Mask;
 }
 
 constexpr uint64_t
@@ -1134,35 +1134,35 @@ segmentGeometry(uint32_t length, uint16_t &count)
 }
 
 constexpr bool
-startingOpcode(rocev1::Opcode opcode)
+startingOpcode(rocev2::Opcode opcode)
 {
-    return opcode == rocev1::Opcode::SendOnly ||
-        opcode == rocev1::Opcode::SendFirst;
+    return opcode == rocev2::Opcode::SendOnly ||
+        opcode == rocev2::Opcode::SendFirst;
 }
 
 constexpr bool
-continuationOpcode(rocev1::Opcode opcode)
+continuationOpcode(rocev2::Opcode opcode)
 {
-    return opcode == rocev1::Opcode::SendMiddle ||
-        opcode == rocev1::Opcode::SendLast;
+    return opcode == rocev2::Opcode::SendMiddle ||
+        opcode == rocev2::Opcode::SendLast;
 }
 
 constexpr bool
-finalOpcode(rocev1::Opcode opcode)
+finalOpcode(rocev2::Opcode opcode)
 {
-    return opcode == rocev1::Opcode::SendOnly ||
-        opcode == rocev1::Opcode::SendLast;
+    return opcode == rocev2::Opcode::SendOnly ||
+        opcode == rocev2::Opcode::SendLast;
 }
 
-inline rocev1::Opcode
+inline rocev2::Opcode
 sendOpcode(uint16_t index, uint16_t count)
 {
     if (count == 1)
-        return rocev1::Opcode::SendOnly;
+        return rocev2::Opcode::SendOnly;
     if (index == 0)
-        return rocev1::Opcode::SendFirst;
-    return index + 1 == count ? rocev1::Opcode::SendLast :
-                                rocev1::Opcode::SendMiddle;
+        return rocev2::Opcode::SendFirst;
+    return index + 1 == count ? rocev2::Opcode::SendLast :
+                                rocev2::Opcode::SendMiddle;
 }
 
 inline bool
@@ -1573,7 +1573,7 @@ validFinalReplay(const QueuePair &qp)
     if (!replay.valid)
         return replay.qpGeneration == 0 && replay.localQpn == 0 &&
             replay.remoteQpn == 0 && replay.finalPsn == 0 &&
-            replay.finalOpcode == rocev1::Opcode::SendOnly &&
+            replay.finalOpcode == rocev2::Opcode::SendOnly &&
             replay.finalSegmentLength == 0 && replay.completedMsn == 0 &&
             zero_mac(replay.localMac) && zero_mac(replay.remoteMac) &&
             zero_gid(replay.localGid) && zero_gid(replay.remoteGid);
@@ -1587,9 +1587,9 @@ validFinalReplay(const QueuePair &qp)
                    qp.attributes.addressHandle.destinationMac) &&
         validPsn(replay.finalPsn) && finalOpcode(replay.finalOpcode) &&
         replay.finalSegmentLength <= FixedMtu &&
-        (replay.finalOpcode != rocev1::Opcode::SendLast ||
+        (replay.finalOpcode != rocev2::Opcode::SendLast ||
          replay.finalSegmentLength != 0) &&
-        !(replay.completedMsn & ~rocev1::Field24Mask) &&
+        !(replay.completedMsn & ~rocev2::Field24Mask) &&
         replay.completedMsn == qp.responderMsn &&
         advancePsn(replay.finalPsn) == qp.attributes.receivePsn;
 }
@@ -1761,7 +1761,7 @@ validQueueObjects(const CompletionQueueTable &cqs,
             qp.pages.size() != qp.totalChunks ||
             !validSupportedState(qp.state) ||
             !validStoredQpAttributes(qp) ||
-            (qp.responderMsn & ~rocev1::Field24Mask) ||
+            (qp.responderMsn & ~rocev2::Field24Mask) ||
             !validFinalReplay(qp) ||
             !ringSnapshotValid(qp.sqProducerTail, qp.sqConsumerHead,
                                qp.capabilities.maxSendWr) ||
@@ -2094,6 +2094,14 @@ queryPkey(const CommandRequest &request, CommandResponse &response)
     return {true, 0};
 }
 
+inline bool
+ipv4MappedGid(const uint8_t *gid)
+{
+    return std::all_of(gid, gid + 10,
+                       [](uint8_t byte) { return byte == 0; }) &&
+        gid[10] == 0xff && gid[11] == 0xff;
+}
+
 inline CommandResult
 createBind(const CommandRequest &request, GidTable &gids,
            GidValidTable &gid_valid)
@@ -2101,7 +2109,8 @@ createBind(const CommandRequest &request, GidTable &gids,
     const auto &bind = request.createBind;
     const uint32_t index = letoh(bind.index);
     if (letoh(request.header.reserved) != 0 || index >= GidTableEntries ||
-        letoh(bind.mtu) != FixedMtu || bind.gidType != GidTypeRoceV1)
+        letoh(bind.mtu) != FixedMtu || bind.gidType != GidTypeRoceV2 ||
+        ipv4MappedGid(bind.newGid))
         return {false, CommandError};
 
     std::copy(std::begin(bind.newGid), std::end(bind.newGid),
@@ -2624,7 +2633,7 @@ makeCapabilities(uint32_t mac_low, uint32_t mac_high)
     caps.maxPkeys = htole(uint16_t{1});
     caps.physicalPortCount = 1;
     caps.mode = static_cast<uint8_t>(DeviceMode::Roce);
-    caps.gidTypes = GidTypeRoceV1;
+    caps.gidTypes = GidTypeRoceV2;
     return caps;
 }
 
@@ -2864,10 +2873,10 @@ class Pvrdma : public PciDevice
         std::array<uint8_t, pvrdma::RqStride> rqSlot{};
         std::vector<uint8_t> payload;
         EthPacketPtr packet;
-        pvrdma::rocev1::MacAddress localMac{};
-        pvrdma::rocev1::MacAddress remoteMac{};
-        pvrdma::rocev1::Gid localGid{};
-        pvrdma::rocev1::Gid remoteGid{};
+        pvrdma::rocev2::MacAddress localMac{};
+        pvrdma::rocev2::MacAddress remoteMac{};
+        pvrdma::rocev2::Gid localGid{};
+        pvrdma::rocev2::Gid remoteGid{};
         uint32_t localQpn = 0;
         uint32_t remoteQpn = 0;
         uint32_t psn = 0;
@@ -2878,16 +2887,16 @@ class Pvrdma : public PciDevice
         uint16_t segmentIndex = 0;
         uint16_t segmentCount = 0;
         uint16_t acceptedSegmentIndex = 0;
-        pvrdma::rocev1::Opcode opcode = pvrdma::rocev1::Opcode::SendOnly;
-        pvrdma::rocev1::Opcode acceptedOpcode =
-            pvrdma::rocev1::Opcode::SendOnly;
+        pvrdma::rocev2::Opcode opcode = pvrdma::rocev2::Opcode::SendOnly;
+        pvrdma::rocev2::Opcode acceptedOpcode =
+            pvrdma::rocev2::Opcode::SendOnly;
         uint16_t acceptedSegmentLength = 0;
         uint32_t responseMsn = 0;
         uint32_t lastAckMsn = 0;
         uint8_t retryRemaining = 0;
         uint8_t rnrRetryRemaining = 0;
-        pvrdma::rocev1::Syndrome responseSyndrome =
-            pvrdma::rocev1::Syndrome::Ack;
+        pvrdma::rocev2::Syndrome responseSyndrome =
+            pvrdma::rocev2::Syndrome::Ack;
         pvrdma::CompletionStatus status =
             pvrdma::CompletionStatus::Success;
 
@@ -2993,7 +3002,7 @@ class Pvrdma : public PciDevice
     bool activeMr() const;
     bool revalidateTransport(bool requireCq = false) const;
     bool revalidateTransportLease() const;
-    bool receiveSegmentMatches(const pvrdma::rocev1::Packet &packet,
+    bool receiveSegmentMatches(const pvrdma::rocev2::Packet &packet,
                                bool accepted) const;
     bool recvTransportPacket(EthPacketPtr packet);
     void transportSendDone();
@@ -3001,8 +3010,8 @@ class Pvrdma : public PciDevice
     void runTransport();
     void transportDmaDone();
     bool selectSend();
-    void queueReverseError(const pvrdma::rocev1::Packet &received,
-                           pvrdma::rocev1::Syndrome syndrome,
+    void queueReverseError(const pvrdma::rocev2::Packet &received,
+                           pvrdma::rocev2::Syndrome syndrome,
                            uint32_t responsePsn);
     void startInbound();
     void startTransportDma(bool write, uint64_t address, size_t size,
@@ -3015,9 +3024,9 @@ class Pvrdma : public PciDevice
                       pvrdma::CompletionStatus::GeneralError,
                   bool qpError = false);
     void failReceive(pvrdma::CompletionStatus status, bool sendNak = false,
-                     pvrdma::rocev1::Syndrome syndrome =
-                         pvrdma::rocev1::Syndrome::RemoteOperationNak);
-    void prepareControl(pvrdma::rocev1::Syndrome syndrome,
+                     pvrdma::rocev2::Syndrome syndrome =
+                         pvrdma::rocev2::Syndrome::RemoteOperationNak);
+    void prepareControl(pvrdma::rocev2::Syndrome syndrome,
                         uint32_t responsePsn);
     bool tryTransportPacket();
     void publishConsumer(pvrdma::QueueKind kind);
@@ -3026,8 +3035,8 @@ class Pvrdma : public PciDevice
     void armTransportTimer(TransportTimerKind kind, Tick delay);
     void cancelTransportTimer();
     void transportTimerExpired();
-    bool handleInboundContinuation(const pvrdma::rocev1::Packet &packet);
-    bool replayFinal(const pvrdma::rocev1::Packet &packet);
+    bool handleInboundContinuation(const pvrdma::rocev2::Packet &packet);
+    bool replayFinal(const pvrdma::rocev2::Packet &packet);
 
     pvrdma::CompletionSubmitResult submitCompletion(
         const pvrdma::CompletionRecord &record,

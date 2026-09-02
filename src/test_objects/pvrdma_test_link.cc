@@ -104,23 +104,24 @@ PvrdmaTestLink::receive(int source, EthPacketPtr packet)
 {
     if (!packet)
         return false;
-    panic_if(packet->length < pvrdma::rocev1::EthernetHeaderSize ||
-                 packet->data[12] != 0x89 || packet->data[13] != 0x15,
-             "PVRDMA test link observed a non-RoCEv1 production frame");
+    panic_if(packet->length < pvrdma::rocev2::EthernetHeaderSize ||
+                 packet->data[pvrdma::rocev2::EtherTypeOffset] != 0x86 ||
+                 packet->data[pvrdma::rocev2::EtherTypeOffset + 1] != 0xdd,
+             "PVRDMA test link observed a non-RoCEv2 production frame");
 
     const Direction direction = source == 0 ? Direction::Int0ToInt1 :
                                               Direction::Int1ToInt0;
     Action action = Action::Forward;
     Tick delay = 0;
     const auto decoded = packet->length <= packet->bufLength ?
-        pvrdma::rocev1::decode(
+        pvrdma::rocev2::decode(
             {packet->data, packet->bufLength}, packet->length) :
-        pvrdma::rocev1::DecodeResult{};
+        pvrdma::rocev2::DecodeResult{};
     if (decoded) {
         const auto &frame = decoded.packet;
         const FrameId id{direction, frame.opcode,
-            frame.opcode == pvrdma::rocev1::Opcode::Acknowledge ?
-                frame.syndrome : pvrdma::rocev1::Syndrome::Ack,
+            frame.opcode == pvrdma::rocev2::Opcode::Acknowledge ?
+                frame.syndrome : pvrdma::rocev2::Syndrome::Ack,
             frame.psn};
         const auto rule = std::find_if(rules.begin(), rules.end(),
             [&id](const Rule &candidate) {

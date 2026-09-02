@@ -64,7 +64,6 @@ inline constexpr unsigned MaxInterrupts = 3;
 inline constexpr uint64_t MsixTableOffset = 0x0000;
 inline constexpr uint64_t MsixPbaOffset = 0x2000;
 
-inline constexpr uint32_t RoceV1Version = 17;
 inline constexpr uint32_t RoceV2Version = 18;
 inline constexpr uint32_t Ppn64Version = 19;
 inline constexpr uint32_t QpHandleVersion = 20;
@@ -94,7 +93,6 @@ inline constexpr uint32_t CqFlagArmedSolicited = uint32_t{1} << 0;
 inline constexpr uint32_t CqFlagArmed = uint32_t{1} << 1;
 inline constexpr uint32_t MrFlagDma = uint32_t{1} << 0;
 
-inline constexpr uint32_t GidTypeRoceV1 = uint32_t{1} << 0;
 inline constexpr uint32_t GidTypeRoceV2 = uint32_t{1} << 1;
 
 inline constexpr unsigned PageDirectoryShift = 18;
