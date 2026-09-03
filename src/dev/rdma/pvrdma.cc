@@ -1413,18 +1413,17 @@ Pvrdma::startInbound()
 
 void
 Pvrdma::startTransportDma(bool write, uint64_t address, size_t size,
-                          uint8_t *data)
+                          uint8_t *data, Request::Flags flags)
 {
     panic_if(transport.dmaBusy || dmaPending(),
              "PVRDMA overlapping transport DMA");
+    assert(!flags || (write ? Request::isValidNicDmaWriteFlags(flags) :
+                              Request::isValidNicDmaReadFlags(flags)));
     transport.dmaBusy = true;
-    if (write) {
-        dmaWrite(pciToDma(address), size,
-                 sys->isAtomicMode() ? nullptr : &transportDmaEvent, data);
-    } else {
-        dmaRead(pciToDma(address), size,
-                sys->isAtomicMode() ? nullptr : &transportDmaEvent, data);
-    }
+    dmaPort.dmaAction(write ? MemCmd::WriteReq : MemCmd::ReadReq,
+                      pciToDma(address), size,
+                      sys->isAtomicMode() ? nullptr : &transportDmaEvent,
+                      data, 0, flags);
     if (sys->isAtomicMode())
         transportDmaDone();
 }
@@ -1468,7 +1467,8 @@ Pvrdma::startPayloadDma(bool write)
         transport.dmaRemaining, chunk.length - transport.chunkOffset);
     startTransportDma(write, chunk.address + transport.chunkOffset,
                       transport.dmaChunkLength,
-                      transport.payload.data() + transport.dmaPayloadOffset);
+                      transport.payload.data() + transport.dmaPayloadOffset,
+                      pvrdma::payloadDmaFlags(write));
 }
 
 void

@@ -221,6 +221,10 @@ MESIDDIODirectedTester::buildScenario()
     const Request::Flags rxPayload(Request::NIC_RX_PAYLOAD_WRITE);
     const Request::Flags rxHeader(Request::NIC_RX_HEADER_WRITE);
     const Request::Flags txPayload(Request::NIC_TX_PAYLOAD_READ);
+    const Request::Flags rdmaRxPayload(
+        Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA);
+    const Request::Flags rdmaTxPayload(
+        Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA);
     const Request::Flags rxDescRead(Request::NIC_RX_DESC_READ);
     const Request::Flags rxDescWrite(Request::NIC_RX_DESC_WRITEBACK);
 
@@ -239,6 +243,13 @@ MESIDDIODirectedTester::buildScenario()
         addWrite(PortKind::Dma, 0, a, rxPayload, first, "cold RX write");
         addRead(PortKind::Dma, 0, a, generic, first,
                 "generic directory read after RX ACK");
+    } else if (scenario == "pvrdma_provenance") {
+        addWrite(PortKind::Dma, 0, a, rdmaRxPayload, first,
+                 "PVRDMA RX payload write");
+        addRead(PortKind::Dma, 0, a, rdmaTxPayload, first,
+                "PVRDMA TX payload read");
+        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
+                "CPU read of prior PVRDMA RX payload");
     } else if (scenario == "hit_update") {
         addWrite(PortKind::Dma, 0, a, rxPayload, first, "cold RX write");
         addWrite(PortKind::Dma, 0, a, rxPayload, second,

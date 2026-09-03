@@ -82,6 +82,30 @@ TEST(RequestNicFlags, LeafCategories)
     EXPECT_TRUE(rx_header.isNicPayloadDma());
 }
 
+TEST(RequestNicFlags, PvrdmaProvenanceIsOrthogonalToPayloadCategory)
+{
+    Request rx(0x1000, 64,
+               Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA, 0);
+    EXPECT_TRUE(rx.isNicPvrdma());
+    EXPECT_TRUE(rx.isNicRxPayloadWrite());
+    EXPECT_TRUE(rx.isNicDmaWrite());
+    EXPECT_FALSE(rx.isNicDmaRead());
+    EXPECT_TRUE(Request::hasOneNicDmaCategory(rx.getFlags()));
+    EXPECT_TRUE(Request::isValidNicDmaWriteFlags(rx.getFlags()));
+
+    Request tx(0x1000, 64,
+               Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA, 0);
+    EXPECT_TRUE(tx.isNicPvrdma());
+    EXPECT_TRUE(tx.isNicTxPayloadRead());
+    EXPECT_TRUE(tx.isNicDmaRead());
+    EXPECT_FALSE(tx.isNicDmaWrite());
+    EXPECT_TRUE(Request::hasOneNicDmaCategory(tx.getFlags()));
+    EXPECT_TRUE(Request::isValidNicDmaReadFlags(tx.getFlags()));
+
+    Request generic(0x1000, 64, Request::NIC_RX_PAYLOAD_WRITE, 0);
+    EXPECT_FALSE(generic.isNicPvrdma());
+}
+
 TEST(RequestNicFlags, CombinedAndUnrelatedCategories)
 {
     Request combined(

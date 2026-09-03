@@ -68,6 +68,20 @@ for mode in ("semantic-pair", "timing-semantic-pair"):
     )
 
 
+gem5_verify_config(
+    name="pvrdma-request-observation-pair",
+    fixtures=(),
+    verifiers=(
+        verifier.MatchRegex(re.compile("PVRDMA_REQUEST_OBSERVATION_OK")),
+    ),
+    config=joinpath(absdirpath(__file__), "configs", "pvrdma_runtime.py"),
+    config_args=("--mode", "request-observation-pair"),
+    valid_isas=(constants.x86_tag,),
+    valid_hosts=constants.supported_hosts,
+    length=constants.quick_tag,
+)
+
+
 for name, marker in (
     (
         "precommit-abort-pair",

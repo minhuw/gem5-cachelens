@@ -62,6 +62,8 @@ nicDmaCategory(const CacheController::Params &p)
     }
     if (category == "rx_payload")
         return Request::NIC_RX_PAYLOAD_WRITE;
+    if (category == "rdma_rx_payload")
+        return Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA;
     if (category == "rx_header")
         return Request::NIC_RX_HEADER_WRITE;
     if (category == "rx_desc_read")
@@ -70,6 +72,8 @@ nicDmaCategory(const CacheController::Params &p)
         return Request::NIC_RX_DESC_WRITEBACK;
     if (category == "tx_payload_read")
         return Request::NIC_TX_PAYLOAD_READ;
+    if (category == "rdma_tx_payload_read")
+        return Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA;
     if (category == "tx_desc_read")
         return Request::NIC_TX_DESC_READ;
     if (category == "tx_desc_writeback")

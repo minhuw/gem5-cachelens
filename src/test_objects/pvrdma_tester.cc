@@ -187,6 +187,26 @@ PvrdmaTester::getPort(const std::string &if_name, PortID idx)
 }
 
 void
+PvrdmaTester::regProbeListeners()
+{
+    if (testMode != "request-observation-pair")
+        return;
+
+    auto *sender = SimObject::find("system.rdma_dma_monitor");
+    auto *receiver = SimObject::find("system.peer_rdma_dma_monitor");
+    panic_if(!sender || !receiver,
+             "PVRDMA request observation requires both DMA monitors");
+    senderDmaListener = std::make_unique<
+        ProbeListenerArgFunc<probing::PacketInfo>>(
+            sender->getProbeManager(), "PktRequest",
+            [this](const auto &packet) { observeDmaRequest(packet, false); });
+    receiverDmaListener = std::make_unique<
+        ProbeListenerArgFunc<probing::PacketInfo>>(
+            receiver->getProbeManager(), "PktRequest",
+            [this](const auto &packet) { observeDmaRequest(packet, true); });
+}
+
+void
 PvrdmaTester::startup()
 {
     if (testMode == "fault-link" || testMode == "timing-fault-link") {
@@ -225,7 +245,8 @@ PvrdmaTester::startup()
     if (testMode == "transport-pair" ||
         testMode == "timing-transport-pair" ||
         testMode == "semantic-pair" ||
-        testMode == "timing-semantic-pair" || reliability_pair ||
+        testMode == "timing-semantic-pair" ||
+        testMode == "request-observation-pair" || reliability_pair ||
         terminal_pair) {
         peerRdma = dynamic_cast<Pvrdma *>(
             SimObject::find("system.peer_rdma"));
@@ -2215,6 +2236,118 @@ PvrdmaTester::postReliabilitySend(uint32_t length)
     write(PairSenderQp, rings);
     write(UarBarAddress + pvrdma::UarPageSize,
           htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+}
+
+void
+PvrdmaTester::observeDmaRequest(
+    const probing::PacketInfo &packet, bool receiver)
+{
+    const auto inRange = [&packet](Addr base, Addr size) {
+        return packet.addr >= base &&
+            packet.addr + packet.size <= base + size;
+    };
+    const Request::FlagsType classification = packet.flags &
+        (Request::NIC_DMA_CATEGORY_MASK | Request::NIC_PVRDMA);
+    const Addr payload = receiver ? PairReceiverPayload : PairSenderPayload;
+    if (inRange(payload, 16 * pvrdma::PageSize)) {
+        const Request::FlagsType expected = receiver ?
+            Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA :
+            Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA;
+        panic_if(classification != expected ||
+                     packet.cmd != (receiver ? MemCmd::WriteReq :
+                                               MemCmd::ReadReq),
+                 "PVRDMA %s payload request %#x+%u has flags %#x",
+                 receiver ? "RX" : "TX", packet.addr, packet.size,
+                 packet.flags);
+        receiver ? ++rxPayloadRequests : ++txPayloadRequests;
+        return;
+    }
+
+    panic_if(classification,
+             "PVRDMA non-payload request %#x+%u has flags %#x",
+             packet.addr, packet.size, packet.flags);
+    if (packet.cmd == MemCmd::ReadReq &&
+        ((!receiver && inRange(PairSenderSq, pvrdma::PageSize)) ||
+         (receiver && inRange(PairReceiverRq, pvrdma::PageSize)))) {
+        ++unclassifiedWqeRequests;
+    } else if (packet.cmd == MemCmd::WriteReq &&
+               ((!receiver && inRange(PairSenderCqe, pvrdma::PageSize)) ||
+                (receiver && inRange(PairReceiverCqe, pvrdma::PageSize)))) {
+        ++unclassifiedCqeRequests;
+    } else if (packet.cmd == MemCmd::WriteReq &&
+               packet.addr == (receiver ?
+                   PairReceiverQp + offsetof(pvrdma::RingState, rx) +
+                       offsetof(pvrdma::Ring, consumerHead) :
+                   PairSenderQp + offsetof(pvrdma::RingState, tx) +
+                       offsetof(pvrdma::Ring, consumerHead))) {
+        ++unclassifiedConsumerRequests;
+    } else if (receiver &&
+               (inRange(CommandAddress, sizeof(pvrdma::CommandRequest)) ||
+                inRange(ResponseAddress, sizeof(pvrdma::CommandResponse)))) {
+        ++unclassifiedControlRequests;
+    }
+}
+
+void
+PvrdmaTester::runRequestObservationPair()
+{
+    constexpr uint32_t Length = 129;
+    switch (timingStage) {
+      case TimingStage::Configure: {
+        setupReliabilityPair();
+        peerRdma->commandSlotAddress = CommandAddress;
+        peerRdma->responseSlotAddress = ResponseAddress;
+        peerRdma->commandSlotDmaAddress = peerRdma->pciToDma(CommandAddress);
+        peerRdma->responseSlotDmaAddress = peerRdma->pciToDma(ResponseAddress);
+        pvrdma::CommandRequest request{};
+        request.header.response = htole(uint64_t{0x123456789abcdef0});
+        request.header.command = htole(
+            static_cast<uint32_t>(pvrdma::Command::QueryPort));
+        request.queryPort.portNumber = 1;
+        write(CommandAddress, request);
+        write(ResponseAddress, pvrdma::CommandResponse{});
+        peerRdma->startCommand(0);
+        const auto response = read<pvrdma::CommandResponse>(ResponseAddress);
+        panic_if(response.header.response != request.header.response ||
+                     letoh(response.header.acknowledgement) !=
+                         pvrdma::responseCommand(pvrdma::Command::QueryPort) ||
+                     response.header.error,
+                 "PVRDMA request-observation control DMA failed");
+        reliabilityCase = 0;
+        postReliabilityReceive(Length);
+        timingStage = TimingStage::RequestObservationPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      }
+      case TimingStage::RequestObservationPostSq:
+        postReliabilitySend(Length);
+        timingStage = TimingStage::RequestObservationVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      case TimingStage::RequestObservationVerify:
+        break;
+      default:
+        panic("Invalid PVRDMA request-observation stage");
+    }
+
+    const auto received = read<std::array<uint8_t, Length>>(
+        PairReceiverPayload);
+    for (size_t i = 0; i < received.size(); ++i) {
+        panic_if(received[i] != static_cast<uint8_t>(i ^ 0x5a),
+                 "PVRDMA request-observation payload mismatch at %u", i);
+    }
+    panic_if(txPayloadRequests != 3 || rxPayloadRequests != 3 ||
+                 !unclassifiedWqeRequests || !unclassifiedCqeRequests ||
+                 !unclassifiedConsumerRequests ||
+                 unclassifiedControlRequests < 2 || rdma->transportActive() ||
+                 peerRdma->transportActive(),
+             "PVRDMA request observation missed transport DMA paths: "
+             "tx=%u rx=%u wqe=%u cqe=%u consumer=%u control=%u",
+             txPayloadRequests, rxPayloadRequests,
+             unclassifiedWqeRequests, unclassifiedCqeRequests,
+             unclassifiedConsumerRequests, unclassifiedControlRequests);
+    inform("PVRDMA transport DMA request observation passed");
+    exitSimLoop("PVRDMA request observation test passed");
 }
 
 void
@@ -5050,6 +5183,10 @@ PvrdmaTester::run()
     if (testMode == "semantic-pair" ||
         testMode == "timing-semantic-pair") {
         runSemanticPair();
+        return;
+    }
+    if (testMode == "request-observation-pair") {
+        runRequestObservationPair();
         return;
     }
     if (testMode == "timing-mr") {

@@ -80,6 +80,8 @@ class CacheMemory : public SimObject
 
     void init();
     void resetStats() override;
+    void serialize(CheckpointOut &cp) const override;
+    void unserialize(CheckpointIn &cp) override;
 
     // Public Methods
     // perform a cache access and see if we hit or not.  Return true on a hit.
@@ -303,6 +305,13 @@ class CacheMemory : public SimObject
           statistics::Vector rxPayloadAllocWays;
           statistics::Vector ddioAllocWays;
 
+          // PVRDMA subset of the aggregate RX payload accounting.
+          statistics::Scalar rdmaRxPayloadRequests;
+          statistics::Scalar rdmaRxPayloadHits;
+          statistics::Scalar rdmaRxPayloadMisses;
+          statistics::Formula rdmaRxPayloadHitRate;
+          statistics::Vector rdmaRxPayloadHitWays;
+
           // RX header writes retain separate request/hit/miss telemetry.
           statistics::Scalar rxHeaderRequests;
           statistics::Scalar rxHeaderHits;
@@ -314,6 +323,12 @@ class CacheMemory : public SimObject
           statistics::Scalar txPayloadHits;
           statistics::Scalar txPayloadMisses;
           statistics::Formula txPayloadHitRate;
+
+          // PVRDMA subset of the aggregate TX payload accounting.
+          statistics::Scalar rdmaTxPayloadRequests;
+          statistics::Scalar rdmaTxPayloadHits;
+          statistics::Scalar rdmaTxPayloadMisses;
+          statistics::Formula rdmaTxPayloadHitRate;
 
           // Per-way, per-source accounting to understand eviction
           // pressure on the DDIO ways.  Source classes:
@@ -330,6 +345,9 @@ class CacheMemory : public SimObject
           statistics::Vector rxPayloadCpuAccessWays;
           statistics::Vector rxPayloadCpuFillWays;
           statistics::Scalar rxPayloadCpuUniqueLines;
+          statistics::Vector rdmaRxPayloadCpuAccessWays;
+          statistics::Vector rdmaRxPayloadCpuFillWays;
+          statistics::Scalar rdmaRxPayloadCpuUniqueLines;
 
           // Per-set payload access counters (set-index imbalance of the
           // payload stream on the DDIO ways).
@@ -339,14 +357,20 @@ class CacheMemory : public SimObject
           // Unique payload line addresses seen in the current stats window.
           statistics::Scalar rxPayloadUniqueLines;
           statistics::Scalar txPayloadUniqueLines;
+          statistics::Scalar rdmaRxPayloadUniqueLines;
+          statistics::Scalar rdmaTxPayloadUniqueLines;
       } cacheMemoryStats;
 
       std::unordered_set<Addr> rxPayloadUniqueAddrs;
       std::unordered_set<Addr> txPayloadUniqueAddrs;
+      std::unordered_set<Addr> rdmaRxPayloadUniqueAddrs;
+      std::unordered_set<Addr> rdmaTxPayloadUniqueAddrs;
       std::unordered_set<Addr> rxPayloadCpuUniqueAddrs;
-      // Unlike the per-window uniqueness set, retain this set across a stats
+      std::unordered_set<Addr> rdmaRxPayloadCpuUniqueAddrs;
+      // Unlike the per-window uniqueness sets, retain these across a stats
       // reset so post-reset CPU touches to warmed payload buffers are visible.
       std::unordered_set<Addr> rxPayloadEverAddrs;
+      std::unordered_set<Addr> rdmaRxPayloadEverAddrs;
 
     public:
       // These function increment the number of demand hits/misses by one
@@ -382,8 +406,10 @@ class CacheMemory : public SimObject
       // whether the line was present at acceptance. Allocation ways are
       // recorded by profileDdioWayFill().
       void profileRxPayload(Addr address);
+      void profileRdmaRxPayload(Addr address);
       void profileRxHeader(Addr address);
       void profileTxPayload(Addr address);
+      void profileRdmaTxPayload(Addr address);
 
       // Per-way, per-source accounting hooks (see CacheMemoryStats for
       // the source classes).
@@ -395,6 +421,11 @@ class CacheMemory : public SimObject
                   cacheMemoryStats.rxPayloadCpuAccessWays[way]++;
                   if (rxPayloadCpuUniqueAddrs.insert(address).second)
                       cacheMemoryStats.rxPayloadCpuUniqueLines++;
+              }
+              if (src == 3 && rdmaRxPayloadEverAddrs.count(address)) {
+                  cacheMemoryStats.rdmaRxPayloadCpuAccessWays[way]++;
+                  if (rdmaRxPayloadCpuUniqueAddrs.insert(address).second)
+                      cacheMemoryStats.rdmaRxPayloadCpuUniqueLines++;
               }
           }
       }
@@ -412,6 +443,11 @@ class CacheMemory : public SimObject
                   cacheMemoryStats.rxPayloadCpuFillWays[way]++;
                   if (rxPayloadCpuUniqueAddrs.insert(address).second)
                       cacheMemoryStats.rxPayloadCpuUniqueLines++;
+              }
+              if (src == 3 && rdmaRxPayloadEverAddrs.count(address)) {
+                  cacheMemoryStats.rdmaRxPayloadCpuFillWays[way]++;
+                  if (rdmaRxPayloadCpuUniqueAddrs.insert(address).second)
+                      cacheMemoryStats.rdmaRxPayloadCpuUniqueLines++;
               }
           }
       }
@@ -442,6 +478,10 @@ class CacheMemory : public SimObject
       bool isNicTxPayloadReadReq(const RequestPtr &req) const
       {
           return req && req->isNicTxPayloadRead();
+      }
+      bool isNicPvrdmaReq(const RequestPtr &req) const
+      {
+          return req && req->isNicPvrdma();
       }
       bool ddioWriteNeedsRead(bool partial, bool data_valid) const
       {
