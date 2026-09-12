@@ -103,8 +103,9 @@ const uint32_t REG_SWSM     = 0x05B50;
 const uint32_t REG_FWSM     = 0x05B54;
 const uint32_t REG_SWFWSYNC = 0x05B5C;
 
-const uint8_t EEPROM_READ_OPCODE_SPI    = 0x03;
-const uint8_t EEPROM_RDSR_OPCODE_SPI    = 0x05;
+const uint8_t EEPROM_READ_OPCODE_SPI      = 0x03;
+const uint8_t EEPROM_RDSR_OPCODE_SPI      = 0x05;
+const uint8_t EEPROM_READ_OPCODE_MICROWIRE = 0x06;
 const uint8_t EEPROM_SIZE               = 64;
 const uint16_t EEPROM_CSUM              = 0xBABA;
 

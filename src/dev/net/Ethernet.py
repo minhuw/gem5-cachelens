@@ -181,8 +181,8 @@ class IGbE(EtherDevice):
     hardware_address = Param.EthernetAddr(
         NextEthernetAddr, "Ethernet Hardware Address"
     )
-    rx_fifo_size = Param.MemorySize("384KiB", "Size of the rx FIFO")
-    tx_fifo_size = Param.MemorySize("384KiB", "Size of the tx FIFO")
+    rx_fifo_size = Param.MemorySize("48KiB", "Size of the rx FIFO")
+    tx_fifo_size = Param.MemorySize("16KiB", "Size of the tx FIFO")
     rx_desc_cache_size = Param.Int(
         64, "Number of enteries in the rx descriptor cache"
     )
@@ -209,6 +209,12 @@ class IGbE(EtherDevice):
     rx_write_delay = Param.Latency("0ns", "delay after rx dma read")
     phy_pid = Param.UInt16("Phy PID that corresponds to device ID")
     phy_epid = Param.UInt16("Phy EPID that corresponds to device ID")
+
+    # The current model has one RX payload DMA completion path. Keep this
+    # explicit until a safe multi-engine refactor is available.
+    rx_dma_engines = Param.UInt32(
+        1, "Maximum concurrent RX payload DMA engines (currently max 1)"
+    )
 
 
 class IGbE_e1000(IGbE):

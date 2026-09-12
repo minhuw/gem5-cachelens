@@ -313,6 +313,14 @@ PciDevice::writeConfig(PacketPtr pkt)
           case PCI_LATENCY_TIMER:
             config.latencyTimer = pkt->getLE<uint8_t>();
             break;
+          // Handle misaligned command register write
+          case 0x5: {
+            uint16_t command = letoh(config.command);
+            command = (command & 0xff) |
+                (static_cast<uint16_t>(pkt->getLE<uint8_t>()) << 8);
+            config.command = htole(command);
+            break;
+          }
           /* Do nothing for these read-only registers */
           case PCI0_INTERRUPT_PIN:
           case PCI0_MINIMUM_GRANT:
@@ -321,7 +329,7 @@ PciDevice::writeConfig(PacketPtr pkt)
           case PCI_REVISION_ID:
             break;
           default:
-            panic("writing to a read only register");
+            panic("writing to a read only register %#x\n", offset);
         }
         DPRINTF(PciDevice,
             "writeConfig: dev %#x func %#x reg %#x 1 bytes: data = %#x\n",
@@ -331,12 +339,12 @@ PciDevice::writeConfig(PacketPtr pkt)
       case sizeof(uint16_t):
         switch (offset) {
           case PCI_COMMAND:
-            config.command = pkt->getLE<uint8_t>();
+            config.command = htole(pkt->getLE<uint16_t>());
             // IO or memory space may have been enabled/disabled.
             pioPort.sendRangeChange();
             break;
           case PCI_STATUS:
-            config.status = pkt->getLE<uint8_t>();
+            config.status = htole(pkt->getLE<uint16_t>());
             break;
           case PCI_CACHE_LINE_SIZE:
             config.cacheLineSize = pkt->getLE<uint8_t>();

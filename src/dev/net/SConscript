@@ -46,6 +46,7 @@ SimObject('Ethernet.py', sim_objects=[
     'NSGigE', 'Sinic'] +
     (['EtherTap'] if env['CONF']['HAVE_TUNTAP'] else []))
 
+
 # Basic Ethernet infrastructure
 Source('etherbus.cc')
 Source('etherswitch.cc')
@@ -81,12 +82,28 @@ DebugFlag('DistEthernetCmd')
 Source('i8254xGBe.cc')
 Source('ns_gige.cc')
 Source('sinic.cc')
+Source('load_generator.cc')
 
+
+# LOADGEN
+SimObject('load_generator.py', sim_objects=['LoadGenerator'])
+if env['CONF']['HAVE_PCAP']:
+    Source('load_generator_pcap.cc', tags='pcap')
+    SourceLib('pcap', tags='pcap')
+    SimObject('load_generator_pcap.py', sim_objects=['LoadGeneratorPcap'],
+              tags='pcap')
 
 
 CompoundFlag('EthernetAll', [ 'Ethernet', 'EthernetPIO', 'EthernetDMA',
     'EthernetData' , 'EthernetDesc', 'EthernetIntr', 'EthernetSM',
-    'EthernetCksum', 'EthernetEEPROM' ])
+    'EthernetCksum', 'EthernetEEPROM', 'LoadgenDebug', 'LoadgenLatency' ])
 
 CompoundFlag('EthernetNoData', [ 'Ethernet', 'EthernetPIO', 'EthernetDesc',
     'EthernetIntr', 'EthernetSM', 'EthernetCksum' ])
+
+CompoundFlag('EthernetLoadgen', [ 'EthernetDpdk', 'LoadgenDebug',
+    'LoadgenLatency' ])
+
+DebugFlag('LoadgenDebug')
+DebugFlag('LoadgenLatency')
+DebugFlag('EthernetDpdk')
