@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <tuple>
 #include <utility>
 
@@ -159,6 +160,45 @@ buildQp(const CommandRequest &request, ObjectTables &objects,
         walkPages(build, first_page);
 }
 
+QueuePair
+testQueuePair(uint32_t send_wr = 64, uint32_t recv_wr = 256)
+{
+    QueuePair qp;
+    qp.valid = true;
+    qp.generation = 2;
+    qp.qpHandle = 1;
+    qp.qpn = (qp.generation << SlotBits) | qp.qpHandle;
+    qp.pdHandle = 1;
+    qp.capabilities.maxSendWr = send_wr;
+    qp.capabilities.maxRecvWr = recv_wr;
+    qp.capabilities.maxSendSge = 1;
+    qp.capabilities.maxRecvSge = 1;
+    qp.sendChunks = detail::chunksFor(send_wr, SqStride);
+    qp.recvChunks = detail::chunksFor(recv_wr, RqStride);
+    qp.totalChunks = 1 + qp.sendChunks + qp.recvChunks;
+    for (uint32_t i = 0; i < qp.totalChunks; ++i)
+        qp.pages.push_back(0x8000 + uint64_t{i} * PageSize);
+    return qp;
+}
+
+std::array<uint8_t, SqStride>
+sqSlot(const SendWqeHeader &header, const Sge &sge)
+{
+    std::array<uint8_t, SqStride> slot{};
+    std::memcpy(slot.data(), &header, sizeof(header));
+    std::memcpy(slot.data() + sizeof(header), &sge, sizeof(sge));
+    return slot;
+}
+
+std::array<uint8_t, RqStride>
+rqSlot(const ReceiveWqeHeader &header, const Sge &sge)
+{
+    std::array<uint8_t, RqStride> slot{};
+    std::memcpy(slot.data(), &header, sizeof(header));
+    std::memcpy(slot.data() + sizeof(header), &sge, sizeof(sge));
+    return slot;
+}
+
 CommandResult
 modify(QueuePairTable &qps, QpState state, uint32_t mask,
        const QpAttr &attributes, CommandResponse &response)
@@ -282,6 +322,16 @@ TEST(PvrdmaRegisterTest, ResetRestoresMutableConstructorState)
     EXPECT_EQ(regs.macHigh, 0x6655);
 }
 
+TEST(PvrdmaRegisterTest, DerivesCompanionTransportMac)
+{
+    const RegisterState regs(0x00009002, 0x0100);
+    const rocev2::MacAddress configured = {0x02, 0x90, 0, 0, 0, 1};
+    const rocev2::MacAddress companion = {0x90, 0x02, 0, 0, 1, 0};
+
+    EXPECT_EQ(transportMac(regs, false), configured);
+    EXPECT_EQ(transportMac(regs, true), companion);
+}
+
 TEST(PvrdmaControlTest, PublishesFrozenCapabilitiesAndGuid)
 {
     const auto caps = makeCapabilities(0x33221100, 0x5544);
@@ -309,7 +359,7 @@ TEST(PvrdmaControlTest, PublishesFrozenCapabilitiesAndGuid)
     EXPECT_EQ(letoh(caps.maxPkeys), 1);
     EXPECT_EQ(caps.physicalPortCount, 1);
     EXPECT_EQ(caps.mode, static_cast<uint8_t>(DeviceMode::Roce));
-    EXPECT_EQ(caps.gidTypes, GidTypeRoceV1);
+    EXPECT_EQ(caps.gidTypes, GidTypeRoceV2);
     EXPECT_EQ(caps.atomicOps, 0);
     EXPECT_EQ(caps.bmmeFlags, 0);
     EXPECT_EQ(letoh(caps.deviceCapFlags), 0);
@@ -410,9 +460,26 @@ TEST(PvrdmaCompletionTest, EncodesOnlySupportedSendAndReceiveCqes)
     record.opcode = CompletionOpcode::RdmaWrite;
     EXPECT_FALSE(validCompletionRecord(record));
     record.opcode = CompletionOpcode::Send;
-    record.status = CompletionStatus::LocalLengthError;
+    record.byteLength = record.sourceQp = 0;
+    for (const auto status : {
+             CompletionStatus::LocalLengthError,
+             CompletionStatus::LocalQpOperationError,
+             CompletionStatus::LocalProtectionError,
+             CompletionStatus::LocalAccessError,
+             CompletionStatus::RemoteInvalidRequestError,
+             CompletionStatus::RemoteAccessError,
+             CompletionStatus::RemoteOperationError,
+             CompletionStatus::RetryExceededError,
+             CompletionStatus::RnrRetryExceededError,
+             CompletionStatus::GeneralError}) {
+        record.status = status;
+        EXPECT_TRUE(validCompletionRecord(record));
+    }
+    record.opcode = CompletionOpcode::Receive;
+    record.status = CompletionStatus::RetryExceededError;
     EXPECT_FALSE(validCompletionRecord(record));
     record.status = CompletionStatus::Success;
+    record.opcode = CompletionOpcode::Send;
     record.byteLength = 1;
     EXPECT_FALSE(validCompletionRecord(record));
 }
@@ -518,7 +585,7 @@ TEST(PvrdmaCommandTest, ValidatesGidBindBoundsMtuTypeAndDestroyMatch)
         static_cast<uint32_t>(Command::CreateBind));
     request.createBind.mtu = htole(FixedMtu);
     request.createBind.index = htole(uint32_t{7});
-    request.createBind.gidType = GidTypeRoceV1;
+    request.createBind.gidType = GidTypeRoceV2;
     std::copy(gid.begin(), gid.end(), request.createBind.newGid);
     auto result = processCommand(request, response, gids, valid, objects,
                                  range);
@@ -535,9 +602,20 @@ TEST(PvrdmaCommandTest, ValidatesGidBindBoundsMtuTypeAndDestroyMatch)
     EXPECT_EQ(processCommand(request, response, gids, valid, objects,
                              range).error, CommandError);
     request.createBind.mtu = htole(FixedMtu);
-    request.createBind.gidType = GidTypeRoceV2;
+    request.createBind.gidType = uint8_t{1};
     EXPECT_EQ(processCommand(request, response, gids, valid, objects,
                              range).error, CommandError);
+
+    const std::array<uint8_t, 16> mapped = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1,
+    };
+    request.createBind.index = htole(uint32_t{6});
+    request.createBind.gidType = GidTypeRoceV2;
+    std::copy(mapped.begin(), mapped.end(), request.createBind.newGid);
+    EXPECT_TRUE(detail::ipv4MappedGid(request.createBind.newGid));
+    EXPECT_EQ(processCommand(request, response, gids, valid, objects,
+                             range).error, CommandError);
+    EXPECT_EQ(valid[6], 0);
 
     request = {};
     request.header.command = htole(
@@ -826,6 +904,8 @@ TEST(PvrdmaControlTest, CheckpointsOnlyStableIdleState)
     EXPECT_FALSE(checkpointStable(ControlState::Active, true));
     EXPECT_FALSE(checkpointStable(ControlState::Active, false, true));
     EXPECT_FALSE(checkpointStable(ControlState::Active, false, false, true));
+    EXPECT_FALSE(checkpointStable(ControlState::Active, false, false, false,
+                                  false, false, false, true));
     EXPECT_FALSE(checkpointStable(ControlState::ReadingDsr, false));
     EXPECT_FALSE(checkpointStable(ControlState::WritingCaps, false));
     EXPECT_FALSE(checkpointStable(ControlState::ReadingCommand, false));
@@ -1068,6 +1148,84 @@ TEST(PvrdmaMrTest, TranslatesOneSgeWithinAndAcrossPages)
                            chunks));
 }
 
+TEST(PvrdmaMrTest, AcquiresAndReleasesGenerationSafeLocalKeys)
+{
+    ObjectTables objects{};
+    objects.pdAllocated[1] = 1;
+    MemoryRegionTable mrs{};
+    MemoryRegionBuild build{};
+    ASSERT_TRUE(buildMr(mrRequest(0x1003, 5000, 2,
+                                  AccessLocalWrite | AccessRemoteRead),
+                        objects, mrs, build, 0x8000));
+    ASSERT_TRUE(mrs.commit(std::move(build), objects));
+    auto qp = testQueuePair();
+
+    MemoryRegionLease lease{9, 9, {{1, 2}}};
+    auto wrong_pd = qp;
+    wrong_pd.pdHandle = 2;
+    EXPECT_FALSE(acquireLocalMr(mrs, wrong_pd, QueueKind::Sq, 1,
+                                0x1ff0, 32, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+    EXPECT_EQ(lease.slot, 9);
+    EXPECT_EQ(lease.generation, 9);
+    EXPECT_EQ(lease.chunks, (std::vector<DmaChunk>{{1, 2}}));
+
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Sq, 2,
+                                0x1ff0, 32, lease));
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::None, 1,
+                                0x1ff0, 32, lease));
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Sq, 1,
+                                0x1002, 1, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+    const uint32_t access = mrs.entries[1].accessFlags;
+    mrs.entries[1].accessFlags = 0;
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Rq, 1,
+                                0x1003, 1, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+    ASSERT_TRUE(acquireLocalMr(mrs, qp, QueueKind::Sq, 1,
+                               0x1003, 1, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 1);
+    EXPECT_TRUE(releaseMr(mrs, lease));
+    mrs.entries[1].accessFlags = access;
+
+    ASSERT_TRUE(acquireLocalMr(mrs, qp, QueueKind::Rq, 1,
+                               0x1ff0, 32, lease));
+    EXPECT_EQ(lease.slot, 1);
+    EXPECT_EQ(lease.generation, 0);
+    EXPECT_EQ(lease.chunks, (std::vector<DmaChunk>{{0x8ff0, 16},
+                                                   {0x9000, 16}}));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 1);
+    EXPECT_FALSE(mrs.destroy(1, objects));
+    const auto stale = lease;
+    EXPECT_TRUE(releaseMr(mrs, lease));
+    EXPECT_FALSE(releaseMr(mrs, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+
+    for (const uint64_t address : {uint64_t{0x1003},
+                                   mrs.entries[1].end}) {
+        ASSERT_TRUE(acquireLocalMr(mrs, qp, QueueKind::Rq, 1,
+                                   address, 0, lease));
+        EXPECT_TRUE(lease.chunks.empty());
+        EXPECT_TRUE(releaseMr(mrs, lease));
+    }
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Sq, 1,
+                                0x1002, 0, lease));
+    EXPECT_FALSE(acquireLocalMr(mrs, qp, QueueKind::Sq, 1,
+                                mrs.entries[1].end + 1, 0, lease));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 0);
+
+    ASSERT_TRUE(mrs.destroy(1, objects));
+    ASSERT_TRUE(buildMr(mrRequest(0x1003, 5000, 2,
+                                  AccessLocalWrite | AccessRemoteRead),
+                        objects, mrs, build, 0xa000));
+    ASSERT_TRUE(mrs.commit(std::move(build), objects));
+    ASSERT_TRUE(acquireLocalMr(mrs, qp, QueueKind::Rq, 65,
+                               0x1003, 1, lease));
+    EXPECT_FALSE(releaseMr(mrs, stale));
+    EXPECT_EQ(mrs.entries[1].activeReferences, 1);
+    EXPECT_TRUE(releaseMr(mrs, lease));
+}
+
 TEST(PvrdmaMrTest, ValidatesRestoreConsistency)
 {
     ObjectTables objects{};
@@ -1278,6 +1436,310 @@ TEST(PvrdmaQpTest, EnforcesFrozenGeometryAndCreateValidation)
     EXPECT_FALSE(prepareCreateQp(malformed, objects, cqs, qps, build));
 }
 
+TEST(PvrdmaQpTest, AllocatesOnlyUnicastTwentyFourBitQpns)
+{
+    ObjectTables objects{};
+    setupUserParent(objects);
+    CompletionQueueTable cqs{};
+    CompletionQueueBuild cq_build{};
+    ASSERT_TRUE(buildCq(cqRequest(64), objects, cqs, cq_build));
+    ASSERT_TRUE(cqs.commit(std::move(cq_build), objects));
+    QueuePairTable qps{};
+    for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot)
+        qps.entries[slot].valid = true;
+
+    qps.entries[1].valid = false;
+    qps.entries[1].generation = MaxQpGeneration;
+    QueuePairBuild build{};
+    ASSERT_TRUE(buildQp(qpRequest(32, 128), objects, cqs, qps, build));
+    EXPECT_EQ(build.qpn, (MaxQpGeneration << SlotBits) | 1);
+    EXPECT_TRUE(validQpn(build.qpn));
+
+    qps.entries[1].generation = MaxQpGeneration + 1;
+    qps.entries[ObjectTableEntries - 1].valid = false;
+    qps.entries[ObjectTableEntries - 1].generation = MaxQpGeneration;
+    EXPECT_FALSE(prepareCreateQp(
+        qpRequest(32, 128), objects, cqs, qps, build));
+    EXPECT_EQ(MaxMrGeneration, MaxGeneration);
+    EXPECT_GT(MaxGeneration, MaxQpGeneration);
+}
+
+TEST(PvrdmaQpTest, LooksUpOnlyExactGenerationDerivedQpn)
+{
+    QueuePairTable qps;
+    qps.entries[1] = testQueuePair();
+    EXPECT_EQ(findQueuePair(qps, qps.entries[1].qpn), &qps.entries[1]);
+    EXPECT_EQ(findQueuePair(qps, 1), nullptr);
+    EXPECT_EQ(findQueuePair(qps, qps.entries[1].qpn + ObjectTableEntries),
+              nullptr);
+    qps.entries[1].valid = false;
+    EXPECT_EQ(findQueuePair(qps, (2 << SlotBits) | 1), nullptr);
+}
+
+TEST(PvrdmaTransportTest, DecodesReliabilityTimersAndRetries)
+{
+    EXPECT_EQ(ackTimeoutNanoseconds(0), 0);
+    EXPECT_EQ(ackTimeoutNanoseconds(1), 8192);
+    EXPECT_EQ(ackTimeoutNanoseconds(8), 1048576);
+    EXPECT_EQ(ackTimeoutNanoseconds(31), uint64_t{4096} << 31);
+    EXPECT_EQ(saturatingMultiply(5, 7, 100), 35);
+    EXPECT_EQ(saturatingMultiply(51, 2, 100), 100);
+    EXPECT_EQ(saturatingAdd(40, 50, 100), 90);
+    EXPECT_EQ(saturatingAdd(40, 61, 100), 100);
+    constexpr std::array<uint32_t, 32> expected = {
+        655360, 10, 20, 30, 40, 60, 80, 120,
+        160, 240, 320, 480, 640, 960, 1280, 1920,
+        2560, 3840, 5120, 7680, 10240, 15360, 20480, 30720,
+        40960, 61440, 81920, 122880, 163840, 245760, 327680, 491520,
+    };
+    EXPECT_EQ(RnrTimerMicros, expected);
+
+    uint8_t retry = 0;
+    EXPECT_FALSE(useRetry(retry));
+    retry = 2;
+    EXPECT_TRUE(useRetry(retry));
+    EXPECT_EQ(retry, 1);
+    EXPECT_TRUE(useRetry(retry));
+    EXPECT_EQ(retry, 0);
+    EXPECT_FALSE(useRetry(retry));
+    retry = 7;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        EXPECT_TRUE(useRetry(retry));
+        EXPECT_EQ(retry, 7);
+    }
+}
+
+TEST(PvrdmaTransportTest, BoundsSequenceNakProgressAndRetries)
+{
+    uint8_t retry = 2;
+    EXPECT_EQ(sequenceNakAction(0x100, 0, 3, 0x101, retry),
+              SequenceNakAction::Advance);
+    EXPECT_EQ(retry, 2);
+    EXPECT_EQ(sequenceNakAction(0x100, 0, 3, 0x102, retry),
+              SequenceNakAction::Invalid);
+    EXPECT_EQ(sequenceNakAction(0x100, 2, 3, 0x103, retry),
+              SequenceNakAction::Advance);
+    EXPECT_EQ(retry, 2);
+
+    EXPECT_EQ(sequenceNakAction(0x100, 1, 3, 0x101, retry),
+              SequenceNakAction::Restart);
+    EXPECT_EQ(retry, 1);
+    EXPECT_EQ(sequenceNakAction(0x100, 1, 3, 0x100, retry),
+              SequenceNakAction::Restart);
+    EXPECT_EQ(retry, 0);
+    EXPECT_EQ(sequenceNakAction(0x100, 1, 3, 0x101, retry),
+              SequenceNakAction::RetryExceeded);
+
+    retry = 1;
+    EXPECT_EQ(sequenceNakAction(rocev2::Field24Mask, 0, 2, 0, retry),
+              SequenceNakAction::Advance);
+    EXPECT_EQ(sequenceNakAction(rocev2::Field24Mask, 0, 2, 1, retry),
+              SequenceNakAction::Invalid);
+    EXPECT_EQ(sequenceNakAction(rocev2::Field24Mask, 1, 2,
+                                rocev2::Field24Mask, retry),
+              SequenceNakAction::Restart);
+}
+
+TEST(PvrdmaTransportTest, ComputesCanonicalSegmentsAndLeaseRanges)
+{
+    for (const auto &[length, count] : {
+             std::pair{0U, uint16_t{1}}, {1U, uint16_t{1}},
+             {1023U, uint16_t{1}}, {1024U, uint16_t{1}},
+             {1025U, uint16_t{2}}, {MaxMessageSize, uint16_t{65535}}}) {
+        uint16_t actual = 0;
+        EXPECT_TRUE(segmentGeometry(length, actual));
+        EXPECT_EQ(actual, count);
+    }
+    uint16_t count = 0;
+    EXPECT_FALSE(segmentGeometry(MaxMessageSize + 1, count));
+
+    MemoryRegionLease lease{1, 0, {{0x1000, 3}, {0x2000, 4}}};
+    size_t chunk = 0;
+    size_t offset = 0;
+    EXPECT_TRUE(leaseRange(lease, 2, 4, chunk, offset));
+    EXPECT_EQ(chunk, 0);
+    EXPECT_EQ(offset, 2);
+    EXPECT_TRUE(leaseRange(lease, 3, 4, chunk, offset));
+    EXPECT_EQ(chunk, 1);
+    EXPECT_EQ(offset, 0);
+    EXPECT_TRUE(leaseRange(lease, 7, 0, chunk, offset));
+    EXPECT_EQ(chunk, 1);
+    EXPECT_EQ(offset, 4);
+    EXPECT_FALSE(leaseRange(lease, 4, 4, chunk, offset));
+}
+
+TEST(PvrdmaQpTest, ComputesExactConsumerAddressesAndPsnWrap)
+{
+    const auto qp = testQueuePair();
+    uint64_t address = 0;
+    ASSERT_TRUE(queueConsumerAddress(qp, QueueKind::Sq, address));
+    EXPECT_EQ(address, qp.pages[0] + offsetof(RingState, tx) +
+                           offsetof(Ring, consumerHead));
+    ASSERT_TRUE(queueConsumerAddress(qp, QueueKind::Rq, address));
+    EXPECT_EQ(address, qp.pages[0] + offsetof(RingState, rx) +
+                           offsetof(Ring, consumerHead));
+    EXPECT_FALSE(queueConsumerAddress(qp, QueueKind::Cq, address));
+    EXPECT_TRUE(validPsn(rocev2::Field24Mask));
+    EXPECT_FALSE(validPsn(rocev2::Field24Mask + 1));
+    EXPECT_EQ(advancePsn(rocev2::Field24Mask), 0);
+}
+
+TEST(PvrdmaQpTest, ComputesExactSqAndRqWqeAddresses)
+{
+    const auto qp = testQueuePair();
+    uint64_t address = 0;
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Sq, 0, address));
+    EXPECT_EQ(address, 0x9000);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Sq, 31, address));
+    EXPECT_EQ(address, 0x9f80);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Sq, 32, address));
+    EXPECT_EQ(address, 0xa000);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Sq, 64, address));
+    EXPECT_EQ(address, 0x9000);
+
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Rq, 0, address));
+    EXPECT_EQ(address, 0xb000);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Rq, 127, address));
+    EXPECT_EQ(address, 0xbfe0);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Rq, 128, address));
+    EXPECT_EQ(address, 0xc000);
+    ASSERT_TRUE(wqeAddress(qp, QueueKind::Rq, 256, address));
+    EXPECT_EQ(address, 0xb000);
+}
+
+TEST(PvrdmaQpTest, RejectsMalformedWqeAddressGeometry)
+{
+    const auto qp = testQueuePair();
+    uint64_t address = 0xdeadbeef;
+    EXPECT_FALSE(wqeAddress({}, QueueKind::Sq, 0, address));
+    EXPECT_FALSE(wqeAddress(qp, QueueKind::None, 0, address));
+    EXPECT_FALSE(wqeAddress(qp, QueueKind::Cq, 0, address));
+    EXPECT_FALSE(wqeAddress(qp, static_cast<QueueKind>(0xff), 0, address));
+
+    auto malformed = qp;
+    malformed.capabilities.maxSendWr = 3;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 0, address));
+    malformed = qp;
+    malformed.sendChunks++;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 0, address));
+    malformed = qp;
+    malformed.totalChunks--;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Rq, 0, address));
+    malformed = qp;
+    malformed.pages.resize(1);
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 32, address));
+    malformed = qp;
+    malformed.pages[1] = 0;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 0, address));
+    malformed = qp;
+    malformed.pages.back()++;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Rq, 128, address));
+    malformed = qp;
+    malformed.generation++;
+    EXPECT_FALSE(wqeAddress(malformed, QueueKind::Sq, 0, address));
+    EXPECT_EQ(address, 0xdeadbeef);
+}
+
+TEST(PvrdmaWqeTest, DecodesLittleEndianSqAndSignalPolicy)
+{
+    SendWqeHeader header{};
+    header.workRequestId = htole(uint64_t{0x1122334455667788});
+    header.numSge = htole(uint32_t{1});
+    header.reservedLength = htole(uint32_t{0xffffffff});
+    header.opcode = htole(
+        static_cast<uint32_t>(WorkRequestOpcode::Send));
+    Sge sge{htole(uint64_t{0x8877665544332211}),
+            htole(uint32_t{MaxMessageSize}), htole(uint32_t{0x12345678})};
+    auto slot = sqSlot(header, sge);
+    slot.back() = 0xaa;
+    PreparedWqe prepared;
+    auto qp = testQueuePair();
+    auto invalid_qp = qp;
+    invalid_qp.valid = false;
+    EXPECT_FALSE(decodeSqWqe(invalid_qp, slot, prepared));
+    ASSERT_TRUE(decodeSqWqe(qp, slot, prepared));
+    EXPECT_EQ(prepared.kind, QueueKind::Sq);
+    EXPECT_EQ(prepared.workRequestId, 0x1122334455667788);
+    EXPECT_EQ(prepared.address, 0x8877665544332211);
+    EXPECT_EQ(prepared.length, MaxMessageSize);
+    EXPECT_EQ(prepared.lkey, 0x12345678);
+    EXPECT_FALSE(prepared.signaled);
+
+    header.sendFlags = htole(SendSignaled);
+    ASSERT_TRUE(decodeSqWqe(qp, sqSlot(header, sge), prepared));
+    EXPECT_TRUE(prepared.signaled);
+    header.sendFlags = 0;
+    qp.signalAllSendWr = true;
+    ASSERT_TRUE(decodeSqWqe(qp, sqSlot(header, sge), prepared));
+    EXPECT_TRUE(prepared.signaled);
+}
+
+TEST(PvrdmaWqeTest, RejectsEachUnsupportedSqField)
+{
+    SendWqeHeader header{};
+    header.numSge = htole(uint32_t{1});
+    header.opcode = htole(
+        static_cast<uint32_t>(WorkRequestOpcode::Send));
+    Sge sge{htole(uint64_t{0x1000}), htole(uint32_t{1}),
+            htole(uint32_t{1})};
+    PreparedWqe prepared;
+    const auto qp = testQueuePair();
+
+    auto malformed = header;
+    malformed.numSge = htole(uint32_t{2});
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.opcode = htole(
+        static_cast<uint32_t>(WorkRequestOpcode::RdmaWrite));
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.sendFlags = htole(SendFence);
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.sendFlags = htole(SendSignaled | SendFence);
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.invalidateRkey = htole(uint32_t{1});
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.reserved = htole(uint32_t{1});
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    malformed = header;
+    malformed.operationData[47] = 1;
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(malformed, sge), prepared));
+    auto long_sge = sge;
+    long_sge.length = htole(MaxMessageSize + 1);
+    EXPECT_FALSE(decodeSqWqe(qp, sqSlot(header, long_sge), prepared));
+}
+
+TEST(PvrdmaWqeTest, DecodesAndValidatesLittleEndianRq)
+{
+    ReceiveWqeHeader header{};
+    header.workRequestId = htole(uint64_t{0x1122334455667788});
+    header.numSge = htole(uint32_t{1});
+    header.reservedLength = htole(uint32_t{0xffffffff});
+    Sge sge{htole(uint64_t{0x8877665544332211}),
+            htole(uint32_t{MaxMessageSize}), htole(uint32_t{0x12345678})};
+    PreparedWqe prepared;
+    const auto qp = testQueuePair();
+    auto invalid_qp = qp;
+    invalid_qp.valid = false;
+    EXPECT_FALSE(decodeRqWqe(invalid_qp, rqSlot(header, sge), prepared));
+    ASSERT_TRUE(decodeRqWqe(qp, rqSlot(header, sge), prepared));
+    EXPECT_EQ(prepared.kind, QueueKind::Rq);
+    EXPECT_EQ(prepared.workRequestId, 0x1122334455667788);
+    EXPECT_EQ(prepared.address, 0x8877665544332211);
+    EXPECT_EQ(prepared.length, MaxMessageSize);
+    EXPECT_EQ(prepared.lkey, 0x12345678);
+    EXPECT_FALSE(prepared.signaled);
+
+    header.numSge = htole(uint32_t{2});
+    EXPECT_FALSE(decodeRqWqe(qp, rqSlot(header, sge), prepared));
+    header.numSge = htole(uint32_t{1});
+    sge.length = htole(MaxMessageSize + 1);
+    EXPECT_FALSE(decodeRqWqe(qp, rqSlot(header, sge), prepared));
+}
+
 TEST(PvrdmaQpTest, TracksDependenciesDirectHandleAndGenerationSafeQpn)
 {
     ObjectTables objects{};
@@ -1401,11 +1863,44 @@ TEST(PvrdmaQpTest, ReachesRtsQueriesStoredAttributesAndResets)
     EXPECT_EQ(letoh(attr.capabilities.maxSendSge), 1);
     EXPECT_EQ(letoh(attr.capabilities.maxRecvSge), 1);
 
+    auto &stored = qps.entries[1];
+    stored.state = QpState::Error;
+    stored.attributes.qpState = stored.attributes.currentQpState =
+        QpState::Error;
+    stored.finalReplay.valid = true;
+    stored.finalReplay.qpGeneration = stored.generation;
+    stored.finalReplay.localMac = {0x02, 0, 0, 0, 0, 2};
+    stored.finalReplay.remoteMac = {0x02, 0, 0, 0, 0, 1};
+    std::copy(stored.finalReplay.remoteMac.begin(),
+              stored.finalReplay.remoteMac.end(),
+              stored.attributes.addressHandle.destinationMac);
+    stored.finalReplay.localGid[0] = stored.finalReplay.remoteGid[0] = 0xfe;
+    stored.finalReplay.localGid[1] = stored.finalReplay.remoteGid[1] = 0x80;
+    stored.finalReplay.localGid[15] = 2;
+    stored.finalReplay.remoteGid[15] = 1;
+    stored.finalReplay.localQpn = stored.qpn;
+    stored.finalReplay.remoteQpn = stored.attributes.destinationQpNumber;
+    stored.finalReplay.finalPsn =
+        (stored.attributes.receivePsn - 1) & rocev2::Field24Mask;
+    stored.responderMsn = 1;
+    stored.finalReplay.finalOpcode = rocev2::Opcode::SendOnly;
+    stored.finalReplay.finalSegmentLength = 1;
+    stored.finalReplay.completedMsn = 1;
+    EXPECT_TRUE(detail::validFinalReplay(stored));
+    ASSERT_EQ(detail::queryQp(query, response, qps).error, 0);
+    EXPECT_EQ(letoh(static_cast<uint32_t>(
+                  response.queryQp.attributes.qpState)),
+              static_cast<uint32_t>(QpState::Error));
+    EXPECT_EQ(modify(qps, QpState::Error, QpAttrState,
+                     {}, response).error, CommandError);
+
     QpAttr reset{};
     ASSERT_EQ(modify(qps, QpState::Reset, QpAttrState,
                      reset, response).error, 0);
     EXPECT_EQ(qps.entries[1].state, QpState::Reset);
     EXPECT_EQ(qps.entries[1].attributes.capabilities.maxSendWr, 32);
+    EXPECT_EQ(qps.entries[1].responderMsn, 0);
+    EXPECT_FALSE(qps.entries[1].finalReplay.valid);
     EXPECT_TRUE(validQueueObjects(cqs, qps, MemoryRegionTable{}, objects));
 }
 
@@ -1469,12 +1964,15 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
                      rtr, response).error, CommandError);
     rtr.pathMtu = static_cast<Mtu>(
         htole(static_cast<uint32_t>(Mtu::Mtu1024)));
-    rtr.destinationQpNumber = 0;
-    EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
-                     QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
-                     QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
-                     QpAttrMinRnrTimer | QpAttrDestinationQpn,
-                     rtr, response).error, CommandError);
+    for (const uint32_t qpn : {0U, rocev2::Field24Mask,
+                               rocev2::Field24Mask + 1}) {
+        rtr.destinationQpNumber = htole(qpn);
+        EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
+                         QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
+                         QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
+                         QpAttrMinRnrTimer | QpAttrDestinationQpn,
+                         rtr, response).error, CommandError);
+    }
     rtr.destinationQpNumber = htole(uint32_t{1});
     rtr.maxDestinationReadAtomic = 2;
     EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
@@ -1483,6 +1981,13 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
                      QpAttrMinRnrTimer | QpAttrDestinationQpn,
                      rtr, response).error, CommandError);
     rtr.maxDestinationReadAtomic = 0;
+    rtr.receivePsn = htole(rocev2::Field24Mask + 1);
+    EXPECT_EQ(modify(qps, QpState::ReadyToReceive,
+                     QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
+                     QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
+                     QpAttrMinRnrTimer | QpAttrDestinationQpn,
+                     rtr, response).error, CommandError);
+    rtr.receivePsn = htole(uint32_t{0x123456});
     ASSERT_EQ(modify(qps, QpState::ReadyToReceive,
                      QpAttrState | QpAttrAddressVector | QpAttrPathMtu |
                      QpAttrReceivePsn | QpAttrMaxDestReadAtomic |
@@ -1507,6 +2012,10 @@ TEST(PvrdmaQpTest, RejectsInvalidTransitionsAndResetsNonemptyQueues)
     EXPECT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, CommandError);
     rts.rnrRetry = 7;
+    rts.sendPsn = htole(rocev2::Field24Mask + 1);
+    EXPECT_EQ(modify(qps, QpState::ReadyToSend,
+                     RtsMask, rts, response).error, CommandError);
+    rts.sendPsn = htole(uint32_t{0x654321});
     ASSERT_EQ(modify(qps, QpState::ReadyToSend,
                      RtsMask, rts, response).error, 0);
 
@@ -1559,10 +2068,17 @@ TEST(PvrdmaQpTest, ValidatesRestoreCountersGeometryStateAndGeneration)
     malformed_qps.entries[1].qpn = 65;
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
+    malformed_qps.entries[1].qpn = rocev2::Field24Mask;
+    EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
+    malformed_qps = qps;
     malformed_qps.entries[1].pages.pop_back();
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
     malformed_qps.entries[1].attributes.destinationQpNumber = 0;
+    EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
+    malformed_qps = qps;
+    malformed_qps.entries[1].attributes.destinationQpNumber =
+        rocev2::Field24Mask;
     EXPECT_FALSE(validQueueObjects(cqs, malformed_qps, mrs, objects));
     malformed_qps = qps;
     malformed_qps.entries[1].attributes.timeout = 32;
@@ -1644,6 +2160,8 @@ TEST(PvrdmaDoorbellTest, ValidatesLiveHandleUarAndQpState)
     ASSERT_TRUE(decodeDoorbell(2 * UarPageSize, 4,
                                RqDoorbellAction | 1, doorbell));
     EXPECT_TRUE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+    qp.state = QpState::Init;
+    EXPECT_TRUE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
     qp.state = QpState::Reset;
     EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
     qp.state = QpState::ReadyToSend;
@@ -1659,6 +2177,16 @@ TEST(PvrdmaDoorbellTest, ValidatesLiveHandleUarAndQpState)
     EXPECT_FALSE(validDoorbell(doorbell, ControlState::Ready, cqs, qps));
     cqs.entries[1].valid = false;
     EXPECT_FALSE(validDoorbell(doorbell, ControlState::Active, cqs, qps));
+}
+
+TEST(PvrdmaDoorbellTest, EmptyCqPollsDoNotNeedObservation)
+{
+    CompletionQueue cq;
+    EXPECT_FALSE(cqPollNeedsObservation(cq));
+    cq.producerTail = 1;
+    EXPECT_TRUE(cqPollNeedsObservation(cq));
+    cq.consumerHead = 1;
+    EXPECT_FALSE(cqPollNeedsObservation(cq));
 }
 
 TEST(PvrdmaDoorbellTest, BlocksOnlyQueueDestroyAndResetTargets)

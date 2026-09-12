@@ -212,7 +212,8 @@ if buildEnv["USE_X86_ISA"]:
             rdmas = []
             if self._enable_pvrdma:
                 rdma = Pvrdma(
-                    hardware_address=str(network.nics[0].hardware_address)
+                    hardware_address=str(network.nics[0].hardware_address),
+                    companion_mac_word_swap=True,
                 )
                 rdma.host = self.pc.pci_host
                 rdma.pci_bus = 0

@@ -6,14 +6,17 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <vector>
 
 #include "base/statistics.hh"
+#include "dev/net/etherint.hh"
 #include "dev/pci/device.hh"
 #include "dev/rdma/pvrdma_abi.hh"
 #include "dev/rdma/pvrdma_ring.hh"
+#include "dev/rdma/pvrdma_rocev2.hh"
 #include "params/Pvrdma.hh"
 #include "sim/byteswap.hh"
 #include "sim/eventq.hh"
@@ -34,6 +37,8 @@ inline constexpr uint32_t SlotBits = 6;
 inline constexpr uint32_t SlotMask = ObjectTableEntries - 1;
 inline constexpr uint32_t MaxGeneration =
     std::numeric_limits<uint32_t>::max() >> SlotBits;
+inline constexpr uint32_t MaxQpGeneration =
+    rocev2::Field24Mask >> SlotBits;
 inline constexpr uint32_t MrPageSize = PageSize;
 inline constexpr uint32_t MrEntriesPerPage = PageEntries;
 inline constexpr uint32_t MrSlotBits = SlotBits;
@@ -45,7 +50,15 @@ inline constexpr uint32_t RqStride = 32;
 inline constexpr uint32_t SupportedMrAccess = AccessLocalWrite |
     AccessRemoteWrite | AccessRemoteRead | AccessRemoteAtomic;
 inline constexpr uint32_t FixedMtu = 1024;
-inline constexpr uint32_t MaxMessageSize = uint32_t{1} << 31;
+inline constexpr uint32_t MaxMessageSegments =
+    std::numeric_limits<uint16_t>::max();
+inline constexpr uint32_t MaxMessageSize = MaxMessageSegments * FixedMtu;
+inline constexpr std::array<uint32_t, 32> RnrTimerMicros = {
+    655360, 10, 20, 30, 40, 60, 80, 120,
+    160, 240, 320, 480, 640, 960, 1280, 1920,
+    2560, 3840, 5120, 7680, 10240, 15360, 20480, 30720,
+    40960, 61440, 81920, 122880, 163840, 245760, 327680, 491520,
+};
 inline constexpr uint16_t FullMembershipPkey = 0xffff;
 inline constexpr uint32_t QpDoorbellOffset = 0x00;
 inline constexpr uint32_t CqDoorbellOffset = 0x04;
@@ -55,6 +68,12 @@ inline constexpr uint32_t RqDoorbellAction = 0x80000000;
 inline constexpr uint32_t CqArmSolicitedAction = 0x20000000;
 inline constexpr uint32_t CqArmAnyAction = 0x40000000;
 inline constexpr uint32_t CqPollAction = 0x80000000;
+
+constexpr bool
+validQpn(uint32_t qpn)
+{
+    return qpn && qpn < rocev2::Field24Mask;
+}
 
 enum class QueueKind : uint8_t
 {
@@ -104,16 +123,37 @@ struct CompletionRecord
 };
 
 inline bool
+supportedCompletionStatus(CompletionStatus status)
+{
+    switch (status) {
+      case CompletionStatus::Success:
+      case CompletionStatus::LocalLengthError:
+      case CompletionStatus::LocalQpOperationError:
+      case CompletionStatus::LocalProtectionError:
+      case CompletionStatus::LocalAccessError:
+      case CompletionStatus::RemoteInvalidRequestError:
+      case CompletionStatus::RemoteAccessError:
+      case CompletionStatus::RemoteOperationError:
+      case CompletionStatus::RetryExceededError:
+      case CompletionStatus::RnrRetryExceededError:
+      case CompletionStatus::GeneralError:
+        return true;
+      default:
+        return false;
+    }
+}
+
+inline bool
 validCompletionRecord(const CompletionRecord &record)
 {
+    const bool send = record.opcode == CompletionOpcode::Send;
     return record.cqHandle && record.cqHandle < ObjectTableEntries &&
         record.qpHandle && record.qpHandle < ObjectTableEntries &&
-        (record.opcode == CompletionOpcode::Send ||
-         record.opcode == CompletionOpcode::Receive) &&
-        (record.status == CompletionStatus::Success ||
-         record.status == CompletionStatus::GeneralError) &&
-        (record.opcode == CompletionOpcode::Receive ||
-         (!record.byteLength && !record.sourceQp));
+        (send || record.opcode == CompletionOpcode::Receive) &&
+        supportedCompletionStatus(record.status) &&
+        (send || (record.status != CompletionStatus::RetryExceededError &&
+                  record.status != CompletionStatus::RnrRetryExceededError)) &&
+        (!send || (!record.byteLength && !record.sourceQp));
 }
 
 inline CompletionQueueElement
@@ -377,10 +417,14 @@ constexpr bool
 checkpointStable(ControlState state, bool dma_pending,
                  bool observation_queued = false,
                  bool observation_active = false,
-                 bool completion_active = false)
+                 bool completion_active = false,
+                 bool transport_active = false,
+                 bool runnable_sq = false,
+                 bool active_mr = false)
 {
     return stable(state) && !dma_pending && !observation_queued &&
-           !observation_active && !completion_active;
+           !observation_active && !completion_active && !transport_active &&
+           !runnable_sq && !active_mr;
 }
 
 constexpr Register
@@ -518,6 +562,24 @@ struct RegisterState
     }
 };
 
+inline rocev2::MacAddress
+transportMac(const RegisterState &regs, bool word_swap)
+{
+    rocev2::MacAddress mac = {
+        static_cast<uint8_t>(regs.macLow),
+        static_cast<uint8_t>(regs.macLow >> 8),
+        static_cast<uint8_t>(regs.macLow >> 16),
+        static_cast<uint8_t>(regs.macLow >> 24),
+        static_cast<uint8_t>(regs.macHigh),
+        static_cast<uint8_t>(regs.macHigh >> 8),
+    };
+    if (word_swap) {
+        for (size_t i = 0; i < mac.size(); i += 2)
+            std::swap(mac[i], mac[i + 1]);
+    }
+    return mac;
+}
+
 using GidTable = std::array<Gid, GidTableEntries>;
 using GidValidTable = std::array<uint8_t, GidTableEntries>;
 
@@ -600,6 +662,23 @@ struct DmaChunk
     {
         return address == other.address && length == other.length;
     }
+};
+
+struct MemoryRegionLease
+{
+    uint32_t slot = 0;
+    uint32_t generation = 0;
+    std::vector<DmaChunk> chunks;
+};
+
+struct PreparedWqe
+{
+    QueueKind kind = QueueKind::None;
+    uint64_t workRequestId = 0;
+    uint64_t address = 0;
+    uint32_t length = 0;
+    uint32_t lkey = 0;
+    bool signaled = false;
 };
 
 enum class MrKeyType
@@ -763,6 +842,22 @@ struct CompletionQueueTable
     }
 };
 
+struct FinalReplay
+{
+    bool valid = false;
+    uint32_t qpGeneration = 0;
+    rocev2::MacAddress localMac{};
+    rocev2::MacAddress remoteMac{};
+    rocev2::Gid localGid{};
+    rocev2::Gid remoteGid{};
+    uint32_t localQpn = 0;
+    uint32_t remoteQpn = 0;
+    uint32_t finalPsn = 0;
+    rocev2::Opcode finalOpcode = rocev2::Opcode::SendOnly;
+    uint16_t finalSegmentLength = 0;
+    uint32_t completedMsn = 0;
+};
+
 struct QueuePair
 {
     bool valid = false;
@@ -785,6 +880,8 @@ struct QueuePair
     uint32_t sqConsumerHead = 0;
     uint32_t rqProducerTail = 0;
     uint32_t rqConsumerHead = 0;
+    uint32_t responderMsn = 0;
+    FinalReplay finalReplay{};
     std::vector<uint64_t> pages;
 };
 
@@ -813,10 +910,12 @@ struct QueuePairTable
     {
         for (uint32_t slot = 1; slot < ObjectTableEntries; ++slot) {
             const auto &entry = entries[slot];
-            if (!entry.valid && entry.generation <= MaxGeneration) {
+            const uint32_t qpn = (entry.generation << SlotBits) | slot;
+            if (!entry.valid && entry.generation <= MaxQpGeneration &&
+                qpn && qpn < rocev2::Field24Mask) {
                 build.slot = slot;
                 build.generation = entry.generation;
-                build.qpn = (build.generation << SlotBits) | slot;
+                build.qpn = qpn;
                 return true;
             }
         }
@@ -861,6 +960,7 @@ struct QueuePairTable
                 (uint64_t{build.capabilities.maxRecvWr} * RqStride +
                  PageSize - 1) / PageSize ||
             build.numChunks != 1 + build.sendChunks + build.recvChunks ||
+            !validQpn(build.qpn) ||
             build.pages.size() != build.numChunks ||
             std::any_of(build.pages.begin(), build.pages.end(),
                 [](uint64_t page) {
@@ -925,6 +1025,284 @@ struct QueuePairTable
     }
 };
 
+inline QueuePair *
+findQueuePair(QueuePairTable &qps, uint32_t qpn)
+{
+    if (!qpn || qpn >= rocev2::Field24Mask)
+        return nullptr;
+    const uint32_t slot = qpn & SlotMask;
+    if (!slot || slot >= ObjectTableEntries)
+        return nullptr;
+    auto &qp = qps.entries[slot];
+    return qp.valid && qp.qpn == qpn &&
+        qp.generation == (qpn >> SlotBits) ? &qp : nullptr;
+}
+
+inline const QueuePair *
+findQueuePair(const QueuePairTable &qps, uint32_t qpn)
+{
+    if (!qpn || qpn >= rocev2::Field24Mask)
+        return nullptr;
+    const uint32_t slot = qpn & SlotMask;
+    if (!slot || slot >= ObjectTableEntries)
+        return nullptr;
+    const auto &qp = qps.entries[slot];
+    return qp.valid && qp.qpn == qpn &&
+        qp.generation == (qpn >> SlotBits) ? &qp : nullptr;
+}
+
+constexpr bool
+validPsn(uint32_t psn)
+{
+    return !(psn & ~rocev2::Field24Mask);
+}
+
+constexpr uint32_t
+advancePsn(uint32_t psn)
+{
+    return (psn + 1) & rocev2::Field24Mask;
+}
+
+constexpr uint32_t
+psnDistance(uint32_t from, uint32_t to)
+{
+    return (to - from) & rocev2::Field24Mask;
+}
+
+constexpr uint64_t
+saturatingMultiply(uint64_t value, uint64_t scale, uint64_t maximum)
+{
+    return scale && value > maximum / scale ? maximum : value * scale;
+}
+
+constexpr uint64_t
+saturatingAdd(uint64_t value, uint64_t addend, uint64_t maximum)
+{
+    return addend > maximum - value ? maximum : value + addend;
+}
+
+constexpr uint64_t
+ackTimeoutNanoseconds(uint8_t timeout)
+{
+    return timeout ? uint64_t{4096} << timeout : 0;
+}
+
+constexpr bool
+useRetry(uint8_t &remaining)
+{
+    if (remaining == 7)
+        return true;
+    if (!remaining)
+        return false;
+    --remaining;
+    return true;
+}
+
+enum class SequenceNakAction : uint8_t
+{
+    Advance,
+    Restart,
+    RetryExceeded,
+    Invalid,
+};
+
+constexpr SequenceNakAction
+sequenceNakAction(uint32_t initialPsn, uint16_t current,
+                  uint16_t segmentCount, uint32_t expectedPsn,
+                  uint8_t &retryRemaining)
+{
+    if (current >= segmentCount)
+        return SequenceNakAction::Invalid;
+    const uint32_t expected = psnDistance(initialPsn, expectedPsn);
+    if (expected == uint32_t{current} + 1)
+        return SequenceNakAction::Advance;
+    if (expected <= current)
+        return useRetry(retryRemaining) ? SequenceNakAction::Restart :
+                                          SequenceNakAction::RetryExceeded;
+    return SequenceNakAction::Invalid;
+}
+
+inline bool
+segmentGeometry(uint32_t length, uint16_t &count)
+{
+    const uint64_t segments = length ?
+        (uint64_t{length} + FixedMtu - 1) / FixedMtu : 1;
+    if (segments > MaxMessageSegments)
+        return false;
+    count = segments;
+    return true;
+}
+
+constexpr bool
+startingOpcode(rocev2::Opcode opcode)
+{
+    return opcode == rocev2::Opcode::SendOnly ||
+        opcode == rocev2::Opcode::SendFirst;
+}
+
+constexpr bool
+continuationOpcode(rocev2::Opcode opcode)
+{
+    return opcode == rocev2::Opcode::SendMiddle ||
+        opcode == rocev2::Opcode::SendLast;
+}
+
+constexpr bool
+finalOpcode(rocev2::Opcode opcode)
+{
+    return opcode == rocev2::Opcode::SendOnly ||
+        opcode == rocev2::Opcode::SendLast;
+}
+
+inline rocev2::Opcode
+sendOpcode(uint16_t index, uint16_t count)
+{
+    if (count == 1)
+        return rocev2::Opcode::SendOnly;
+    if (index == 0)
+        return rocev2::Opcode::SendFirst;
+    return index + 1 == count ? rocev2::Opcode::SendLast :
+                                rocev2::Opcode::SendMiddle;
+}
+
+inline bool
+leaseRange(const MemoryRegionLease &lease, size_t offset, size_t length,
+           size_t &chunk_index, size_t &chunk_offset)
+{
+    size_t cursor = 0;
+    for (chunk_index = 0; chunk_index < lease.chunks.size(); ++chunk_index) {
+        const size_t next = cursor + lease.chunks[chunk_index].length;
+        if (offset < next || (offset == next && !length)) {
+            chunk_offset = offset - cursor;
+            size_t available = lease.chunks[chunk_index].length -
+                chunk_offset;
+            for (size_t i = chunk_index + 1; available < length &&
+                 i < lease.chunks.size(); ++i)
+                available += lease.chunks[i].length;
+            return available >= length;
+        }
+        cursor = next;
+    }
+    if (!length && offset == cursor) {
+        chunk_index = lease.chunks.size();
+        chunk_offset = 0;
+        return true;
+    }
+    return false;
+}
+
+inline bool
+queueConsumerAddress(const QueuePair &qp, QueueKind kind, uint64_t &address)
+{
+    if (!qp.valid || qp.pages.empty() ||
+        (kind != QueueKind::Sq && kind != QueueKind::Rq))
+        return false;
+    address = qp.pages[0] +
+        (kind == QueueKind::Sq ? offsetof(RingState, tx) :
+                                 offsetof(RingState, rx)) +
+        offsetof(Ring, consumerHead);
+    return true;
+}
+
+inline bool
+wqeAddress(const QueuePair &qp, QueueKind kind, uint32_t consumer,
+           uint64_t &address)
+{
+    if (!qp.valid || !qp.qpHandle || qp.qpHandle >= ObjectTableEntries ||
+        qp.generation > MaxQpGeneration || !validQpn(qp.qpn) ||
+        qp.qpn != ((qp.generation << SlotBits) | qp.qpHandle) ||
+        (kind != QueueKind::Sq && kind != QueueKind::Rq))
+        return false;
+
+    const auto valid_depth = [](uint32_t depth) {
+        return depth && !(depth & (depth - 1)) && depth <= 256;
+    };
+    if (!valid_depth(qp.capabilities.maxSendWr) ||
+        !valid_depth(qp.capabilities.maxRecvWr) ||
+        qp.capabilities.maxSendSge != 1 ||
+        qp.capabilities.maxRecvSge != 1 ||
+        qp.capabilities.maxInlineData || qp.capabilities.reserved ||
+        qp.sendChunks !=
+            (static_cast<uint64_t>(qp.capabilities.maxSendWr) * SqStride +
+             PageSize - 1) / PageSize ||
+        qp.recvChunks !=
+            (static_cast<uint64_t>(qp.capabilities.maxRecvWr) * RqStride +
+             PageSize - 1) / PageSize ||
+        PageSize % SqStride || PageSize % RqStride ||
+        qp.totalChunks != 1 + qp.sendChunks + qp.recvChunks ||
+        qp.pages.size() != qp.totalChunks ||
+        std::any_of(qp.pages.begin(), qp.pages.end(), [](uint64_t page) {
+            return !page || page % PageSize;
+        }))
+        return false;
+
+    const uint32_t depth = kind == QueueKind::Sq ?
+        qp.capabilities.maxSendWr : qp.capabilities.maxRecvWr;
+    const uint32_t stride = kind == QueueKind::Sq ? SqStride : RqStride;
+    const uint32_t chunks = kind == QueueKind::Sq ?
+        qp.sendChunks : qp.recvChunks;
+    const uint64_t offset =
+        static_cast<uint64_t>(consumer & (depth - 1)) * stride;
+    const uint32_t page = offset / PageSize;
+    const uint32_t page_offset = offset % PageSize;
+    const uint32_t first = 1 +
+        (kind == QueueKind::Rq ? qp.sendChunks : 0);
+    if (page >= chunks || first + page >= qp.pages.size() ||
+        page_offset + stride > PageSize)
+        return false;
+    address = qp.pages[first + page] + page_offset;
+    return true;
+}
+
+inline bool
+decodeSqWqe(const QueuePair &qp,
+            const std::array<uint8_t, SqStride> &slot,
+            PreparedWqe &prepared)
+{
+    if (!qp.valid)
+        return false;
+    SendWqeHeader header;
+    Sge sge;
+    std::memcpy(&header, slot.data(), sizeof(header));
+    std::memcpy(&sge, slot.data() + sizeof(header), sizeof(sge));
+    const uint32_t flags = letoh(header.sendFlags);
+    if (letoh(header.numSge) != 1 ||
+        letoh(header.opcode) !=
+            static_cast<uint32_t>(WorkRequestOpcode::Send) ||
+        (flags != 0 && flags != SendSignaled) ||
+        letoh(header.beImmediateData) || letoh(header.reserved) ||
+        std::any_of(std::begin(header.operationData),
+                    std::end(header.operationData),
+                    [](uint8_t byte) { return byte != 0; }) ||
+        letoh(sge.length) > MaxMessageSize)
+        return false;
+
+    prepared = {QueueKind::Sq, letoh(header.workRequestId),
+                letoh(sge.address), letoh(sge.length), letoh(sge.lkey),
+                qp.signalAllSendWr || (flags & SendSignaled)};
+    return true;
+}
+
+inline bool
+decodeRqWqe(const QueuePair &qp,
+            const std::array<uint8_t, RqStride> &slot,
+            PreparedWqe &prepared)
+{
+    if (!qp.valid)
+        return false;
+    ReceiveWqeHeader header;
+    Sge sge;
+    std::memcpy(&header, slot.data(), sizeof(header));
+    std::memcpy(&sge, slot.data() + sizeof(header), sizeof(sge));
+    if (letoh(header.numSge) != 1 || letoh(sge.length) > MaxMessageSize)
+        return false;
+
+    prepared = {QueueKind::Rq, letoh(header.workRequestId),
+                letoh(sge.address), letoh(sge.length), letoh(sge.lkey),
+                false};
+    return true;
+}
+
 inline bool
 validDoorbell(const Doorbell &doorbell, ControlState control_state,
               const CompletionQueueTable &cqs, const QueuePairTable &qps)
@@ -945,7 +1323,15 @@ validDoorbell(const Doorbell &doorbell, ControlState control_state,
     return qp.valid && qp.qpHandle == doorbell.handle &&
         qp.uar == doorbell.uar &&
         (kind == QueueKind::Sq ? qp.state == QpState::ReadyToSend :
-                                qp.state != QpState::Reset);
+            (qp.state == QpState::Init ||
+             qp.state == QpState::ReadyToReceive ||
+             qp.state == QpState::ReadyToSend));
+}
+
+inline bool
+cqPollNeedsObservation(const CompletionQueue &cq)
+{
+    return cq.producerTail != cq.consumerHead;
 }
 
 inline bool
@@ -1088,7 +1474,7 @@ validSupportedState(QpState state)
 {
     return state == QpState::Reset || state == QpState::Init ||
         state == QpState::ReadyToReceive ||
-        state == QpState::ReadyToSend;
+        state == QpState::ReadyToSend || state == QpState::Error;
 }
 
 inline bool
@@ -1157,7 +1543,8 @@ validStoredQpAttributes(const QueuePair &qp)
             !attr.timeout && !attr.retryCount && !attr.rnrRetry &&
             zeroAddressVector(attr.addressHandle);
 
-    if (attr.pathMtu != Mtu::Mtu1024 || !attr.destinationQpNumber ||
+    if (attr.pathMtu != Mtu::Mtu1024 ||
+        !validQpn(attr.destinationQpNumber) || !validPsn(attr.receivePsn) ||
         attr.maxDestinationReadAtomic > 1 || attr.minRnrTimer > 31 ||
         !validAddressVector(attr.addressHandle))
         return false;
@@ -1165,8 +1552,46 @@ validStoredQpAttributes(const QueuePair &qp)
         return !attr.sendPsn && !attr.maxReadAtomic && !attr.timeout &&
             !attr.retryCount && !attr.rnrRetry;
 
-    return qp.state == QpState::ReadyToSend && attr.maxReadAtomic <= 1 &&
-        attr.timeout <= 31 && attr.retryCount <= 7 && attr.rnrRetry <= 7;
+    return (qp.state == QpState::ReadyToSend ||
+            qp.state == QpState::Error) && validPsn(attr.sendPsn) &&
+        attr.maxReadAtomic <= 1 && attr.timeout <= 31 &&
+        attr.retryCount <= 7 && attr.rnrRetry <= 7;
+}
+
+inline bool
+validFinalReplay(const QueuePair &qp)
+{
+    const auto &replay = qp.finalReplay;
+    const auto zero_mac = [](const auto &mac) {
+        return std::all_of(mac.begin(), mac.end(),
+                           [](uint8_t byte) { return byte == 0; });
+    };
+    const auto zero_gid = [](const auto &gid) {
+        return std::all_of(gid.begin(), gid.end(),
+                           [](uint8_t byte) { return byte == 0; });
+    };
+    if (!replay.valid)
+        return replay.qpGeneration == 0 && replay.localQpn == 0 &&
+            replay.remoteQpn == 0 && replay.finalPsn == 0 &&
+            replay.finalOpcode == rocev2::Opcode::SendOnly &&
+            replay.finalSegmentLength == 0 && replay.completedMsn == 0 &&
+            zero_mac(replay.localMac) && zero_mac(replay.remoteMac) &&
+            zero_gid(replay.localGid) && zero_gid(replay.remoteGid);
+    return replay.qpGeneration == qp.generation &&
+        !zero_mac(replay.localMac) && !zero_mac(replay.remoteMac) &&
+        !zero_gid(replay.localGid) && !zero_gid(replay.remoteGid) &&
+        replay.localQpn == qp.qpn && validQpn(replay.localQpn) &&
+        replay.remoteQpn == qp.attributes.destinationQpNumber &&
+        validQpn(replay.remoteQpn) &&
+        std::equal(replay.remoteMac.begin(), replay.remoteMac.end(),
+                   qp.attributes.addressHandle.destinationMac) &&
+        validPsn(replay.finalPsn) && finalOpcode(replay.finalOpcode) &&
+        replay.finalSegmentLength <= FixedMtu &&
+        (replay.finalOpcode != rocev2::Opcode::SendLast ||
+         replay.finalSegmentLength != 0) &&
+        !(replay.completedMsn & ~rocev2::Field24Mask) &&
+        replay.completedMsn == qp.responderMsn &&
+        advancePsn(replay.finalPsn) == qp.attributes.receivePsn;
 }
 
 inline bool
@@ -1288,7 +1713,7 @@ validQueueObjects(const CompletionQueueTable &cqs,
 
         const auto &qp = qps.entries[slot];
         if (!qp.valid) {
-            if (qp.generation > MaxGeneration + uint64_t{1} ||
+            if (qp.generation > MaxQpGeneration + uint64_t{1} ||
                 qp.qpHandle || qp.qpn || qp.pdHandle ||
                 qp.sendCqHandle || qp.recvCqHandle ||
                 qp.contextHandle || qp.uar || qp.sendChunks ||
@@ -1300,13 +1725,14 @@ validQueueObjects(const CompletionQueueTable &cqs,
                 qp.capabilities.reserved ||
                 !validStoredQpAttributes(qp) ||
                 qp.sqProducerTail || qp.sqConsumerHead ||
-                qp.rqProducerTail || qp.rqConsumerHead ||
-                !qp.pages.empty())
+                qp.rqProducerTail || qp.rqConsumerHead || qp.responderMsn ||
+                !validFinalReplay(qp) || !qp.pages.empty())
                 return false;
             continue;
         }
-        if (qp.generation > MaxGeneration || qp.qpHandle != slot ||
+        if (qp.generation > MaxQpGeneration || qp.qpHandle != slot ||
             qp.qpn != ((qp.generation << SlotBits) | slot) ||
+            !validQpn(qp.qpn) ||
             !qp.pdHandle || qp.pdHandle >= ObjectTableEntries ||
             !objects.pdAllocated[qp.pdHandle] || !qp.contextHandle ||
             objects.pdParent[qp.pdHandle] != qp.contextHandle ||
@@ -1335,6 +1761,8 @@ validQueueObjects(const CompletionQueueTable &cqs,
             qp.pages.size() != qp.totalChunks ||
             !validSupportedState(qp.state) ||
             !validStoredQpAttributes(qp) ||
+            (qp.responderMsn & ~rocev2::Field24Mask) ||
+            !validFinalReplay(qp) ||
             !ringSnapshotValid(qp.sqProducerTail, qp.sqConsumerHead,
                                qp.capabilities.maxSendWr) ||
             !ringSnapshotValid(qp.rqProducerTail, qp.rqConsumerHead,
@@ -1666,6 +2094,14 @@ queryPkey(const CommandRequest &request, CommandResponse &response)
     return {true, 0};
 }
 
+inline bool
+ipv4MappedGid(const uint8_t *gid)
+{
+    return std::all_of(gid, gid + 10,
+                       [](uint8_t byte) { return byte == 0; }) &&
+        gid[10] == 0xff && gid[11] == 0xff;
+}
+
 inline CommandResult
 createBind(const CommandRequest &request, GidTable &gids,
            GidValidTable &gid_valid)
@@ -1673,7 +2109,8 @@ createBind(const CommandRequest &request, GidTable &gids,
     const auto &bind = request.createBind;
     const uint32_t index = letoh(bind.index);
     if (letoh(request.header.reserved) != 0 || index >= GidTableEntries ||
-        letoh(bind.mtu) != FixedMtu || bind.gidType != GidTypeRoceV1)
+        letoh(bind.mtu) != FixedMtu || bind.gidType != GidTypeRoceV2 ||
+        ipv4MappedGid(bind.newGid))
         return {false, CommandError};
 
     std::copy(std::begin(bind.newGid), std::end(bind.newGid),
@@ -1908,7 +2345,7 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
                   QpAttrAlternatePath | QpAttrPathMigrationState |
                   QpAttrCapabilities)) &&
         convertQpAttrFromAbi(request.modifyQp.attributes, attrs) &&
-        validSupportedState(attrs.qpState);
+        validSupportedState(attrs.qpState) && attrs.qpState != QpState::Error;
     auto *qp = success ? &qps.entries[handle] : nullptr;
     if (success && (mask & QpAttrCurrentState))
         success = validSupportedState(attrs.currentQpState) &&
@@ -1922,6 +2359,8 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
             qp->attributes.capabilities = qp->capabilities;
             qp->sqProducerTail = qp->sqConsumerHead = 0;
             qp->rqProducerTail = qp->rqConsumerHead = 0;
+            qp->responderMsn = 0;
+            qp->finalReplay = {};
         }
     } else if (success && qp->state == QpState::Reset &&
                attrs.qpState == QpState::Init) {
@@ -1937,7 +2376,8 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
                attrs.qpState == QpState::ReadyToReceive) {
         success = transition_mask == RtrMask &&
             attrs.pathMtu == Mtu::Mtu1024 &&
-            attrs.destinationQpNumber &&
+            validQpn(attrs.destinationQpNumber) &&
+            validPsn(attrs.receivePsn) &&
             attrs.maxDestinationReadAtomic <= 1 &&
             attrs.minRnrTimer <= 31 &&
             validAddressVector(attrs.addressHandle);
@@ -1954,7 +2394,7 @@ modifyQp(const CommandRequest &request, CommandResponse &response,
         }
     } else if (success && qp->state == QpState::ReadyToReceive &&
                attrs.qpState == QpState::ReadyToSend) {
-        success = transition_mask == RtsMask &&
+        success = transition_mask == RtsMask && validPsn(attrs.sendPsn) &&
             attrs.maxReadAtomic <= 1 && attrs.timeout <= 31 &&
             attrs.retryCount <= 7 && attrs.rnrRetry <= 7;
         if (success) {
@@ -2111,6 +2551,60 @@ translate(const MemoryRegionTable &mrs, MrKeyType key_type, uint32_t key,
                              required_access, chunks);
 }
 
+inline bool
+acquireLocalMr(MemoryRegionTable &mrs, const QueuePair &qp, QueueKind kind,
+               uint32_t lkey, uint64_t address, uint64_t length,
+               MemoryRegionLease &lease)
+{
+    const uint32_t slot = lkey & MrSlotMask;
+    const uint32_t required_access = kind == QueueKind::Rq ?
+        AccessLocalWrite : 0;
+    if (!qp.valid || !qp.qpHandle || qp.qpHandle >= ObjectTableEntries ||
+        qp.generation > MaxQpGeneration || !validQpn(qp.qpn) ||
+        qp.qpn != ((qp.generation << SlotBits) | qp.qpHandle) ||
+        !qp.pdHandle || qp.pdHandle >= ObjectTableEntries || !slot ||
+        slot >= ObjectTableEntries ||
+        (kind != QueueKind::Sq && kind != QueueKind::Rq))
+        return false;
+
+    auto &mr = mrs.entries[slot];
+    if (!mr.valid || mr.generation > MaxMrGeneration ||
+        mr.mrHandle != ((mr.generation << MrSlotBits) | slot) ||
+        mr.lkey != lkey || mr.mrHandle != lkey ||
+        mr.pdHandle != qp.pdHandle ||
+        (mr.accessFlags & required_access) != required_access ||
+        mr.activeReferences == std::numeric_limits<uint32_t>::max())
+        return false;
+
+    std::vector<DmaChunk> chunks;
+    if (length) {
+        if (!detail::translate(mrs, MrKeyType::Local, lkey, address, length,
+                               required_access, chunks))
+            return false;
+    } else if (address < mr.start || address > mr.end) {
+        return false;
+    }
+
+    ++mr.activeReferences;
+    lease = {slot, mr.generation, std::move(chunks)};
+    return true;
+}
+
+inline bool
+releaseMr(MemoryRegionTable &mrs, const MemoryRegionLease &lease)
+{
+    if (!lease.slot || lease.slot >= ObjectTableEntries)
+        return false;
+    auto &mr = mrs.entries[lease.slot];
+    if (!mr.valid || mr.generation > MaxMrGeneration ||
+        mr.generation != lease.generation ||
+        mr.mrHandle != ((mr.generation << MrSlotBits) | lease.slot) ||
+        !mr.activeReferences)
+        return false;
+    --mr.activeReferences;
+    return true;
+}
+
 inline DeviceCaps
 makeCapabilities(uint32_t mac_low, uint32_t mac_high)
 {
@@ -2139,7 +2633,7 @@ makeCapabilities(uint32_t mac_low, uint32_t mac_high)
     caps.maxPkeys = htole(uint16_t{1});
     caps.physicalPortCount = 1;
     caps.mode = static_cast<uint8_t>(DeviceMode::Roce);
-    caps.gidTypes = GidTypeRoceV1;
+    caps.gidTypes = GidTypeRoceV2;
     return caps;
 }
 
@@ -2234,6 +2728,8 @@ class Pvrdma : public PciDevice
     PARAMS(Pvrdma);
     Pvrdma(const Params &params);
 
+    Port &getPort(const std::string &if_name,
+                  PortID idx = InvalidPortID) override;
     Tick read(PacketPtr pkt) override;
     Tick write(PacketPtr pkt) override;
     void startup() override;
@@ -2244,6 +2740,19 @@ class Pvrdma : public PciDevice
 
   private:
     friend class PvrdmaTester;
+
+    class Interface : public EtherInt
+    {
+      public:
+        Interface(const std::string &name, Pvrdma &device)
+            : EtherInt(name), device(device)
+        {}
+        bool recvPacket(EthPacketPtr packet) override;
+        void sendDone() override;
+
+      private:
+        Pvrdma &device;
+    } interface;
 
     pvrdma::RegisterState regs;
     pvrdma::ControlState controlState = pvrdma::ControlState::Unconfigured;
@@ -2273,6 +2782,7 @@ class Pvrdma : public PciDevice
     uint32_t objectTableIndex = 0;
     pvrdma::OperationErrorState operationError;
     bool intxAsserted = false;
+    const bool companionMacWordSwap;
     const Tick controlCompletionLatency;
 
     struct QueueDmaState
@@ -2313,6 +2823,100 @@ class Pvrdma : public PciDevice
         void reset() { *this = {}; }
     } completionDma;
 
+    struct TransportState
+    {
+        enum class Stage : uint8_t
+        {
+            Idle,
+            ReadSqWqe,
+            ReadSqPayload,
+            TryData,
+            WaitResponse,
+            RetryWait,
+            ReadRqWqe,
+            WriteRqPayload,
+            WaitReceiveData,
+            WaitReceiveCq,
+            WriteSqConsumer,
+            WriteRqConsumer,
+            TryAck,
+            TryRnr,
+            TryError,
+            WaitSendCq,
+        } stage = Stage::Idle;
+
+        pvrdma::QueueKind kind = pvrdma::QueueKind::None;
+        uint32_t qpHandle = 0;
+        uint32_t qpGeneration = 0;
+        uint32_t cqHandle = 0;
+        uint32_t cqGeneration = 0;
+        uint32_t consumer = 0;
+        uint32_t nextConsumer = 0;
+        uint32_t consumerLe = 0;
+        uint64_t wqeAddress = 0;
+        pvrdma::PreparedWqe wqe{};
+        pvrdma::MemoryRegionLease lease{};
+        bool leaseHeld = false;
+        bool dmaBusy = false;
+        bool completionBackpressured = false;
+        bool keepAfterControl = false;
+        bool terminalQpError = false;
+        bool retryPending = false;
+        bool rqWqeSelected = false;
+        bool hasAcceptedSegment = false;
+        size_t chunkIndex = 0;
+        size_t chunkOffset = 0;
+        size_t dmaPayloadOffset = 0;
+        size_t dmaRemaining = 0;
+        size_t dmaChunkLength = 0;
+        std::array<uint8_t, pvrdma::SqStride> sqSlot{};
+        std::array<uint8_t, pvrdma::RqStride> rqSlot{};
+        std::vector<uint8_t> payload;
+        EthPacketPtr packet;
+        pvrdma::rocev2::MacAddress localMac{};
+        pvrdma::rocev2::MacAddress remoteMac{};
+        pvrdma::rocev2::Gid localGid{};
+        pvrdma::rocev2::Gid remoteGid{};
+        uint32_t localQpn = 0;
+        uint32_t remoteQpn = 0;
+        uint32_t psn = 0;
+        uint32_t livePsn = 0;
+        uint32_t initialPsn = 0;
+        uint32_t acceptedPsn = 0;
+        uint32_t totalLength = 0;
+        uint16_t segmentIndex = 0;
+        uint16_t segmentCount = 0;
+        uint16_t acceptedSegmentIndex = 0;
+        pvrdma::rocev2::Opcode opcode = pvrdma::rocev2::Opcode::SendOnly;
+        pvrdma::rocev2::Opcode acceptedOpcode =
+            pvrdma::rocev2::Opcode::SendOnly;
+        uint16_t acceptedSegmentLength = 0;
+        uint32_t responseMsn = 0;
+        uint32_t lastAckMsn = 0;
+        uint8_t retryRemaining = 0;
+        uint8_t rnrRetryRemaining = 0;
+        pvrdma::rocev2::Syndrome responseSyndrome =
+            pvrdma::rocev2::Syndrome::Ack;
+        pvrdma::CompletionStatus status =
+            pvrdma::CompletionStatus::Success;
+
+        bool active() const { return stage != Stage::Idle; }
+        void reset() { *this = {}; }
+    } transport;
+
+    EthPacketPtr pendingRxPacket;
+    EthPacketPtr pendingErrorPacket;
+    bool transportPaused = false;
+    uint64_t receivePayloadDmaStarts = 0;
+    enum class TransportTimerKind : uint8_t
+    {
+        None,
+        Ack,
+        Rnr,
+        ReceiveIdle,
+    };
+    TransportTimerKind transportTimerKind = TransportTimerKind::None;
+
     struct QueueStats : public statistics::Group
     {
         QueueStats(Pvrdma &parent);
@@ -2330,6 +2934,8 @@ class Pvrdma : public PciDevice
         statistics::Scalar cqOutstandingAtReset;
         statistics::Scalar sqPosted;
         statistics::Scalar rqPosted;
+        statistics::Scalar sqConsumed;
+        statistics::Scalar rqConsumed;
         statistics::Scalar cqReclaimed;
         statistics::Scalar cqPublished;
         statistics::Scalar cqErrorPublished;
@@ -2367,9 +2973,11 @@ class Pvrdma : public PciDevice
     EventFunctionWrapper observationEvent;
     EventFunctionWrapper queueDmaEvent;
     EventFunctionWrapper completionDmaEvent;
+    EventFunctionWrapper transportEvent;
+    EventFunctionWrapper transportDmaEvent;
+    EventFunctionWrapper transportTimerEvent;
 
     bool observationQueued() const;
-    bool commandBlockedByObservation() const;
     bool completionBusy() const;
     bool validDoorbell(const pvrdma::Doorbell &doorbell) const;
     void writeDoorbell(uint64_t offset, PacketPtr pkt);
@@ -2386,6 +2994,49 @@ class Pvrdma : public PciDevice
     void refreshQueueGauges();
     void queueStatsReset();
     void checkQueueConservation();
+
+    bool transportActive() const;
+    bool transportDmaBusy() const;
+    bool terminalCompletionBackpressured() const;
+    bool runnableSq() const;
+    bool activeMr() const;
+    bool revalidateTransport(bool requireCq = false) const;
+    bool revalidateTransportLease() const;
+    bool receiveSegmentMatches(const pvrdma::rocev2::Packet &packet,
+                               bool accepted) const;
+    bool recvTransportPacket(EthPacketPtr packet);
+    void transportSendDone();
+    void scheduleTransport();
+    void runTransport();
+    void transportDmaDone();
+    bool selectSend();
+    void queueReverseError(const pvrdma::rocev2::Packet &received,
+                           pvrdma::rocev2::Syndrome syndrome,
+                           uint32_t responsePsn);
+    void startInbound();
+    void startTransportDma(bool write, uint64_t address, size_t size,
+                           uint8_t *data);
+    bool beginPayloadDma(bool write, size_t offset, size_t length);
+    void startPayloadDma(bool write);
+    void submitTransportCompletion();
+    void transportCompletionDone(pvrdma::CompletionSubmitResult result);
+    void failSend(pvrdma::CompletionStatus status =
+                      pvrdma::CompletionStatus::GeneralError,
+                  bool qpError = false);
+    void failReceive(pvrdma::CompletionStatus status, bool sendNak = false,
+                     pvrdma::rocev2::Syndrome syndrome =
+                         pvrdma::rocev2::Syndrome::RemoteOperationNak);
+    void prepareControl(pvrdma::rocev2::Syndrome syndrome,
+                        uint32_t responsePsn);
+    bool tryTransportPacket();
+    void publishConsumer(pvrdma::QueueKind kind);
+    void finishTransport(bool releaseLease = true);
+    void clearTransport();
+    void armTransportTimer(TransportTimerKind kind, Tick delay);
+    void cancelTransportTimer();
+    void transportTimerExpired();
+    bool handleInboundContinuation(const pvrdma::rocev2::Packet &packet);
+    bool replayFinal(const pvrdma::rocev2::Packet &packet);
 
     pvrdma::CompletionSubmitResult submitCompletion(
         const pvrdma::CompletionRecord &record,

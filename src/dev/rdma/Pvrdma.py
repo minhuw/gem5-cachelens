@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
+from m5.objects.Ethernet import EtherInt
 from m5.objects.PciDevice import PciDevice, PciMemBar
 from m5.params import *
 
@@ -25,8 +26,13 @@ class Pvrdma(PciDevice):
     BAR1 = PciMemBar(size="256B")
     BAR2 = PciMemBar(size="2MiB")
 
+    interface = EtherInt("PVRDMA Ethernet interface")
+
     hardware_address = Param.EthernetAddr(
         NextEthernetAddr, "PVRDMA MAC address"
+    )
+    companion_mac_word_swap = Param.Bool(
+        False, "Swap bytes within companion NIC EEPROM words"
     )
     control_completion_latency = Param.Latency(
         "10us", "Conservative DSR and command PIO completion latency"

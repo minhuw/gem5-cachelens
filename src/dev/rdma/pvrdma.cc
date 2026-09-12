@@ -6,6 +6,7 @@
 
 #include "base/logging.hh"
 #include "mem/packet_access.hh"
+#include "sim/core.hh"
 #include "sim/serialize.hh"
 
 namespace gem5
@@ -35,6 +36,10 @@ Pvrdma::QueueStats::QueueStats(Pvrdma &parent)
                "Observed SQ producer advances"),
       ADD_STAT(rqPosted, statistics::units::Count::get(),
                "Observed RQ producer advances"),
+      ADD_STAT(sqConsumed, statistics::units::Count::get(),
+               "Completed SQ consumer advances"),
+      ADD_STAT(rqConsumed, statistics::units::Count::get(),
+               "Completed RQ consumer advances"),
       ADD_STAT(cqReclaimed, statistics::units::Count::get(),
                "Observed CQ consumer advances"),
       ADD_STAT(cqPublished, statistics::units::Count::get(),
@@ -90,7 +95,9 @@ Pvrdma::QueueStats::preDumpStats()
 }
 
 Pvrdma::Pvrdma(const Params &p)
-    : PciDevice(p), controlCompletionLatency(p.control_completion_latency),
+    : PciDevice(p), interface(name() + ".interface", *this),
+      companionMacWordSwap(p.companion_mac_word_swap),
+      controlCompletionLatency(p.control_completion_latency),
       queueStats(*this),
       dsrReadEvent([this] { dsrReadDone(); }, name() + ".dsrRead"),
       capsWriteEvent([this] { capsWriteDone(); }, name() + ".capsWrite"),
@@ -110,7 +117,12 @@ Pvrdma::Pvrdma(const Params &p)
                   startCompletion();
               else
                   completionDmaDone();
-          }, name() + ".completionDma")
+          }, name() + ".completionDma"),
+      transportEvent([this] { runTransport(); }, name() + ".transport"),
+      transportDmaEvent([this] { transportDmaDone(); },
+                        name() + ".transportDma"),
+      transportTimerEvent([this] { transportTimerExpired(); },
+                          name() + ".transportTimer")
 {
     const auto *mac = p.hardware_address.bytes();
     regs.macLow = static_cast<uint32_t>(mac[0]) |
@@ -123,6 +135,14 @@ Pvrdma::Pvrdma(const Params &p)
     capabilities = pvrdma::makeCapabilities(regs.macLow, regs.macHigh);
     queueStatsReset();
     statistics::registerResetCallback([this] { queueStatsReset(); });
+}
+
+Port &
+Pvrdma::getPort(const std::string &if_name, PortID idx)
+{
+    if (if_name == "interface")
+        return interface;
+    return PciDevice::getPort(if_name, idx);
 }
 
 void
@@ -239,10 +259,16 @@ Pvrdma::write(PacketPtr pkt)
         updateInterrupt();
         break;
       case pvrdma::Register::MacLow:
-        regs.macLow = value;
+        if (transportActive())
+            operationError.set(regs.error, pvrdma::CommandError);
+        else
+            regs.macLow = value;
         break;
       case pvrdma::Register::MacHigh:
-        regs.writeMacHigh(value);
+        if (transportActive())
+            operationError.set(regs.error, pvrdma::CommandError);
+        else
+            regs.writeMacHigh(value);
         break;
       default:
         panic("Invalid writable PVRDMA register at offset %#x", offset);
@@ -262,12 +288,6 @@ bool
 Pvrdma::completionBusy() const
 {
     return completionDma.active() || completionDmaEvent.scheduled();
-}
-
-bool
-Pvrdma::commandBlockedByObservation() const
-{
-    return observationQueued() || queueDma.active() || completionBusy();
 }
 
 bool
@@ -299,6 +319,16 @@ Pvrdma::writeDoorbell(uint64_t offset, PacketPtr pkt)
         break;
       case pvrdma::DoorbellAction::CqPoll:
         queueStats.cqPollDoorbells++;
+        if (transport.active() && transport.cqHandle == doorbell.handle)
+            transport.completionBackpressured = false;
+        if (!pvrdma::cqPollNeedsObservation(
+                completionQueues.entries[doorbell.handle]) &&
+            !(completionDma.stage ==
+                  CompletionDmaState::Stage::PublishCqProducer &&
+              completionDma.record.cqHandle == doorbell.handle)) {
+            scheduleTransport();
+            return;
+        }
         break;
       case pvrdma::DoorbellAction::CqArmSolicited:
         queueStats.cqArmDoorbells++;
@@ -334,7 +364,8 @@ void
 Pvrdma::scheduleObservation()
 {
     if (controlState == pvrdma::ControlState::Active &&
-        !queueDma.active() && !completionBusy() && observationQueued() &&
+        !queueDma.active() && !completionBusy() && !transportDmaBusy() &&
+        observationQueued() &&
         !observationEvent.scheduled())
         schedule(observationEvent, nextCycle());
 }
@@ -410,14 +441,17 @@ Pvrdma::revalidateObservation() const
         depth == queueDma.depth && address == queueDma.ringAddress &&
         (kind == pvrdma::QueueKind::Sq ?
              qp.state == pvrdma::QpState::ReadyToSend :
-             qp.state != pvrdma::QpState::Reset);
+             (qp.state == pvrdma::QpState::Init ||
+              qp.state == pvrdma::QpState::ReadyToReceive ||
+              qp.state == pvrdma::QpState::ReadyToSend));
 }
 
 void
 Pvrdma::startObservation()
 {
     if (controlState != pvrdma::ControlState::Active ||
-        queueDma.active() || completionBusy() || !selectObservation())
+        queueDma.active() || completionBusy() || transportDmaBusy() ||
+        !selectObservation())
         return;
     if (!revalidateObservation() || !queueDma.ringAddress) {
         queueStats.ringObservationsRejected++;
@@ -484,9 +518,11 @@ Pvrdma::finishObservation()
 {
     queueDma.reset();
     scheduleObservation();
+    scheduleTransport();
     if (pvrdma::checkpointStable(controlState, dmaPending(),
                                  observationQueued(), queueDma.active(),
-                                 completionBusy()))
+                                 completionBusy(), transportActive(),
+                                 runnableSq(), activeMr()))
         signalDrainDone();
 }
 
@@ -580,12 +616,14 @@ Pvrdma::checkQueueConservation()
 {
     if (queueStats.sqOutstandingAtReset.value() +
             queueStats.sqPosted.value() !=
-        queueStats.sqResetDiscarded.value() +
+        queueStats.sqConsumed.value() +
+            queueStats.sqResetDiscarded.value() +
             queueStats.sqOutstanding.value())
         queueStats.conservationViolations++;
     if (queueStats.rqAvailableAtReset.value() +
             queueStats.rqPosted.value() !=
-        queueStats.rqResetDiscarded.value() +
+        queueStats.rqConsumed.value() +
+            queueStats.rqResetDiscarded.value() +
             queueStats.rqAvailable.value())
         queueStats.conservationViolations++;
     if (queueStats.cqOutstandingAtReset.value() +
@@ -597,6 +635,1476 @@ Pvrdma::checkQueueConservation()
     if (queueStats.cqErrorPublished.value() >
         queueStats.cqPublished.value())
         queueStats.conservationViolations++;
+}
+
+namespace
+{
+
+pvrdma::rocev2::MacAddress
+storedMac(const pvrdma::QueuePair &qp)
+{
+    pvrdma::rocev2::MacAddress mac;
+    std::copy_n(qp.attributes.addressHandle.destinationMac, mac.size(),
+                mac.begin());
+    return mac;
+}
+
+bool
+zeroGid(const pvrdma::rocev2::Gid &gid)
+{
+    return std::all_of(gid.begin(), gid.end(),
+                       [](uint8_t byte) { return byte == 0; });
+}
+
+pvrdma::rocev2::Gid
+linkLocalGid(const pvrdma::rocev2::MacAddress &mac)
+{
+    const uint32_t low = uint32_t{mac[0]} | (uint32_t{mac[1]} << 8) |
+        (uint32_t{mac[2]} << 16) | (uint32_t{mac[3]} << 24);
+    const uint32_t high = uint32_t{mac[4]} | (uint32_t{mac[5]} << 8);
+    const uint64_t guid = pvrdma::detail::macGuid(low, high);
+    pvrdma::rocev2::Gid gid{};
+    gid[0] = 0xfe;
+    gid[1] = 0x80;
+    for (size_t i = 0; i < 8; ++i)
+        gid[8 + i] = guid >> (56 - 8 * i);
+    return gid;
+}
+
+bool
+routeGids(const pvrdma::QueuePair &qp, const pvrdma::GidTable &gids,
+          const pvrdma::GidValidTable &valid,
+          const pvrdma::rocev2::MacAddress &local_mac,
+          pvrdma::rocev2::Gid &local_gid,
+          pvrdma::rocev2::Gid &remote_gid)
+{
+    const auto &route = qp.attributes.addressHandle.globalRoute;
+    const bool local_configured = route.sourceGidIndex < valid.size() &&
+        valid[route.sourceGidIndex];
+    std::copy_n(route.destinationGid.raw, remote_gid.size(),
+                remote_gid.begin());
+    const bool remote_configured = !zeroGid(remote_gid);
+    if (local_configured != remote_configured)
+        return false;
+    if (local_configured) {
+        std::copy_n(gids[route.sourceGidIndex].raw, local_gid.size(),
+                    local_gid.begin());
+    } else {
+        local_gid = linkLocalGid(local_mac);
+        remote_gid = linkLocalGid(storedMac(qp));
+    }
+    return !zeroGid(local_gid) &&
+        !pvrdma::detail::ipv4MappedGid(local_gid.data()) &&
+        !pvrdma::detail::ipv4MappedGid(remote_gid.data());
+}
+
+bool
+routeMatches(const pvrdma::QueuePair &qp,
+             const pvrdma::rocev2::Packet &packet,
+             const pvrdma::rocev2::MacAddress &local_mac,
+             const pvrdma::rocev2::Gid &local_gid,
+             const pvrdma::rocev2::Gid &remote_gid)
+{
+    return packet.destinationMac == local_mac &&
+        packet.destinationGid == local_gid && packet.sourceGid == remote_gid &&
+        packet.destinationQpn == qp.qpn &&
+        packet.pKey == pvrdma::FullMembershipPkey &&
+        (qp.state == pvrdma::QpState::ReadyToReceive ||
+         qp.state == pvrdma::QpState::ReadyToSend) &&
+        pvrdma::validQpn(qp.attributes.destinationQpNumber);
+}
+
+bool
+nakableShapeError(pvrdma::rocev2::CodecError error)
+{
+    using pvrdma::rocev2::CodecError;
+    switch (error) {
+      case CodecError::BadOpcode:
+      case CodecError::BadBthVersion:
+      case CodecError::BadReserved:
+      case CodecError::BadAckRequest:
+      case CodecError::BadIpv6Length:
+      case CodecError::BadUdpLength:
+      case CodecError::ExtraBytes:
+      case CodecError::BadPad:
+      case CodecError::BadPayloadLength:
+        return true;
+      default:
+        return false;
+    }
+}
+
+bool
+routeFromMalformed(const uint8_t *bytes, size_t length,
+                   pvrdma::rocev2::Packet &packet)
+{
+    using namespace pvrdma::rocev2;
+    if (!bytes || length < SendHeaderSize + IcrcSize ||
+        detail::get32Le(bytes, length - IcrcSize) !=
+            detail::icrc(bytes + EthernetHeaderSize,
+                         length - EthernetHeaderSize - IcrcSize) ||
+        detail::get16(bytes, EtherTypeOffset) != EtherType ||
+        (bytes[Ipv6Offset] >> 4) != 6 ||
+        bytes[Ipv6NextHeaderOffset] != Ipv6NextHeader ||
+        detail::get16(bytes, UdpDestinationPortOffset) !=
+            RoceUdpDestinationPort ||
+        detail::get16(bytes, UdpSourcePortOffset) < MinUdpSourcePort)
+        return false;
+    std::copy_n(bytes + EthernetDestinationOffset, 6,
+                packet.destinationMac.begin());
+    std::copy_n(bytes + EthernetSourceOffset, 6, packet.sourceMac.begin());
+    std::copy_n(bytes + Ipv6SourceOffset, 16, packet.sourceGid.begin());
+    std::copy_n(bytes + Ipv6DestinationOffset, 16,
+                packet.destinationGid.begin());
+    packet.trafficClass = ((bytes[Ipv6Offset] & 0x0f) << 4) |
+                          (bytes[Ipv6Offset + 1] >> 4);
+    packet.flowLabel = (uint32_t{bytes[Ipv6Offset + 1]} & 0x0f) << 16 |
+                       (uint32_t{bytes[Ipv6Offset + 2]} << 8) |
+                       bytes[Ipv6Offset + 3];
+    packet.hopLimit = bytes[Ipv6HopLimitOffset];
+    packet.sourcePort = detail::get16(bytes, UdpSourcePortOffset);
+    packet.pKey = detail::get16(bytes, BthPKeyOffset);
+    packet.opcode = static_cast<Opcode>(bytes[BthOffset]);
+    packet.destinationQpn = detail::get24(bytes, BthQpnOffset + 1);
+    packet.psn = detail::get24(bytes, BthPsnOffset);
+    return pvrdma::validQpn(packet.destinationQpn);
+}
+
+Tick
+saturatingTicks(uint64_t value, Tick scale)
+{
+    return pvrdma::saturatingMultiply(value, scale, MaxTick);
+}
+
+Tick
+ackDelay(uint8_t timeout)
+{
+    return saturatingTicks(pvrdma::ackTimeoutNanoseconds(timeout),
+                           sim_clock::as_int::ns);
+}
+
+// ponytail: the device-wide single receive flight is abandoned after this
+// local ceiling; move to per-QP receive timers if concurrent transport lands.
+constexpr uint8_t ReceiveIdleTimeoutEncoding = 10;
+
+Tick
+rnrDelay(uint8_t timer)
+{
+    return std::max<Tick>(saturatingTicks(pvrdma::RnrTimerMicros[timer],
+                                          sim_clock::as_int::us), 1);
+}
+
+Tick
+saturatingDeadline(Tick now, Tick delay)
+{
+    return pvrdma::saturatingAdd(now, delay, MaxTick);
+}
+
+} // anonymous namespace
+
+bool
+Pvrdma::Interface::recvPacket(EthPacketPtr packet)
+{
+    return device.recvTransportPacket(std::move(packet));
+}
+
+void
+Pvrdma::Interface::sendDone()
+{
+    device.transportSendDone();
+}
+
+bool
+Pvrdma::transportActive() const
+{
+    return transport.active() || transportEvent.scheduled() ||
+        transportTimerEvent.scheduled() || transport.dmaBusy ||
+        pendingRxPacket || pendingErrorPacket;
+}
+
+bool
+Pvrdma::transportDmaBusy() const
+{
+    return transport.dmaBusy || transportDmaEvent.scheduled();
+}
+
+bool
+Pvrdma::terminalCompletionBackpressured() const
+{
+    const auto stage = transport.kind == pvrdma::QueueKind::Rq ?
+        TransportState::Stage::WaitReceiveCq :
+        TransportState::Stage::WaitSendCq;
+    return transport.active() &&
+        (transport.kind == pvrdma::QueueKind::Rq ||
+         transport.kind == pvrdma::QueueKind::Sq) &&
+        transport.terminalQpError && transport.stage == stage &&
+        transport.completionBackpressured && !completionBusy() &&
+        !transportDmaBusy() && !dmaPending();
+}
+
+bool
+Pvrdma::activeMr() const
+{
+    return std::any_of(memoryRegions.entries.begin(),
+                       memoryRegions.entries.end(),
+                       [](const auto &mr) { return mr.activeReferences; });
+}
+
+bool
+Pvrdma::runnableSq() const
+{
+    for (uint32_t handle = 1; handle < pvrdma::ObjectTableEntries;
+         ++handle) {
+        const auto &qp = queuePairs.entries[handle];
+        if (qp.valid && qp.state == pvrdma::QpState::ReadyToSend &&
+            qp.sqProducerTail != qp.sqConsumerHead)
+            return true;
+    }
+    return false;
+}
+
+bool
+Pvrdma::revalidateTransport(bool require_cq) const
+{
+    if (controlState != pvrdma::ControlState::Active ||
+        !transport.qpHandle ||
+        transport.qpHandle >= pvrdma::ObjectTableEntries)
+        return false;
+    const auto &qp = queuePairs.entries[transport.qpHandle];
+    if (!qp.valid || qp.qpHandle != transport.qpHandle ||
+        qp.generation != transport.qpGeneration ||
+        qp.qpn != transport.localQpn ||
+        qp.attributes.destinationQpNumber != transport.remoteQpn ||
+        storedMac(qp) != transport.remoteMac)
+        return false;
+    pvrdma::rocev2::Gid local_gid{}, remote_gid{};
+    if (!routeGids(qp, gids, gidValid, transport.localMac,
+                   local_gid, remote_gid) ||
+        local_gid != transport.localGid || remote_gid != transport.remoteGid)
+        return false;
+    if (transport.kind == pvrdma::QueueKind::Sq) {
+        if (qp.state != pvrdma::QpState::ReadyToSend ||
+            qp.sendCqHandle != transport.cqHandle ||
+            qp.sqConsumerHead != transport.consumer ||
+            qp.attributes.sendPsn != transport.livePsn)
+            return false;
+    } else if (transport.kind == pvrdma::QueueKind::Rq) {
+        if ((qp.state != pvrdma::QpState::ReadyToReceive &&
+             qp.state != pvrdma::QpState::ReadyToSend) ||
+            qp.recvCqHandle != transport.cqHandle ||
+            qp.rqConsumerHead != transport.consumer ||
+            qp.attributes.receivePsn != transport.livePsn)
+            return false;
+    } else {
+        return false;
+    }
+    if (!require_cq)
+        return true;
+    if (!transport.cqHandle ||
+        transport.cqHandle >= pvrdma::ObjectTableEntries)
+        return false;
+    const auto &cq = completionQueues.entries[transport.cqHandle];
+    return cq.valid && cq.cqHandle == transport.cqHandle &&
+        cq.generation == transport.cqGeneration;
+}
+
+bool
+Pvrdma::revalidateTransportLease() const
+{
+    if (!transport.leaseHeld || !revalidateTransport())
+        return false;
+    const auto &lease = transport.lease;
+    if (!lease.slot || lease.slot >= pvrdma::ObjectTableEntries)
+        return false;
+    const auto &mr = memoryRegions.entries[lease.slot];
+    const auto &qp = queuePairs.entries[transport.qpHandle];
+    return mr.valid && mr.generation == lease.generation &&
+        mr.mrHandle == transport.wqe.lkey && mr.lkey == transport.wqe.lkey &&
+        mr.pdHandle == qp.pdHandle && mr.activeReferences;
+}
+
+bool
+Pvrdma::receiveSegmentMatches(const pvrdma::rocev2::Packet &frame,
+                              bool accepted) const
+{
+    if (!transport.active() || transport.kind != pvrdma::QueueKind::Rq ||
+        (accepted && !transport.hasAcceptedSegment) ||
+        frame.destinationMac != transport.localMac ||
+        frame.sourceGid != transport.remoteGid ||
+        frame.destinationGid != transport.localGid ||
+        frame.destinationQpn != transport.localQpn)
+        return false;
+
+    const auto opcode = accepted ? transport.acceptedOpcode :
+                                   transport.opcode;
+    const uint32_t psn = accepted ? transport.acceptedPsn : transport.psn;
+    const size_t index = accepted ? transport.acceptedSegmentIndex :
+                                    transport.segmentIndex;
+    const size_t offset = index * pvrdma::FixedMtu;
+    if (!accepted && offset > transport.totalLength)
+        return false;
+    const size_t length = accepted ? transport.acceptedSegmentLength :
+                                     transport.totalLength - offset;
+    return frame.opcode == opcode && frame.psn == psn &&
+        frame.payload.size == length &&
+        offset <= transport.payload.size() &&
+        length <= transport.payload.size() - offset &&
+        (!length || std::equal(frame.payload.data,
+                               frame.payload.data + length,
+                               transport.payload.begin() + offset));
+}
+
+bool
+Pvrdma::recvTransportPacket(EthPacketPtr packet)
+{
+    using namespace pvrdma::rocev2;
+    if (!packet)
+        return false;
+    if (packet->length > packet->bufLength || pendingRxPacket)
+        return true;
+    const auto decoded = decode({packet->data, packet->bufLength},
+                                packet->length);
+    if (!decoded) {
+        pvrdma::rocev2::Packet malformed;
+        if (nakableShapeError(decoded.error) &&
+            routeFromMalformed(packet->data, packet->length, malformed)) {
+            queueReverseError(malformed,
+                              pvrdma::rocev2::Syndrome::InvalidRequestNak,
+                              malformed.psn);
+            scheduleTransport();
+        }
+        return true;
+    }
+    const auto &frame = decoded.packet;
+    const auto local_mac = pvrdma::transportMac(regs, companionMacWordSwap);
+    if (frame.destinationMac != local_mac)
+        return true;
+
+    auto *qp = pvrdma::findQueuePair(queuePairs, frame.destinationQpn);
+    if (!qp)
+        return true;
+    Gid local_gid{}, remote_gid{};
+    if (!routeGids(*qp, gids, gidValid, local_mac, local_gid, remote_gid) ||
+        !routeMatches(*qp, frame, local_mac, local_gid, remote_gid)) {
+        queueReverseError(frame, Syndrome::InvalidRequestNak, frame.psn);
+        scheduleTransport();
+        return true;
+    }
+
+    const bool receive_owns_state = transport.active() &&
+        transport.kind == pvrdma::QueueKind::Rq &&
+        transport.stage != TransportState::Stage::WaitReceiveData;
+    if (receive_owns_state) {
+        if (receiveSegmentMatches(frame, false) ||
+            receiveSegmentMatches(frame, true))
+            return true;
+        if (!pendingRxPacket)
+            pendingRxPacket = std::move(packet);
+        return true;
+    }
+
+    if (frame.opcode == Opcode::Acknowledge) {
+        if (!transport.active() || transport.kind != pvrdma::QueueKind::Sq ||
+            transport.qpHandle != qp->qpHandle ||
+            transport.localGid != local_gid ||
+            transport.remoteGid != remote_gid)
+            return true;
+        const uint32_t distance = pvrdma::psnDistance(
+            transport.initialPsn, frame.psn);
+        const bool response_pending =
+            transport.stage == TransportState::Stage::WaitResponse ||
+            (transport.stage == TransportState::Stage::TryData &&
+             transport.retryPending);
+        if (!response_pending)
+            return true;
+        if (frame.syndrome != Syndrome::SequenceNak &&
+            distance != transport.segmentIndex)
+            return true;
+
+        cancelTransportTimer();
+        transport.retryPending = false;
+        transport.packet.reset();
+        const auto accept_current = [&] {
+            qp->attributes.sendPsn = pvrdma::advancePsn(
+                qp->attributes.sendPsn);
+            transport.livePsn = qp->attributes.sendPsn;
+            if (++transport.segmentIndex < transport.segmentCount) {
+                transport.psn = transport.livePsn;
+                transport.stage = TransportState::Stage::TryData;
+            } else {
+                transport.status = pvrdma::CompletionStatus::Success;
+                transport.stage = transport.wqe.signaled ?
+                    TransportState::Stage::WaitSendCq :
+                    TransportState::Stage::WriteSqConsumer;
+            }
+        };
+        if (!revalidateTransport(true)) {
+            failSend(pvrdma::CompletionStatus::GeneralError, true);
+        } else if (frame.syndrome == Syndrome::Ack) {
+            transport.lastAckMsn = frame.msn;
+            accept_current();
+        } else if (frame.syndrome == Syndrome::Rnr) {
+            if (pvrdma::useRetry(transport.rnrRetryRemaining)) {
+                transport.stage = TransportState::Stage::RetryWait;
+                armTransportTimer(TransportTimerKind::Rnr,
+                                  rnrDelay(frame.rnrTimer));
+            } else {
+                failSend(pvrdma::CompletionStatus::RnrRetryExceededError,
+                         true);
+            }
+        } else if (frame.syndrome == Syndrome::SequenceNak) {
+            const auto action = pvrdma::sequenceNakAction(
+                transport.initialPsn, transport.segmentIndex,
+                transport.segmentCount, frame.psn,
+                transport.retryRemaining);
+            if (action == pvrdma::SequenceNakAction::Advance) {
+                accept_current();
+            } else if (action == pvrdma::SequenceNakAction::Restart) {
+                transport.segmentIndex = pvrdma::psnDistance(
+                    transport.initialPsn, frame.psn);
+                transport.psn = frame.psn;
+                qp->attributes.sendPsn = frame.psn;
+                transport.livePsn = frame.psn;
+                transport.stage = TransportState::Stage::TryData;
+            } else if (action ==
+                       pvrdma::SequenceNakAction::RetryExceeded) {
+                failSend(pvrdma::CompletionStatus::RetryExceededError,
+                         true);
+            } else {
+                failSend(pvrdma::CompletionStatus::GeneralError, true);
+            }
+        } else {
+            const auto status = frame.syndrome == Syndrome::InvalidRequestNak ?
+                pvrdma::CompletionStatus::RemoteInvalidRequestError :
+                frame.syndrome == Syndrome::RemoteAccessNak ?
+                    pvrdma::CompletionStatus::RemoteAccessError :
+                    pvrdma::CompletionStatus::RemoteOperationError;
+            failSend(status, true);
+        }
+        scheduleTransport();
+        return true;
+    }
+
+    if (transport.active() && transport.kind == pvrdma::QueueKind::Rq)
+        return handleInboundContinuation(frame);
+    if (transport.active()) {
+        queueReverseError(frame, Syndrome::InvalidRequestNak, frame.psn);
+        scheduleTransport();
+        return true;
+    }
+    if (replayFinal(frame)) {
+        scheduleTransport();
+        return true;
+    }
+    pendingRxPacket = std::move(packet);
+    scheduleTransport();
+    return true;
+}
+
+bool
+Pvrdma::handleInboundContinuation(const pvrdma::rocev2::Packet &frame)
+{
+    using namespace pvrdma::rocev2;
+    const bool route = frame.destinationMac == transport.localMac &&
+        frame.sourceGid == transport.remoteGid &&
+        frame.destinationGid == transport.localGid &&
+        frame.destinationQpn == transport.localQpn;
+    if (!route) {
+        queueReverseError(frame, Syndrome::InvalidRequestNak,
+                          transport.livePsn);
+        return true;
+    }
+    if (transport.stage == TransportState::Stage::WriteRqPayload &&
+        receiveSegmentMatches(frame, false))
+        return true;
+    if (receiveSegmentMatches(frame, true)) {
+        if (transport.stage == TransportState::Stage::WaitReceiveData) {
+            transport.responseMsn = queuePairs.entries[
+                transport.qpHandle].responderMsn;
+            transport.keepAfterControl = true;
+            prepareControl(Syndrome::Ack, frame.psn);
+        }
+        return true;
+    }
+    if (frame.psn != transport.livePsn) {
+        const uint32_t distance = pvrdma::psnDistance(
+            transport.livePsn, frame.psn);
+        if (distance < (uint32_t{1} << 23)) {
+            transport.keepAfterControl = true;
+            prepareControl(Syndrome::SequenceNak, transport.livePsn);
+        } else {
+            failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
+                        true, Syndrome::InvalidRequestNak);
+        }
+        return true;
+    }
+    if (transport.stage != TransportState::Stage::WaitReceiveData ||
+        !pvrdma::continuationOpcode(frame.opcode)) {
+        failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
+                    true, Syndrome::InvalidRequestNak);
+        return true;
+    }
+    if (frame.payload.size > transport.wqe.length ||
+        transport.totalLength > transport.wqe.length - frame.payload.size) {
+        failReceive(pvrdma::CompletionStatus::LocalLengthError,
+                    true, Syndrome::InvalidRequestNak);
+        return true;
+    }
+
+    cancelTransportTimer();
+    const size_t offset = transport.totalLength;
+    transport.psn = frame.psn;
+    transport.opcode = frame.opcode;
+    ++transport.segmentIndex;
+    transport.payload.insert(transport.payload.end(), frame.payload.data,
+                             frame.payload.data + frame.payload.size);
+    transport.totalLength += frame.payload.size;
+    if (!frame.payload.size ||
+        !beginPayloadDma(true, offset, frame.payload.size)) {
+        transport.payload.resize(offset);
+        transport.totalLength = offset;
+        failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
+                    true, Syndrome::RemoteOperationNak);
+    }
+    scheduleTransport();
+    return true;
+}
+
+bool
+Pvrdma::replayFinal(const pvrdma::rocev2::Packet &frame)
+{
+    auto *qp = pvrdma::findQueuePair(queuePairs, frame.destinationQpn);
+    if (!qp || !pvrdma::finalOpcode(frame.opcode))
+        return false;
+    const auto &replay = qp->finalReplay;
+    if (!replay.valid || replay.qpGeneration != qp->generation ||
+        replay.localMac != frame.destinationMac ||
+        replay.localGid != frame.destinationGid ||
+        replay.remoteGid != frame.sourceGid ||
+        replay.localQpn != frame.destinationQpn ||
+        replay.finalPsn != frame.psn || replay.finalOpcode != frame.opcode ||
+        replay.finalSegmentLength != frame.payload.size)
+        return false;
+
+    transport.reset();
+    transport.kind = pvrdma::QueueKind::Rq;
+    transport.qpHandle = qp->qpHandle;
+    transport.qpGeneration = qp->generation;
+    transport.cqHandle = qp->recvCqHandle;
+    transport.cqGeneration = completionQueues.entries[
+        qp->recvCqHandle].generation;
+    transport.consumer = qp->rqConsumerHead;
+    transport.localMac = replay.localMac;
+    transport.remoteMac = replay.remoteMac;
+    transport.localGid = replay.localGid;
+    transport.remoteGid = replay.remoteGid;
+    transport.localQpn = replay.localQpn;
+    transport.remoteQpn = replay.remoteQpn;
+    transport.psn = transport.acceptedPsn = replay.finalPsn;
+    transport.livePsn = qp->attributes.receivePsn;
+    transport.opcode = transport.acceptedOpcode = replay.finalOpcode;
+    transport.acceptedSegmentLength = replay.finalSegmentLength;
+    transport.hasAcceptedSegment = true;
+    transport.responseMsn = replay.completedMsn;
+    transport.stage = TransportState::Stage::TryAck;
+    return true;
+}
+
+void
+Pvrdma::transportSendDone()
+{
+    scheduleTransport();
+}
+
+void
+Pvrdma::scheduleTransport()
+{
+    if (transportPaused || controlState != pvrdma::ControlState::Active ||
+        transportDmaBusy() || queueDma.active() || completionBusy() ||
+        dmaPending() || observationQueued() ||
+        (transport.completionBackpressured && !pendingErrorPacket) ||
+        transportEvent.scheduled())
+        return;
+    if (transport.active() || pendingRxPacket || pendingErrorPacket ||
+        runnableSq())
+        schedule(transportEvent, nextCycle());
+}
+
+bool
+Pvrdma::selectSend()
+{
+    // ponytail: one device-wide flight; add per-QP scheduling only when
+    // concurrent transport is required.
+    const uint32_t first = observationCursor % pvrdma::ObjectTableEntries;
+    for (uint32_t i = 0; i < pvrdma::ObjectTableEntries; ++i) {
+        const uint32_t handle = (first + i) % pvrdma::ObjectTableEntries;
+        if (!handle)
+            continue;
+        auto &qp = queuePairs.entries[handle];
+        if (!qp.valid || qp.state != pvrdma::QpState::ReadyToSend ||
+            qp.sqProducerTail == qp.sqConsumerHead)
+            continue;
+        transport.reset();
+        transport.kind = pvrdma::QueueKind::Sq;
+        transport.stage = TransportState::Stage::ReadSqWqe;
+        transport.qpHandle = handle;
+        transport.qpGeneration = qp.generation;
+        transport.cqHandle = qp.sendCqHandle;
+        transport.cqGeneration = completionQueues.entries[
+            qp.sendCqHandle].generation;
+        transport.consumer = qp.sqConsumerHead;
+        transport.nextConsumer = pvrdma::ringAdvance(
+            transport.consumer, qp.capabilities.maxSendWr);
+        transport.consumerLe = htole(transport.nextConsumer);
+        transport.localMac = pvrdma::transportMac(
+            regs, companionMacWordSwap);
+        transport.remoteMac = storedMac(qp);
+        transport.localQpn = qp.qpn;
+        transport.remoteQpn = qp.attributes.destinationQpNumber;
+        transport.psn = transport.initialPsn = qp.attributes.sendPsn;
+        transport.livePsn = transport.psn;
+        transport.retryRemaining = qp.attributes.retryCount;
+        transport.rnrRetryRemaining = qp.attributes.rnrRetry;
+        observationCursor = (handle + 1) % pvrdma::ObjectTableEntries;
+        if (!routeGids(qp, gids, gidValid, transport.localMac,
+                       transport.localGid, transport.remoteGid) ||
+            !pvrdma::validQpn(transport.localQpn) ||
+            !pvrdma::validQpn(transport.remoteQpn) ||
+            !pvrdma::wqeAddress(qp, pvrdma::QueueKind::Sq,
+                                transport.consumer,
+                                transport.wqeAddress)) {
+            failSend(pvrdma::CompletionStatus::GeneralError, true);
+            return true;
+        }
+        startTransportDma(false, transport.wqeAddress,
+                          transport.sqSlot.size(), transport.sqSlot.data());
+        return true;
+    }
+    return false;
+}
+
+void
+Pvrdma::queueReverseError(const pvrdma::rocev2::Packet &received,
+                          pvrdma::rocev2::Syndrome syndrome,
+                          uint32_t response_psn)
+{
+    using namespace pvrdma::rocev2;
+    if (pendingErrorPacket || received.opcode == Opcode::Acknowledge)
+        return;
+    auto *qp = pvrdma::findQueuePair(queuePairs, received.destinationQpn);
+    if (!qp)
+        return;
+    Gid local_gid{}, remote_gid{};
+    const auto local_mac = pvrdma::transportMac(regs, companionMacWordSwap);
+    if (!routeGids(*qp, gids, gidValid, local_mac, local_gid, remote_gid) ||
+        !routeMatches(*qp, received, local_mac, local_gid, remote_gid))
+        return;
+    pvrdma::rocev2::Packet error;
+    error.destinationMac = storedMac(*qp);
+    error.sourceMac = local_mac;
+    error.destinationGid = received.sourceGid;
+    error.sourceGid = local_gid;
+    error.opcode = Opcode::Acknowledge;
+    error.ackRequest = false;
+    error.destinationQpn = qp->attributes.destinationQpNumber;
+    error.psn = response_psn;
+    const auto &route = qp->attributes.addressHandle.globalRoute;
+    error.trafficClass = route.trafficClass;
+    error.flowLabel = route.flowLabel;
+    error.hopLimit = route.hopLimit ? route.hopLimit : 0xff;
+    error.sourcePort = udpSourcePort(error.flowLabel, qp->qpn,
+                                     error.destinationQpn);
+    error.syndrome = syndrome;
+    error.ackCredit = 31;
+    error.rnrTimer = syndrome == Syndrome::Rnr ?
+        qp->attributes.minRnrTimer : 0;
+    error.msn = qp->responderMsn;
+    pendingErrorPacket = std::make_shared<EthPacketData>(ControlFrameSize);
+    const auto encoded = encode(error, {pendingErrorPacket->data,
+                                        pendingErrorPacket->bufLength});
+    if (!encoded) {
+        pendingErrorPacket.reset();
+        return;
+    }
+    pendingErrorPacket->length = pendingErrorPacket->simLength = encoded.size;
+}
+
+void
+Pvrdma::startInbound()
+{
+    using namespace pvrdma::rocev2;
+    if (!pendingRxPacket || transport.active())
+        return;
+    const EthPacketPtr packet = std::move(pendingRxPacket);
+    const auto decoded = decode({packet->data, packet->bufLength},
+                                packet->length);
+    if (!decoded || decoded.packet.opcode == Opcode::Acknowledge)
+        return;
+    const auto &frame = decoded.packet;
+    if (replayFinal(frame)) {
+        scheduleTransport();
+        return;
+    }
+    auto *qp = pvrdma::findQueuePair(queuePairs, frame.destinationQpn);
+    if (!qp)
+        return;
+    const auto local_mac = pvrdma::transportMac(regs, companionMacWordSwap);
+    Gid local_gid{}, remote_gid{};
+    if (!routeGids(*qp, gids, gidValid, local_mac, local_gid, remote_gid) ||
+        !routeMatches(*qp, frame, local_mac, local_gid, remote_gid)) {
+        queueReverseError(frame, Syndrome::InvalidRequestNak, frame.psn);
+        scheduleTransport();
+        return;
+    }
+    if (!pvrdma::startingOpcode(frame.opcode)) {
+        queueReverseError(frame, Syndrome::InvalidRequestNak,
+                          qp->attributes.receivePsn);
+        scheduleTransport();
+        return;
+    }
+    if (frame.psn != qp->attributes.receivePsn) {
+        const uint32_t distance = pvrdma::psnDistance(
+            qp->attributes.receivePsn, frame.psn);
+        queueReverseError(frame, distance < (uint32_t{1} << 23) ?
+                               Syndrome::SequenceNak :
+                               Syndrome::InvalidRequestNak,
+                          qp->attributes.receivePsn);
+        scheduleTransport();
+        return;
+    }
+    if (qp->rqProducerTail == qp->rqConsumerHead) {
+        queueReverseError(frame, Syndrome::Rnr, frame.psn);
+        scheduleTransport();
+        return;
+    }
+
+    transport.reset();
+    transport.kind = pvrdma::QueueKind::Rq;
+    transport.qpHandle = qp->qpHandle;
+    transport.qpGeneration = qp->generation;
+    transport.cqHandle = qp->recvCqHandle;
+    transport.cqGeneration = completionQueues.entries[
+        qp->recvCqHandle].generation;
+    transport.consumer = qp->rqConsumerHead;
+    transport.nextConsumer = pvrdma::ringAdvance(
+        transport.consumer, qp->capabilities.maxRecvWr);
+    transport.consumerLe = htole(transport.nextConsumer);
+    transport.localMac = local_mac;
+    transport.remoteMac = storedMac(*qp);
+    transport.localGid = local_gid;
+    transport.remoteGid = remote_gid;
+    transport.localQpn = qp->qpn;
+    transport.remoteQpn = qp->attributes.destinationQpNumber;
+    transport.psn = frame.psn;
+    transport.livePsn = qp->attributes.receivePsn;
+    transport.opcode = frame.opcode;
+    transport.totalLength = frame.payload.size;
+    transport.payload.assign(frame.payload.data,
+                             frame.payload.data + frame.payload.size);
+    transport.stage = TransportState::Stage::ReadRqWqe;
+    if (!pvrdma::wqeAddress(*qp, pvrdma::QueueKind::Rq,
+                            transport.consumer, transport.wqeAddress)) {
+        prepareControl(Syndrome::RemoteOperationNak, frame.psn);
+        return;
+    }
+    startTransportDma(false, transport.wqeAddress,
+                      transport.rqSlot.size(), transport.rqSlot.data());
+}
+
+void
+Pvrdma::startTransportDma(bool write, uint64_t address, size_t size,
+                          uint8_t *data)
+{
+    panic_if(transport.dmaBusy || dmaPending(),
+             "PVRDMA overlapping transport DMA");
+    transport.dmaBusy = true;
+    if (write) {
+        dmaWrite(pciToDma(address), size,
+                 sys->isAtomicMode() ? nullptr : &transportDmaEvent, data);
+    } else {
+        dmaRead(pciToDma(address), size,
+                sys->isAtomicMode() ? nullptr : &transportDmaEvent, data);
+    }
+    if (sys->isAtomicMode())
+        transportDmaDone();
+}
+
+bool
+Pvrdma::beginPayloadDma(bool write, size_t offset, size_t length)
+{
+    if (!revalidateTransportLease() ||
+        !pvrdma::leaseRange(transport.lease, offset, length,
+                            transport.chunkIndex, transport.chunkOffset))
+        return false;
+    transport.dmaPayloadOffset = offset;
+    transport.dmaRemaining = length;
+    if (!length)
+        return true;
+    if (write)
+        ++receivePayloadDmaStarts;
+    transport.stage = write ? TransportState::Stage::WriteRqPayload :
+                              TransportState::Stage::ReadSqPayload;
+    startPayloadDma(write);
+    return true;
+}
+
+void
+Pvrdma::startPayloadDma(bool write)
+{
+    if (!revalidateTransportLease() || !transport.dmaRemaining ||
+        transport.chunkIndex >= transport.lease.chunks.size()) {
+        if (transport.kind == pvrdma::QueueKind::Sq) {
+            failSend(pvrdma::CompletionStatus::GeneralError, true);
+        } else {
+            failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
+                        true,
+                        pvrdma::rocev2::Syndrome::RemoteOperationNak);
+        }
+        scheduleTransport();
+        return;
+    }
+    const auto &chunk = transport.lease.chunks[transport.chunkIndex];
+    transport.dmaChunkLength = std::min(
+        transport.dmaRemaining, chunk.length - transport.chunkOffset);
+    startTransportDma(write, chunk.address + transport.chunkOffset,
+                      transport.dmaChunkLength,
+                      transport.payload.data() + transport.dmaPayloadOffset);
+}
+
+void
+Pvrdma::failSend(pvrdma::CompletionStatus status, bool qp_error)
+{
+    cancelTransportTimer();
+    transport.status = status;
+    transport.packet.reset();
+    transport.completionBackpressured = false;
+    transport.keepAfterControl = false;
+    transport.retryPending = false;
+    transport.terminalQpError = qp_error;
+    transport.stage = TransportState::Stage::WaitSendCq;
+}
+
+void
+Pvrdma::failReceive(pvrdma::CompletionStatus status, bool send_nak,
+                    pvrdma::rocev2::Syndrome syndrome)
+{
+    if (!transport.rqWqeSelected) {
+        if (send_nak)
+            prepareControl(syndrome, transport.livePsn);
+        else
+            finishTransport();
+        return;
+    }
+    cancelTransportTimer();
+    transport.status = status;
+    transport.packet.reset();
+    transport.completionBackpressured = false;
+    transport.keepAfterControl = false;
+    transport.retryPending = false;
+    transport.terminalQpError = true;
+    if (transport.qpHandle &&
+        transport.qpHandle < pvrdma::ObjectTableEntries)
+        queuePairs.entries[transport.qpHandle].finalReplay = {};
+    if (send_nak) {
+        prepareControl(syndrome, transport.livePsn);
+    } else {
+        transport.stage = TransportState::Stage::WaitReceiveCq;
+        scheduleTransport();
+    }
+}
+
+void
+Pvrdma::prepareControl(pvrdma::rocev2::Syndrome syndrome,
+                       uint32_t response_psn)
+{
+    transport.responseSyndrome = syndrome;
+    transport.psn = response_psn;
+    transport.packet.reset();
+    if (transport.qpHandle &&
+        transport.qpHandle < pvrdma::ObjectTableEntries) {
+        transport.responseMsn = queuePairs.entries[
+            transport.qpHandle].responderMsn;
+    }
+    transport.stage = syndrome == pvrdma::rocev2::Syndrome::Ack ?
+        TransportState::Stage::TryAck :
+        syndrome == pvrdma::rocev2::Syndrome::Rnr ?
+            TransportState::Stage::TryRnr :
+            TransportState::Stage::TryError;
+    scheduleTransport();
+}
+
+bool
+Pvrdma::tryTransportPacket()
+{
+    using namespace pvrdma::rocev2;
+    const bool data = transport.stage == TransportState::Stage::TryData;
+    if (data && !revalidateTransportLease()) {
+        failSend(pvrdma::CompletionStatus::GeneralError, true);
+        scheduleTransport();
+        return false;
+    }
+    if ((transport.stage == TransportState::Stage::TryAck ||
+         transport.stage == TransportState::Stage::TryError) &&
+        transport.leaseHeld && !transport.terminalQpError &&
+        !revalidateTransportLease()) {
+        failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
+                    true, Syndrome::RemoteOperationNak);
+        return false;
+    }
+    if (transport.stage == TransportState::Stage::TryRnr &&
+        !revalidateTransport()) {
+        finishTransport();
+        return false;
+    }
+    const auto fail_control = [this] {
+        transport.packet.reset();
+        if (transport.kind == pvrdma::QueueKind::Rq &&
+            transport.terminalQpError) {
+            transport.stage = TransportState::Stage::WaitReceiveCq;
+        } else if (transport.kind == pvrdma::QueueKind::Rq &&
+                   transport.rqWqeSelected && transport.keepAfterControl) {
+            failReceive(pvrdma::CompletionStatus::LocalQpOperationError);
+        } else {
+            finishTransport();
+        }
+    };
+    if (!transport.packet) {
+        pvrdma::rocev2::Packet frame;
+        frame.destinationMac = transport.remoteMac;
+        frame.sourceMac = transport.localMac;
+        frame.destinationGid = transport.remoteGid;
+        frame.sourceGid = transport.localGid;
+        frame.destinationQpn = transport.remoteQpn;
+        frame.psn = transport.psn;
+        frame.trafficClass = queuePairs.entries[
+            transport.qpHandle].attributes.addressHandle.globalRoute.
+                trafficClass;
+        frame.flowLabel = queuePairs.entries[
+            transport.qpHandle].attributes.addressHandle.globalRoute.
+                flowLabel;
+        frame.hopLimit = queuePairs.entries[
+            transport.qpHandle].attributes.addressHandle.globalRoute.
+                hopLimit;
+        if (!frame.hopLimit)
+            frame.hopLimit = 0xff;
+        frame.sourcePort = udpSourcePort(frame.flowLabel,
+                                         transport.localQpn,
+                                         transport.remoteQpn);
+        if (data) {
+            const size_t offset = size_t{transport.segmentIndex} *
+                pvrdma::FixedMtu;
+            const size_t length = transport.totalLength == 0 ? 0 :
+                std::min<size_t>(pvrdma::FixedMtu,
+                                 transport.totalLength - offset);
+            frame.opcode = pvrdma::sendOpcode(transport.segmentIndex,
+                                               transport.segmentCount);
+            frame.ackRequest = true;
+            frame.payload = {length ? transport.payload.data() + offset :
+                                      nullptr,
+                             length};
+        } else {
+            frame.opcode = Opcode::Acknowledge;
+            frame.ackRequest = false;
+            frame.syndrome = transport.responseSyndrome;
+            frame.ackCredit = 31;
+            if (frame.syndrome == Syndrome::Rnr) {
+                frame.rnrTimer = queuePairs.entries[
+                    transport.qpHandle].attributes.minRnrTimer;
+            }
+            frame.msn = transport.responseMsn;
+        }
+        const size_t size = encodedSize(frame);
+        transport.packet = std::make_shared<EthPacketData>(size);
+        const auto encoded = encode(
+            frame, {transport.packet->data, transport.packet->bufLength});
+        if (!encoded) {
+            if (data)
+                failSend(pvrdma::CompletionStatus::GeneralError, true);
+            else
+                fail_control();
+            scheduleTransport();
+            return false;
+        }
+        transport.packet->length = encoded.size;
+        transport.packet->simLength = encoded.size;
+    }
+    if (!interface.getPeer()) {
+        if (data)
+            failSend(pvrdma::CompletionStatus::GeneralError, true);
+        else
+            fail_control();
+        scheduleTransport();
+        return false;
+    }
+    if (!interface.sendPacket(transport.packet))
+        return false;
+    transport.packet.reset();
+    if (data) {
+        transport.retryPending = false;
+        transport.stage = TransportState::Stage::WaitResponse;
+        const auto &qp = queuePairs.entries[transport.qpHandle];
+        const Tick delay = ackDelay(qp.attributes.timeout);
+        if (delay)
+            armTransportTimer(TransportTimerKind::Ack, delay);
+    } else if (transport.kind == pvrdma::QueueKind::Rq &&
+               transport.terminalQpError) {
+        transport.stage = TransportState::Stage::WaitReceiveCq;
+        scheduleTransport();
+    } else if (transport.keepAfterControl) {
+        transport.keepAfterControl = false;
+        transport.stage = TransportState::Stage::WaitReceiveData;
+        if (transport.kind == pvrdma::QueueKind::Rq &&
+            transport.hasAcceptedSegment &&
+            !pvrdma::finalOpcode(transport.acceptedOpcode)) {
+            armTransportTimer(TransportTimerKind::ReceiveIdle,
+                              ackDelay(ReceiveIdleTimeoutEncoding));
+        }
+        scheduleTransport();
+    } else {
+        finishTransport();
+    }
+    return true;
+}
+
+void
+Pvrdma::submitTransportCompletion()
+{
+    if (!revalidateTransport(true)) {
+        if (transport.kind == pvrdma::QueueKind::Sq)
+            finishTransport();
+        else
+            prepareControl(pvrdma::rocev2::Syndrome::RemoteOperationNak,
+                           transport.livePsn);
+        return;
+    }
+    pvrdma::CompletionRecord record;
+    record.cqHandle = transport.cqHandle;
+    record.qpHandle = transport.qpHandle;
+    record.cqGeneration = transport.cqGeneration;
+    record.qpGeneration = transport.qpGeneration;
+    record.workRequestId = transport.wqe.workRequestId;
+    record.opcode = transport.kind == pvrdma::QueueKind::Sq ?
+        pvrdma::CompletionOpcode::Send : pvrdma::CompletionOpcode::Receive;
+    record.status = transport.status;
+    if (transport.kind == pvrdma::QueueKind::Rq) {
+        record.byteLength = transport.totalLength;
+        record.sourceQp = transport.remoteQpn;
+    }
+    const auto result = submitCompletion(record, [this](auto completed) {
+        transportCompletionDone(completed);
+    });
+    if (result == pvrdma::CompletionSubmitResult::Busy)
+        scheduleObservation();
+    else if (result == pvrdma::CompletionSubmitResult::Rejected)
+        transportCompletionDone(result);
+}
+
+void
+Pvrdma::transportCompletionDone(pvrdma::CompletionSubmitResult result)
+{
+    if (!transport.active())
+        return;
+    const auto expected = transport.kind == pvrdma::QueueKind::Sq ?
+        TransportState::Stage::WaitSendCq :
+        TransportState::Stage::WaitReceiveCq;
+    if (transport.stage != expected)
+        return;
+    if (result == pvrdma::CompletionSubmitResult::Backpressured) {
+        transport.completionBackpressured = true;
+        return;
+    }
+    if (result == pvrdma::CompletionSubmitResult::Rejected) {
+        if (revalidateTransport(true)) {
+            transport.completionBackpressured = true;
+        } else {
+            finishTransport();
+        }
+        return;
+    }
+    if (result != pvrdma::CompletionSubmitResult::Published)
+        return;
+    if (transport.kind == pvrdma::QueueKind::Sq) {
+        transport.stage = TransportState::Stage::WriteSqConsumer;
+    } else {
+        panic_if(!revalidateTransport(true),
+                 "PVRDMA receive completion lost its QP");
+        transport.stage = TransportState::Stage::WriteRqConsumer;
+    }
+    scheduleTransport();
+}
+
+void
+Pvrdma::publishConsumer(pvrdma::QueueKind kind)
+{
+    if (!revalidateTransport() ||
+        (transport.leaseHeld && !transport.terminalQpError &&
+         !revalidateTransportLease())) {
+        if (kind == pvrdma::QueueKind::Sq)
+            finishTransport();
+        else
+            prepareControl(pvrdma::rocev2::Syndrome::RemoteOperationNak,
+                           transport.livePsn);
+        return;
+    }
+    uint64_t address = 0;
+    if (!pvrdma::queueConsumerAddress(
+            queuePairs.entries[transport.qpHandle], kind, address)) {
+        if (kind == pvrdma::QueueKind::Sq)
+            failSend();
+        else
+            prepareControl(pvrdma::rocev2::Syndrome::RemoteOperationNak,
+                           transport.livePsn);
+        return;
+    }
+    startTransportDma(true, address, sizeof(transport.consumerLe),
+                      reinterpret_cast<uint8_t *>(&transport.consumerLe));
+}
+
+void
+Pvrdma::finishTransport(bool release_lease)
+{
+    cancelTransportTimer();
+    if (release_lease && transport.leaseHeld) {
+        if (!pvrdma::releaseMr(memoryRegions, transport.lease))
+            operationError.set(regs.error, pvrdma::CommandError);
+        transport.leaseHeld = false;
+    }
+    transport.reset();
+    scheduleObservation();
+    scheduleTransport();
+    if (pvrdma::checkpointStable(controlState, dmaPending(),
+                                 observationQueued(), queueDma.active(),
+                                 completionBusy(), transportActive(),
+                                 runnableSq(), activeMr()))
+        signalDrainDone();
+}
+
+void
+Pvrdma::clearTransport()
+{
+    if (transportEvent.scheduled())
+        deschedule(transportEvent);
+    cancelTransportTimer();
+    panic_if(transport.dmaBusy || transport.leaseHeld,
+             "PVRDMA cleared active transport resources");
+    transport.reset();
+    pendingRxPacket.reset();
+    pendingErrorPacket.reset();
+}
+
+void
+Pvrdma::armTransportTimer(TransportTimerKind kind, Tick delay)
+{
+    cancelTransportTimer();
+    transportTimerKind = kind;
+    schedule(transportTimerEvent, saturatingDeadline(curTick(), delay));
+}
+
+void
+Pvrdma::cancelTransportTimer()
+{
+    if (transportTimerEvent.scheduled())
+        deschedule(transportTimerEvent);
+    transportTimerKind = TransportTimerKind::None;
+}
+
+void
+Pvrdma::transportTimerExpired()
+{
+    const auto kind = transportTimerKind;
+    transportTimerKind = TransportTimerKind::None;
+    if (!transport.active())
+        return;
+    if (transport.kind == pvrdma::QueueKind::Rq) {
+        if (kind == TransportTimerKind::ReceiveIdle &&
+            transport.stage == TransportState::Stage::WaitReceiveData) {
+            failReceive(pvrdma::CompletionStatus::LocalQpOperationError);
+        }
+        return;
+    }
+    if (transport.kind != pvrdma::QueueKind::Sq)
+        return;
+    if (kind == TransportTimerKind::Rnr &&
+        transport.stage == TransportState::Stage::RetryWait) {
+        transport.retryPending = true;
+        transport.stage = TransportState::Stage::TryData;
+    } else if (kind == TransportTimerKind::Ack &&
+               transport.stage == TransportState::Stage::WaitResponse) {
+        if (pvrdma::useRetry(transport.retryRemaining)) {
+            transport.retryPending = true;
+            transport.stage = TransportState::Stage::TryData;
+        } else {
+            failSend(pvrdma::CompletionStatus::RetryExceededError, true);
+        }
+    }
+    scheduleTransport();
+}
+
+void
+Pvrdma::runTransport()
+{
+    if (transportPaused || controlState != pvrdma::ControlState::Active ||
+        transportDmaBusy() || queueDma.active() || completionBusy() ||
+        dmaPending() || observationQueued() ||
+        (transport.completionBackpressured && !pendingErrorPacket))
+        return;
+    if (pendingErrorPacket) {
+        if (!interface.getPeer()) {
+            pendingErrorPacket.reset();
+            scheduleTransport();
+            if (pvrdma::checkpointStable(
+                    controlState, dmaPending(), observationQueued(),
+                    queueDma.active(), completionBusy(), transportActive(),
+                    runnableSq(), activeMr()))
+                signalDrainDone();
+        } else if (interface.sendPacket(pendingErrorPacket)) {
+            pendingErrorPacket.reset();
+        }
+        return;
+    }
+    if (!transport.active()) {
+        if (pendingRxPacket)
+            startInbound();
+        else
+            selectSend();
+        return;
+    }
+    if (pendingRxPacket && transport.kind == pvrdma::QueueKind::Rq &&
+        transport.stage == TransportState::Stage::WaitReceiveData) {
+        auto packet = std::move(pendingRxPacket);
+        recvTransportPacket(std::move(packet));
+        return;
+    }
+
+    switch (transport.stage) {
+      case TransportState::Stage::TryData:
+      case TransportState::Stage::TryAck:
+      case TransportState::Stage::TryRnr:
+      case TransportState::Stage::TryError:
+        tryTransportPacket();
+        return;
+      case TransportState::Stage::WaitSendCq:
+      case TransportState::Stage::WaitReceiveCq:
+        submitTransportCompletion();
+        return;
+      case TransportState::Stage::WriteSqConsumer:
+        publishConsumer(pvrdma::QueueKind::Sq);
+        return;
+      case TransportState::Stage::WriteRqConsumer:
+        publishConsumer(pvrdma::QueueKind::Rq);
+        return;
+      case TransportState::Stage::WaitResponse:
+      case TransportState::Stage::RetryWait:
+      case TransportState::Stage::WaitReceiveData:
+      case TransportState::Stage::ReadSqWqe:
+      case TransportState::Stage::ReadSqPayload:
+      case TransportState::Stage::ReadRqWqe:
+      case TransportState::Stage::WriteRqPayload:
+      case TransportState::Stage::Idle:
+        return;
+    }
+}
+
+void
+Pvrdma::transportDmaDone()
+{
+    panic_if(!transport.dmaBusy, "Unexpected PVRDMA transport DMA callback");
+    transport.dmaBusy = false;
+    using Stage = TransportState::Stage;
+    const auto receive_segment_done = [this] {
+        auto &qp = queuePairs.entries[transport.qpHandle];
+        qp.attributes.receivePsn = pvrdma::advancePsn(
+            qp.attributes.receivePsn);
+        transport.livePsn = qp.attributes.receivePsn;
+        transport.acceptedPsn = transport.psn;
+        transport.acceptedOpcode = transport.opcode;
+        transport.acceptedSegmentLength = transport.totalLength -
+            size_t{transport.segmentIndex} * pvrdma::FixedMtu;
+        transport.acceptedSegmentIndex = transport.segmentIndex;
+        transport.hasAcceptedSegment = true;
+        if (pvrdma::finalOpcode(transport.opcode)) {
+            transport.stage = Stage::WaitReceiveCq;
+        } else {
+            transport.keepAfterControl = true;
+            prepareControl(pvrdma::rocev2::Syndrome::Ack,
+                           transport.acceptedPsn);
+        }
+    };
+
+    switch (transport.stage) {
+      case Stage::ReadSqWqe: {
+        if (!revalidateTransport(true)) {
+            finishTransport();
+            return;
+        }
+        pvrdma::SendWqeHeader header{};
+        std::memcpy(&header, transport.sqSlot.data(), sizeof(header));
+        transport.wqe.workRequestId = letoh(header.workRequestId);
+        auto &qp = queuePairs.entries[transport.qpHandle];
+        if (!pvrdma::decodeSqWqe(qp, transport.sqSlot, transport.wqe) ||
+            !pvrdma::segmentGeometry(transport.wqe.length,
+                                     transport.segmentCount) ||
+            !pvrdma::acquireLocalMr(
+                memoryRegions, qp, pvrdma::QueueKind::Sq,
+                transport.wqe.lkey, transport.wqe.address,
+                transport.wqe.length, transport.lease)) {
+            failSend(pvrdma::CompletionStatus::GeneralError, true);
+            break;
+        }
+        transport.leaseHeld = true;
+        transport.totalLength = transport.wqe.length;
+        transport.payload.resize(transport.totalLength);
+        if (!transport.totalLength) {
+            transport.stage = Stage::TryData;
+            break;
+        }
+        if (!beginPayloadDma(false, 0, transport.totalLength))
+            failSend(pvrdma::CompletionStatus::GeneralError, true);
+        else
+            return;
+        break;
+      }
+      case Stage::ReadSqPayload:
+        if (!revalidateTransportLease()) {
+            failSend(pvrdma::CompletionStatus::GeneralError, true);
+            break;
+        }
+        transport.dmaPayloadOffset += transport.dmaChunkLength;
+        transport.dmaRemaining -= transport.dmaChunkLength;
+        transport.chunkOffset += transport.dmaChunkLength;
+        if (transport.chunkOffset ==
+            transport.lease.chunks[transport.chunkIndex].length) {
+            ++transport.chunkIndex;
+            transport.chunkOffset = 0;
+        }
+        if (transport.dmaRemaining) {
+            startPayloadDma(false);
+            return;
+        }
+        transport.stage = Stage::TryData;
+        break;
+      case Stage::ReadRqWqe: {
+        if (!revalidateTransport(true)) {
+            prepareControl(pvrdma::rocev2::Syndrome::RemoteOperationNak,
+                           transport.livePsn);
+            break;
+        }
+        auto &qp = queuePairs.entries[transport.qpHandle];
+        if (!pvrdma::decodeRqWqe(qp, transport.rqSlot, transport.wqe)) {
+            prepareControl(pvrdma::rocev2::Syndrome::InvalidRequestNak,
+                           transport.livePsn);
+            break;
+        }
+        transport.rqWqeSelected = true;
+        if (transport.wqe.length < transport.totalLength) {
+            failReceive(pvrdma::CompletionStatus::LocalLengthError, true,
+                        pvrdma::rocev2::Syndrome::InvalidRequestNak);
+            break;
+        }
+        if (!pvrdma::acquireLocalMr(
+                memoryRegions, qp, pvrdma::QueueKind::Rq,
+                transport.wqe.lkey, transport.wqe.address,
+                transport.wqe.length, transport.lease)) {
+            failReceive(pvrdma::CompletionStatus::LocalProtectionError,
+                        true,
+                        pvrdma::rocev2::Syndrome::RemoteAccessNak);
+            break;
+        }
+        transport.leaseHeld = true;
+        if (!transport.totalLength) {
+            receive_segment_done();
+            break;
+        }
+        if (!beginPayloadDma(true, 0, transport.totalLength)) {
+            failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
+                        true,
+                        pvrdma::rocev2::Syndrome::RemoteOperationNak);
+            break;
+        }
+        return;
+      }
+      case Stage::WriteRqPayload:
+        if (!revalidateTransportLease()) {
+            failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
+                        true,
+                        pvrdma::rocev2::Syndrome::RemoteOperationNak);
+            break;
+        }
+        transport.dmaPayloadOffset += transport.dmaChunkLength;
+        transport.dmaRemaining -= transport.dmaChunkLength;
+        transport.chunkOffset += transport.dmaChunkLength;
+        if (transport.chunkOffset ==
+            transport.lease.chunks[transport.chunkIndex].length) {
+            ++transport.chunkIndex;
+            transport.chunkOffset = 0;
+        }
+        if (transport.dmaRemaining) {
+            startPayloadDma(true);
+            return;
+        }
+        receive_segment_done();
+        break;
+      case Stage::WriteSqConsumer: {
+        panic_if(!revalidateTransport() ||
+                     (transport.leaseHeld && !revalidateTransportLease()),
+                 "PVRDMA SQ changed during consumer publication");
+        sampleQueueOccupancy();
+        auto &qp = queuePairs.entries[transport.qpHandle];
+        qp.sqConsumerHead = transport.nextConsumer;
+        transport.consumer = transport.nextConsumer;
+        queueStats.sqConsumed++;
+        if (transport.terminalQpError) {
+            qp.state = pvrdma::QpState::Error;
+            qp.attributes.qpState = qp.attributes.currentQpState = qp.state;
+        }
+        refreshQueueGauges();
+        sampleCurrentQueueOccupancy();
+        checkQueueConservation();
+        finishTransport();
+        return;
+      }
+      case Stage::WriteRqConsumer: {
+        panic_if(!revalidateTransport() ||
+                     (!transport.terminalQpError &&
+                      !revalidateTransportLease()),
+                 "PVRDMA RQ changed during consumer publication");
+        sampleQueueOccupancy();
+        auto &qp = queuePairs.entries[transport.qpHandle];
+        qp.rqConsumerHead = transport.nextConsumer;
+        transport.consumer = transport.nextConsumer;
+        queueStats.rqConsumed++;
+        if (transport.terminalQpError) {
+            qp.state = pvrdma::QpState::Error;
+            qp.attributes.qpState = qp.attributes.currentQpState = qp.state;
+            qp.finalReplay = {};
+            refreshQueueGauges();
+            sampleCurrentQueueOccupancy();
+            checkQueueConservation();
+            finishTransport();
+            return;
+        }
+        qp.responderMsn = pvrdma::advancePsn(qp.responderMsn);
+        transport.responseMsn = qp.responderMsn;
+        qp.finalReplay = {true, qp.generation, transport.localMac,
+                          transport.remoteMac, transport.localGid,
+                          transport.remoteGid, transport.localQpn,
+                          transport.remoteQpn, transport.acceptedPsn,
+                          transport.acceptedOpcode,
+                          transport.acceptedSegmentLength,
+                          qp.responderMsn};
+        refreshQueueGauges();
+        sampleCurrentQueueOccupancy();
+        checkQueueConservation();
+        transport.keepAfterControl = false;
+        prepareControl(pvrdma::rocev2::Syndrome::Ack,
+                       transport.acceptedPsn);
+        transport.responseMsn = qp.responderMsn;
+        break;
+      }
+      default:
+        panic("Invalid PVRDMA transport DMA stage");
+    }
+    scheduleTransport();
 }
 
 pvrdma::CompletionSubmitResult
@@ -682,9 +2190,11 @@ Pvrdma::rejectCompletion(bool backpressure)
     if (done)
         done(backpressure ? pvrdma::CompletionSubmitResult::Backpressured :
                             pvrdma::CompletionSubmitResult::Rejected);
+    scheduleTransport();
     if (pvrdma::checkpointStable(controlState, dmaPending(),
                                  observationQueued(), queueDma.active(),
-                                 completionBusy()))
+                                 completionBusy(), transportActive(),
+                                 runnableSq(), activeMr()))
         signalDrainDone();
 }
 
@@ -697,9 +2207,11 @@ Pvrdma::finishCompletion()
     checkQueueConservation();
     if (done)
         done(pvrdma::CompletionSubmitResult::Published);
+    scheduleTransport();
     if (pvrdma::checkpointStable(controlState, dmaPending(),
                                  observationQueued(), queueDma.active(),
-                                 completionBusy()))
+                                 completionBusy(), transportActive(),
+                                 runnableSq(), activeMr()))
         signalDrainDone();
 }
 
@@ -770,8 +2282,8 @@ Pvrdma::completionDmaDone()
         sampleQueueOccupancy();
         cq.producerTail = completionDma.cqNextProducer;
         queueStats.cqPublished++;
-        if (completionDma.record.status ==
-            pvrdma::CompletionStatus::GeneralError)
+        if (completionDma.record.status !=
+            pvrdma::CompletionStatus::Success)
             queueStats.cqErrorPublished++;
         refreshQueueGauges();
         sampleCurrentQueueOccupancy();
@@ -849,10 +2361,17 @@ Pvrdma::writeControl(uint32_t value)
 
     const auto control = static_cast<pvrdma::DeviceControl>(value);
     if (control == pvrdma::DeviceControl::Reset) {
+        const bool cancel_terminal = terminalCompletionBackpressured();
         if (!pvrdma::stable(controlState) || queueDma.active() ||
-            completionBusy()) {
+            completionBusy() || dmaPending() ||
+            (transportActive() && !cancel_terminal)) {
             operationError.set(regs.error, pvrdma::CommandError);
             return;
+        }
+        if (cancel_terminal && transport.leaseHeld) {
+            panic_if(!pvrdma::releaseMr(memoryRegions, transport.lease),
+                     "PVRDMA terminal reset lost its MR lease");
+            transport.leaseHeld = false;
         }
         resetDevice();
         return;
@@ -869,7 +2388,7 @@ void
 Pvrdma::startCommand(uint32_t value)
 {
     regs.request = value;
-    if (value != 0 || commandBlockedByObservation() ||
+    if (value != 0 || completionBusy() || transportActive() ||
         !pvrdma::beginCommand(controlState)) {
         operationError.set(regs.error, pvrdma::CommandError);
         return;
@@ -899,6 +2418,11 @@ Pvrdma::commandReadDone()
     if (completionBusy()) {
         cq_busy |= uint64_t{1} << completionDma.record.cqHandle;
         qp_busy |= uint64_t{1} << completionDma.record.qpHandle;
+    }
+    if (transport.active() && transport.qpHandle) {
+        qp_busy |= uint64_t{1} << transport.qpHandle;
+        if (transport.cqHandle)
+            cq_busy |= uint64_t{1} << transport.cqHandle;
     }
     const bool target_busy = pvrdma::queueCommandTargetBusy(
         command, qp_busy, cq_busy);
@@ -1218,6 +2742,7 @@ Pvrdma::resetDevice()
     queueStats.rqResetDiscarded += queueStats.rqAvailable.value();
     queueStats.cqResetDiscarded += queueStats.cqOutstanding.value();
     clearObservations();
+    clearTransport();
     if (completionDmaEvent.scheduled())
         deschedule(completionDmaEvent);
     completionDma.reset();
@@ -1245,6 +2770,7 @@ Pvrdma::resetDevice()
     objectTables.clear();
     objectTableIndex = 0;
     operationError.reset();
+    transportPaused = false;
     refreshQueueGauges();
     sampleCurrentQueueOccupancy();
     checkQueueConservation();
@@ -1273,20 +2799,31 @@ void
 Pvrdma::operationDone()
 {
     scheduleObservation();
+    scheduleTransport();
     if (pvrdma::checkpointStable(controlState, dmaPending(),
                                  observationQueued(), queueDma.active(),
-                                 completionBusy()))
+                                 completionBusy(), transportActive(),
+                                 runnableSq(), activeMr()))
         signalDrainDone();
 }
 
 DrainState
 Pvrdma::drain()
 {
-    if (observationEvent.scheduled())
-        deschedule(observationEvent);
-    sqDirty = rqDirty = cqDirty = 0;
-    return pvrdma::checkpointStable(controlState, dmaPending(), false,
-                                    queueDma.active(), completionBusy()) ?
+    if (terminalCompletionBackpressured()) {
+        // Drain drops an unpublished terminal error CQE for either queue so
+        // the one-flight model can checkpoint; successes still wait for space.
+        transport.completionBackpressured = false;
+        transport.stage = transport.kind == pvrdma::QueueKind::Rq ?
+            TransportState::Stage::WriteRqConsumer :
+            TransportState::Stage::WriteSqConsumer;
+    }
+    scheduleObservation();
+    scheduleTransport();
+    return pvrdma::checkpointStable(controlState, dmaPending(),
+                                    observationQueued(), queueDma.active(),
+                                    completionBusy(), transportActive(),
+                                    runnableSq(), activeMr()) ?
         DrainState::Drained : DrainState::Draining;
 }
 
@@ -1295,9 +2832,10 @@ Pvrdma::serialize(CheckpointOut &cp) const
 {
     panic_if(!pvrdma::checkpointStable(controlState, dmaPending(),
                                         observationQueued(),
-                                        queueDma.active(),
-                                        completionBusy()),
-             "Cannot checkpoint PVRDMA with active or queued DMA");
+                                        queueDma.active(), completionBusy(),
+                                        transportActive(), runnableSq(),
+                                        activeMr()),
+             "Cannot checkpoint PVRDMA with active transport or SEND");
     PciDevice::serialize(cp);
     SERIALIZE_SCALAR(regs.dsrAddress);
     SERIALIZE_SCALAR(regs.control);
@@ -1344,7 +2882,6 @@ Pvrdma::serialize(CheckpointOut &cp) const
         paramOut(cp, "rkey", mr.rkey);
         paramOut(cp, "pdHandle", mr.pdHandle);
         paramOut(cp, "accessFlags", mr.accessFlags);
-        paramOut(cp, "activeReferences", mr.activeReferences);
         paramOut(cp, "start", mr.start);
         paramOut(cp, "length", mr.length);
         paramOut(cp, "end", mr.end);
@@ -1396,6 +2933,25 @@ Pvrdma::serialize(CheckpointOut &cp) const
         paramOut(cp, "sqConsumerHead", qp.sqConsumerHead);
         paramOut(cp, "rqProducerTail", qp.rqProducerTail);
         paramOut(cp, "rqConsumerHead", qp.rqConsumerHead);
+        paramOut(cp, "responderMsn", qp.responderMsn);
+        paramOut(cp, "replayValid", qp.finalReplay.valid);
+        paramOut(cp, "replayQpGeneration", qp.finalReplay.qpGeneration);
+        arrayParamOut(cp, "replayLocalMac", qp.finalReplay.localMac.data(),
+                      qp.finalReplay.localMac.size());
+        arrayParamOut(cp, "replayRemoteMac", qp.finalReplay.remoteMac.data(),
+                      qp.finalReplay.remoteMac.size());
+        arrayParamOut(cp, "replayLocalGid", qp.finalReplay.localGid.data(),
+                      qp.finalReplay.localGid.size());
+        arrayParamOut(cp, "replayRemoteGid", qp.finalReplay.remoteGid.data(),
+                      qp.finalReplay.remoteGid.size());
+        paramOut(cp, "replayLocalQpn", qp.finalReplay.localQpn);
+        paramOut(cp, "replayRemoteQpn", qp.finalReplay.remoteQpn);
+        paramOut(cp, "replayFinalPsn", qp.finalReplay.finalPsn);
+        paramOut(cp, "replayFinalOpcode",
+                 static_cast<uint32_t>(qp.finalReplay.finalOpcode));
+        paramOut(cp, "replayFinalSegmentLength",
+                 qp.finalReplay.finalSegmentLength);
+        paramOut(cp, "replayCompletedMsn", qp.finalReplay.completedMsn);
         arrayParamOut(cp, "pages", qp.pages);
     }
 }
@@ -1419,6 +2975,8 @@ Pvrdma::unserialize(CheckpointIn &cp)
     arrayParamIn(cp, "capabilities",
                  reinterpret_cast<uint8_t *>(&capabilities),
                  sizeof(capabilities));
+    panic_if(capabilities.gidTypes != pvrdma::GidTypeRoceV2,
+             "PVRDMA checkpoint transport is not RoCEv2");
     arrayParamIn(cp, "gids", reinterpret_cast<uint8_t *>(gids.data()),
                  sizeof(gids));
     arrayParamIn(cp, "gidValid", gidValid.data(), gidValid.size());
@@ -1450,7 +3008,7 @@ Pvrdma::unserialize(CheckpointIn &cp)
         paramIn(cp, "rkey", mr.rkey);
         paramIn(cp, "pdHandle", mr.pdHandle);
         paramIn(cp, "accessFlags", mr.accessFlags);
-        paramIn(cp, "activeReferences", mr.activeReferences);
+        mr.activeReferences = 0;
         paramIn(cp, "start", mr.start);
         paramIn(cp, "length", mr.length);
         paramIn(cp, "end", mr.end);
@@ -1506,9 +3064,31 @@ Pvrdma::unserialize(CheckpointIn &cp)
         paramIn(cp, "sqConsumerHead", qp.sqConsumerHead);
         paramIn(cp, "rqProducerTail", qp.rqProducerTail);
         paramIn(cp, "rqConsumerHead", qp.rqConsumerHead);
+        paramIn(cp, "responderMsn", qp.responderMsn);
+        paramIn(cp, "replayValid", qp.finalReplay.valid);
+        paramIn(cp, "replayQpGeneration", qp.finalReplay.qpGeneration);
+        arrayParamIn(cp, "replayLocalMac", qp.finalReplay.localMac.data(),
+                     qp.finalReplay.localMac.size());
+        arrayParamIn(cp, "replayRemoteMac", qp.finalReplay.remoteMac.data(),
+                     qp.finalReplay.remoteMac.size());
+        arrayParamIn(cp, "replayLocalGid", qp.finalReplay.localGid.data(),
+                     qp.finalReplay.localGid.size());
+        arrayParamIn(cp, "replayRemoteGid", qp.finalReplay.remoteGid.data(),
+                     qp.finalReplay.remoteGid.size());
+        paramIn(cp, "replayLocalQpn", qp.finalReplay.localQpn);
+        paramIn(cp, "replayRemoteQpn", qp.finalReplay.remoteQpn);
+        paramIn(cp, "replayFinalPsn", qp.finalReplay.finalPsn);
+        uint32_t replay_opcode = 0;
+        paramIn(cp, "replayFinalOpcode", replay_opcode);
+        qp.finalReplay.finalOpcode =
+            static_cast<pvrdma::rocev2::Opcode>(replay_opcode);
+        paramIn(cp, "replayFinalSegmentLength",
+                qp.finalReplay.finalSegmentLength);
+        paramIn(cp, "replayCompletedMsn", qp.finalReplay.completedMsn);
         arrayParamIn(cp, "pages", qp.pages);
     }
     operationError.reset();
+    transportPaused = false;
 
     panic_if(!pvrdma::stable(controlState),
              "PVRDMA checkpoint contains transient control state");
@@ -1522,6 +3102,7 @@ Pvrdma::unserialize(CheckpointIn &cp)
                                             memoryRegions, objects),
              "PVRDMA checkpoint has inconsistent object tables");
     clearObservations();
+    clearTransport();
     completionDma.reset();
     pendingCreate = pvrdma::PendingCreateKind::None;
     mrBuild = {};

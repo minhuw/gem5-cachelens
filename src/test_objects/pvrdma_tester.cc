@@ -43,6 +43,23 @@ constexpr Addr CqLeafAddress = 0x400000;
 constexpr Addr QpLeafAddress = 0x500000;
 constexpr Addr BadQpLeafAddress = 0x600000;
 constexpr Addr PayloadAddress = 0x700000;
+constexpr Addr PeerPciConfigAddress =
+    PciConfigBase + ((3 << 3 | 1) << 8);
+constexpr Addr PeerMsixBarAddress = 0x11000000;
+constexpr Addr PeerRegisterBarAddress = 0x11004000;
+constexpr Addr PeerUarBarAddress = 0x11200000;
+constexpr Addr PairSenderQp = 0x1000000;
+constexpr Addr PairSenderSq = 0x1010000;
+constexpr Addr PairSenderRq = 0x1020000;
+constexpr Addr PairSenderCq = 0x1030000;
+constexpr Addr PairSenderCqe = 0x1040000;
+constexpr Addr PairSenderPayload = 0x1050000;
+constexpr Addr PairReceiverQp = 0x2000000;
+constexpr Addr PairReceiverSq = 0x2010000;
+constexpr Addr PairReceiverRq = 0x2020000;
+constexpr Addr PairReceiverCq = 0x2030000;
+constexpr Addr PairReceiverCqe = 0x2040000;
+constexpr Addr PairReceiverPayload = 0x2050000;
 
 statistics::Counter
 statValue(const std::string &name)
@@ -60,9 +77,81 @@ microseconds(uint64_t value)
     return value * sim_clock::as_int::us;
 }
 
+constexpr uint8_t TestTrafficClass = 0x2a;
+constexpr uint32_t TestFlowLabel = 0x34567;
+constexpr uint8_t TestHopLimit = 0xff;
+
+pvrdma::rocev2::Gid
+testGid(const pvrdma::rocev2::MacAddress &mac)
+{
+    const uint32_t low = uint32_t{mac[0]} | (uint32_t{mac[1]} << 8) |
+        (uint32_t{mac[2]} << 16) | (uint32_t{mac[3]} << 24);
+    const uint32_t high = uint32_t{mac[4]} | (uint32_t{mac[5]} << 8);
+    const uint64_t guid = pvrdma::detail::macGuid(low, high);
+    pvrdma::rocev2::Gid gid{};
+    gid[0] = 0xfe;
+    gid[1] = 0x80;
+    for (size_t i = 0; i < 8; ++i)
+        gid[8 + i] = guid >> (56 - 8 * i);
+    return gid;
+}
+
+EthPacketPtr
+rocePacket(pvrdma::rocev2::Packet frame,
+           const pvrdma::rocev2::MacAddress &source,
+           const pvrdma::rocev2::MacAddress &destination,
+           uint32_t source_qpn = 1)
+{
+    if (frame.sourceMac == pvrdma::rocev2::MacAddress{})
+        frame.sourceMac = source;
+    if (frame.destinationMac == pvrdma::rocev2::MacAddress{})
+        frame.destinationMac = destination;
+    if (frame.sourceGid == pvrdma::rocev2::Gid{})
+        frame.sourceGid = testGid(source);
+    if (frame.destinationGid == pvrdma::rocev2::Gid{})
+        frame.destinationGid = testGid(destination);
+    frame.trafficClass = TestTrafficClass;
+    frame.flowLabel = TestFlowLabel;
+    frame.hopLimit = TestHopLimit;
+    frame.sourcePort = pvrdma::rocev2::udpSourcePort(
+        frame.flowLabel, source_qpn, frame.destinationQpn);
+    const size_t size = pvrdma::rocev2::encodedSize(frame);
+    auto packet = std::make_shared<EthPacketData>(size);
+    const auto encoded = pvrdma::rocev2::encode(
+        frame, {packet->data, packet->bufLength});
+    panic_if(!encoded, "PVRDMA test RoCEv2 frame failed encode");
+    packet->length = packet->simLength = encoded.size;
+    panic_if(packet->data[pvrdma::rocev2::EtherTypeOffset] != 0x86 ||
+                 packet->data[pvrdma::rocev2::EtherTypeOffset + 1] != 0xdd,
+             "PVRDMA test emitted a non-RoCEv2 EtherType");
+    return packet;
+}
+
 const Request::Flags MmioFlags = Request::UNCACHEABLE;
 
 } // anonymous namespace
+
+bool
+PvrdmaTester::FaultPort::recvPacket(EthPacketPtr packet)
+{
+    const auto decoded = pvrdma::rocev2::decode(
+        {packet->data, packet->bufLength}, packet->length);
+    panic_if(!decoded, "PVRDMA fault-link endpoint received a bad frame");
+    if (tester.faultRejectOnce[side] && decoded.packet.psn == 7) {
+        tester.faultRejectOnce[side] = false;
+        tester.faultDrainWhileRejected =
+            tester.testLink->drain() == DrainState::Draining;
+        return false;
+    }
+    tester.faultReceived[side].push_back(decoded.packet.psn);
+    return true;
+}
+
+void
+PvrdmaTester::FaultPort::sendDone()
+{
+    ++tester.faultSendDone[side];
+}
 
 bool
 PvrdmaTester::TestPort::recvTimingResp(PacketPtr)
@@ -78,6 +167,8 @@ PvrdmaTester::TestPort::recvReqRetry()
 
 PvrdmaTester::PvrdmaTester(const Params &p)
     : Platform(p), port(name() + ".port", *this),
+      faultPort0(name() + ".fault0", *this, 0),
+      faultPort1(name() + ".fault1", *this, 1),
       requestorId(system->getRequestorId(this)),
       testEvent([this] { run(); }, name() + ".test"),
       commandTest(p.command_test), testMode(p.test_mode)
@@ -88,14 +179,76 @@ PvrdmaTester::getPort(const std::string &if_name, PortID idx)
 {
     if (if_name == "port")
         return port;
+    if (if_name == "fault0")
+        return faultPort0;
+    if (if_name == "fault1")
+        return faultPort1;
     return Platform::getPort(if_name, idx);
 }
 
 void
 PvrdmaTester::startup()
 {
+    if (testMode == "fault-link" || testMode == "timing-fault-link") {
+        testLink = dynamic_cast<PvrdmaTestLink *>(
+            SimObject::find("system.rdma_link"));
+        panic_if(!testLink, "PVRDMA tester could not find test link");
+        schedule(testEvent, curTick());
+        return;
+    }
+
     rdma = dynamic_cast<Pvrdma *>(SimObject::find("system.rdma"));
     panic_if(!rdma, "PVRDMA tester could not find system.rdma");
+    const bool terminal_pair = testMode.find("terminal-") !=
+            std::string::npos &&
+        testMode.find("sq-terminal") == std::string::npos;
+    const bool reliability_pair =
+        testMode == "reliability-pair" ||
+        testMode == "timing-reliability-pair" ||
+        testMode == "reliability-rnr-pair" ||
+        testMode == "timing-reliability-rnr-pair" ||
+        testMode == "reliability-timeout-zero-pair" ||
+        testMode == "timing-reliability-timeout-zero-pair" ||
+        testMode == "reliability-invalid-pair" ||
+        testMode == "timing-reliability-invalid-pair" ||
+        testMode == "reliability-sequence-pair" ||
+        testMode == "timing-reliability-sequence-pair" ||
+        testMode == "reliability-unrelated-pair" ||
+        testMode == "timing-reliability-unrelated-pair" ||
+        testMode == "reliability-cq-pair" ||
+        testMode == "timing-reliability-cq-pair" ||
+        testMode == "reliability-cq-abort-pair" ||
+        testMode == "timing-reliability-cq-abort-pair" ||
+        testMode == "timing-reliability-precommit-abort-pair" ||
+        testMode == "timing-reliability-commit-pair" ||
+        testMode == "timing-reliability-commit-boundary-pair";
+    if (testMode == "transport-pair" ||
+        testMode == "timing-transport-pair" ||
+        testMode == "semantic-pair" ||
+        testMode == "timing-semantic-pair" || reliability_pair ||
+        terminal_pair) {
+        peerRdma = dynamic_cast<Pvrdma *>(
+            SimObject::find("system.peer_rdma"));
+        panic_if(!peerRdma, "PVRDMA pair tester could not find peer");
+        if (reliability_pair) {
+            testLink = dynamic_cast<PvrdmaTestLink *>(
+                SimObject::find("system.rdma_link"));
+            panic_if(!testLink, "PVRDMA reliability tester has no fault link");
+        }
+    }
+    auto &interface = rdma->getPort("interface");
+    panic_if(&interface != &rdma->interface ||
+                 &rdma->getPort("dma") == &interface,
+             "PVRDMA Ethernet and PCI DMA ports are not independent");
+    if (testMode == "timing-observation" || testMode == "stats-reset" ||
+        testMode == "checkpoint-observation-save" ||
+        testMode == "checkpoint-observation-restore")
+        rdma->transportPaused = true;
+    if (!peerRdma) {
+        panic_if(rdma->interface.recvPacket(nullptr),
+                 "PVRDMA foundation accepted an inbound packet");
+        rdma->interface.sendDone();
+    }
     schedule(testEvent, curTick());
 }
 
@@ -166,7 +319,7 @@ PvrdmaTester::testCapabilities()
     const auto caps = read<pvrdma::DeviceCaps>(
         DsrAddress + offsetof(pvrdma::DeviceSharedRegion, caps));
     panic_if(caps.mode != static_cast<uint8_t>(pvrdma::DeviceMode::Roce) ||
-                 caps.gidTypes != pvrdma::GidTypeRoceV1,
+                 caps.gidTypes != pvrdma::GidTypeRoceV2,
              "PVRDMA capabilities were not visible after DSR completion");
 }
 
@@ -862,7 +1015,6 @@ PvrdmaTester::runTimingQueues()
                   htole(static_cast<uint16_t>(
                       pvrdma::SqDoorbellAction | 1)), MmioFlags);
             ringDoorbell(pvrdma::SqDoorbellAction, 2);
-            startQueryQp(0x8080808080808080);
             timingStage = TimingStage::ObservationActive;
         } else {
             startQueryQp(0x8080808080808080);
@@ -870,7 +1022,7 @@ PvrdmaTester::runTimingQueues()
         }
         schedule(testEvent, curTick() +
             (timingStage == TimingStage::ObservationActive ?
-                 microseconds(1) : LongDelay));
+                 2 * sim_clock::as_int::ns : LongDelay));
         return;
       case TimingStage::DestroyQp: {
         const auto response = verifyResponse(pvrdma::Command::QueryQp,
@@ -945,19 +1097,33 @@ PvrdmaTester::runTimingQueues()
         exitSimLoop("PVRDMA timing queue test passed");
         return;
       case TimingStage::ObservationActive:
+        panic_if(!rdma->queueDma.active(),
+                 "PVRDMA queue observation did not start");
+        startQueryQp(0x8080808080808080);
         panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
-                                MmioFlags) != pvrdma::CommandError,
-                 "PVRDMA queued observation did not reject command");
+                                MmioFlags) != 0,
+                 "PVRDMA active observation rejected command DMA");
+        timingStage = TimingStage::ObservationCommandActive;
+        schedule(testEvent, curTick() + microseconds(1));
+        return;
+      case TimingStage::ObservationCommandActive:
+        panic_if(!rdma->queueDma.active() ||
+                     rdma->controlState !=
+                         pvrdma::ControlState::ReadingCommand,
+                 "PVRDMA observation did not overlap command DMA");
+        timingStage = TimingStage::ObservationCommandDone;
+        schedule(testEvent, curTick() + LongDelay);
+        return;
+      case TimingStage::ObservationCommandDone:
+        verifyResponse(pvrdma::Command::QueryQp,
+                       0x8080808080808080);
         postObservedRings(4, 6);
         ringDoorbell(pvrdma::SqDoorbellAction);
         ringDoorbell(pvrdma::RqDoorbellAction);
-        write(RegisterBarAddress + pvrdma::RegControl,
-              htole(static_cast<uint32_t>(
-                  pvrdma::DeviceControl::Reset)), MmioFlags);
-        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
-                                MmioFlags) != pvrdma::CommandError,
-                 "PVRDMA reset raced active queue DMA");
         destroyQp();
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                MmioFlags) != 0,
+                 "PVRDMA queued observation rejected command DMA");
         timingStage = TimingStage::ObservationDone;
         schedule(testEvent, curTick() + LongDelay);
         return;
@@ -1280,6 +1446,11 @@ PvrdmaTester::runCompletionErrors()
                      statValue(prefix + "cqPublished") != 0 ||
                      statValue(prefix + "conservationViolations") != 0,
                  "PVRDMA malformed CQ partially published a completion");
+        rdma->pendingErrorPacket = std::make_shared<EthPacketData>(1);
+        rdma->runTransport();
+        panic_if(rdma->pendingErrorPacket ||
+                     rdma->drain() != DrainState::Drained,
+                 "PVRDMA no-peer reverse error did not drain");
         inform("PVRDMA completion rejection/backpressure test passed");
         exitSimLoop("PVRDMA completion error test passed");
         return;
@@ -1575,6 +1746,22 @@ PvrdmaTester::testCheckpointSave()
     verifyMr(0xc065c065c065c065, 65);
     createQueuePairAtomic(1);
     moveQueuePairToRtsAtomic();
+    auto &qp = rdma->queuePairs.entries[1];
+    qp.finalReplay.valid = true;
+    qp.finalReplay.qpGeneration = qp.generation;
+    qp.finalReplay.localMac = {0x02, 0, 0, 0, 0, 1};
+    qp.finalReplay.remoteMac = {0x02, 0, 0, 0, 0, 2};
+    std::copy(qp.finalReplay.remoteMac.begin(),
+              qp.finalReplay.remoteMac.end(),
+              qp.attributes.addressHandle.destinationMac);
+    qp.finalReplay.localQpn = qp.qpn;
+    qp.finalReplay.remoteQpn = qp.attributes.destinationQpNumber;
+    qp.finalReplay.localGid = testGid(qp.finalReplay.localMac);
+    qp.finalReplay.remoteGid = testGid(qp.finalReplay.remoteMac);
+    qp.finalReplay.finalPsn = 0x12344;
+    qp.finalReplay.finalOpcode = pvrdma::rocev2::Opcode::SendOnly;
+    qp.finalReplay.finalSegmentLength = 1;
+    qp.responderMsn = qp.finalReplay.completedMsn = 0xfeed;
     inform("PVRDMA checkpoint live MR/CQ/RTS-QP ready");
     exitSimLoop("PVRDMA checkpoint save ready");
 }
@@ -1590,8 +1777,15 @@ PvrdmaTester::testCheckpointRestore()
     panic_if(letoh(static_cast<uint32_t>(
                  response.queryQp.attributes.qpState)) !=
                  static_cast<uint32_t>(pvrdma::QpState::ReadyToSend) ||
-                 letoh(response.queryQp.attributes.sendPsn) != 0x54321,
-             "Restored PVRDMA QP lost RTS attributes");
+                 letoh(response.queryQp.attributes.sendPsn) != 0x54321 ||
+                 !rdma->queuePairs.entries[1].finalReplay.valid ||
+                 rdma->queuePairs.entries[1].finalReplay.localMac[0] != 2 ||
+                 rdma->queuePairs.entries[1].finalReplay.localMac[5] != 1 ||
+                 rdma->queuePairs.entries[1].finalReplay.completedMsn !=
+                     0xfeed ||
+                 rdma->queuePairs.entries[1].finalReplay.finalPsn !=
+                     0x12344,
+             "Restored PVRDMA QP lost RTS/replay attributes");
     destroyQp();
     panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
                             MmioFlags) != 0,
@@ -1698,8 +1892,7 @@ PvrdmaTester::testCheckpointObservationSave()
         createUserParentAtomic();
         createQueuePairAtomic(1);
         moveQueuePairToRtsAtomic();
-        postObservedRings(5, 7);
-        ringDoorbell(pvrdma::SqDoorbellAction);
+        postObservedRings(0, 7);
         ringDoorbell(pvrdma::RqDoorbellAction);
         ringDoorbell(pvrdma::CqArmAnyAction, 1, true);
         timingStage = TimingStage::CheckpointObservationReady;
@@ -1709,12 +1902,15 @@ PvrdmaTester::testCheckpointObservationSave()
     panic_if(timingStage != TimingStage::CheckpointObservationReady,
              "Invalid PVRDMA observation checkpoint stage");
     const std::string prefix = "system.rdma.queues.";
-    panic_if(statValue(prefix + "sqOutstanding") != 5 ||
+    panic_if(statValue(prefix + "sqOutstanding") != 0 ||
                  statValue(prefix + "rqAvailable") != 7,
              "PVRDMA checkpoint missed queue observations");
     pvrdma::Ring cq_ring{};
     cq_ring.producerTail = htole(uint32_t{3});
     write(CqLeafAddress + offsetof(pvrdma::RingState, rx), cq_ring);
+    rdma->completionQueues.entries[1].producerTail = 3;
+    rdma->refreshQueueGauges();
+    rdma->queueStatsReset();
     inform("PVRDMA nonempty queue observation checkpoint ready");
     exitSimLoop("PVRDMA observation checkpoint save ready");
 }
@@ -1725,10 +1921,10 @@ PvrdmaTester::testCheckpointObservationRestore()
     panic_if(!system->isAtomicMode(),
              "PVRDMA observation checkpoint restore requires atomic mode");
     const std::string prefix = "system.rdma.queues.";
-    panic_if(statValue(prefix + "sqOutstanding") != 5 ||
+    panic_if(statValue(prefix + "sqOutstanding") != 0 ||
                  statValue(prefix + "rqAvailable") != 7 ||
                  statValue(prefix + "cqOutstanding") != 3 ||
-                 statValue(prefix + "sqOutstandingAtReset") != 5 ||
+                 statValue(prefix + "sqOutstandingAtReset") != 0 ||
                  statValue(prefix + "rqAvailableAtReset") != 7 ||
                  statValue(prefix + "cqOutstandingAtReset") != 3,
              "PVRDMA restored queue baselines were incorrect");
@@ -1737,7 +1933,7 @@ PvrdmaTester::testCheckpointObservationRestore()
                             MmioFlags) != 0 ||
                  statValue(prefix + "sqOutstanding") != 0 ||
                  statValue(prefix + "rqAvailable") != 0 ||
-                 statValue(prefix + "sqResetDiscarded") != 5 ||
+                 statValue(prefix + "sqResetDiscarded") != 0 ||
                  statValue(prefix + "rqResetDiscarded") != 7 ||
                  statValue(prefix + "cqOutstanding") != 3 ||
                  statValue(prefix + "conservationViolations") != 0,
@@ -1754,8 +1950,3108 @@ PvrdmaTester::testCheckpointObservationRestore()
 }
 
 void
+PvrdmaTester::setupPairEndpoint(
+    Pvrdma &device, Addr qp_page, Addr cq_page, Addr mr_page,
+    const pvrdma::rocev2::MacAddress &remote_mac,
+    uint32_t send_psn, uint32_t receive_psn)
+{
+    device.controlState = pvrdma::ControlState::Active;
+    device.regs.error = 0;
+    device.objects.contextUar[1] = 1;
+    device.objects.contextPdChildren[1] = 1;
+    device.objects.contextCqChildren[1] = 1;
+    device.objects.pdAllocated[1] = 1;
+    device.objects.pdParent[1] = 1;
+    device.objects.pdChildren[1] = 2;
+
+    auto &cq = device.completionQueues.entries[1];
+    cq.valid = true;
+    cq.cqHandle = 1;
+    cq.contextHandle = 1;
+    cq.uar = 1;
+    cq.cqe = 8;
+    cq.qpReferences = 2;
+    cq.pages = {cq_page, cq_page + 0x10000};
+
+    auto &qp = device.queuePairs.entries[1];
+    qp.valid = true;
+    qp.qpHandle = qp.qpn = 1;
+    qp.pdHandle = qp.sendCqHandle = qp.recvCqHandle = 1;
+    qp.contextHandle = qp.uar = 1;
+    qp.sendChunks = qp.recvChunks = 1;
+    qp.totalChunks = 3;
+    qp.state = pvrdma::QpState::ReadyToSend;
+    qp.capabilities.maxSendWr = qp.capabilities.maxRecvWr = 8;
+    qp.capabilities.maxSendSge = qp.capabilities.maxRecvSge = 1;
+    qp.attributes.qpState = qp.attributes.currentQpState = qp.state;
+    qp.attributes.pathMtu = pvrdma::Mtu::Mtu1024;
+    qp.attributes.pathMigrationState = pvrdma::MigrationState::Migrated;
+    qp.attributes.destinationQpNumber = 1;
+    qp.attributes.qpAccessFlags = pvrdma::AccessLocalWrite;
+    qp.attributes.sendPsn = send_psn;
+    qp.attributes.receivePsn = receive_psn;
+    qp.attributes.portNumber = 1;
+    qp.attributes.addressHandle.portNumber = 1;
+    qp.attributes.addressHandle.globalRoute.trafficClass = TestTrafficClass;
+    qp.attributes.addressHandle.globalRoute.flowLabel = TestFlowLabel;
+    qp.attributes.addressHandle.globalRoute.hopLimit = 0;
+    qp.attributes.capabilities = qp.capabilities;
+    std::copy(remote_mac.begin(), remote_mac.end(),
+              qp.attributes.addressHandle.destinationMac);
+    qp.pages = {qp_page, qp_page + 0x10000, qp_page + 0x20000};
+
+    auto &mr = device.memoryRegions.entries[1];
+    mr.valid = true;
+    mr.mrHandle = mr.lkey = mr.rkey = 1;
+    mr.pdHandle = 1;
+    mr.accessFlags = pvrdma::AccessLocalWrite;
+    mr.start = mr_page;
+    mr.length = 16 * pvrdma::PageSize;
+    mr.end = mr.start + mr.length;
+    for (uint32_t i = 0; i < 16; ++i)
+        mr.pages.push_back(mr_page + uint64_t{i} * pvrdma::PageSize);
+    device.receivePayloadDmaStarts = 0;
+    device.queueStatsReset();
+}
+
+void
+PvrdmaTester::setupPair()
+{
+    configurePci();
+    write(PeerPciConfigAddress + PCI0_BASE_ADDR0,
+          htole(static_cast<uint32_t>(PeerMsixBarAddress)), MmioFlags);
+    write(PeerPciConfigAddress + PCI0_BASE_ADDR1,
+          htole(static_cast<uint32_t>(PeerRegisterBarAddress)), MmioFlags);
+    write(PeerPciConfigAddress + PCI0_BASE_ADDR2,
+          htole(static_cast<uint32_t>(PeerUarBarAddress)), MmioFlags);
+    write(PeerPciConfigAddress + PCI_COMMAND,
+          htole(static_cast<uint16_t>(PCI_CMD_MSE | PCI_CMD_BME)), MmioFlags);
+
+    const pvrdma::rocev2::MacAddress sender_mac =
+        {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver_mac =
+        {0x02, 0, 0, 0, 0, 2};
+    setupPairEndpoint(*rdma, PairSenderQp, PairSenderCq,
+                      PairSenderPayload, receiver_mac, 0x100, 0x200);
+    setupPairEndpoint(*peerRdma, PairReceiverQp, PairReceiverCq,
+                      PairReceiverPayload, sender_mac, 0x200, 0x100);
+
+    write(RegisterBarAddress + pvrdma::RegMacLow,
+          htole(uint32_t{0x44332211}), MmioFlags);
+    write(RegisterBarAddress + pvrdma::RegMacHigh,
+          htole(uint32_t{0x6655}), MmioFlags);
+    panic_if(letoh(read<uint32_t>(RegisterBarAddress + pvrdma::RegMacLow,
+                                  MmioFlags)) != 0x44332211 ||
+                 letoh(read<uint32_t>(RegisterBarAddress + pvrdma::RegMacHigh,
+                                      MmioFlags)) != 0x6655,
+             "PVRDMA idle MAC writes did not take effect");
+    write(RegisterBarAddress + pvrdma::RegMacLow,
+          htole(uint32_t{0x00000002}), MmioFlags);
+    write(RegisterBarAddress + pvrdma::RegMacHigh,
+          htole(uint32_t{0x0100}), MmioFlags);
+
+    std::array<uint8_t, 512> payload{};
+    for (size_t i = 0; i < payload.size(); ++i)
+        payload[i] = i ^ 0x5a;
+    write(PairSenderPayload, payload);
+    write(PairReceiverPayload, std::array<uint8_t, 512>{});
+
+    for (uint32_t i = 0; i < 8; ++i) {
+        pvrdma::SendWqeHeader send{};
+        send.workRequestId = htole(uint64_t{0x1000 + i});
+        send.numSge = htole(uint32_t{1});
+        send.opcode = htole(static_cast<uint32_t>(
+            pvrdma::WorkRequestOpcode::Send));
+        send.sendFlags = htole(i == 1 ? 0U : pvrdma::SendSignaled);
+        pvrdma::Sge send_sge{
+            htole(static_cast<uint64_t>(PairSenderPayload + 64 * i)),
+            htole(i == 2 ? 0U : i == 5 ? 1025U : 64U),
+            htole(uint32_t{1})};
+        std::array<uint8_t, pvrdma::SqStride> send_slot{};
+        std::memcpy(send_slot.data(), &send, sizeof(send));
+        std::memcpy(send_slot.data() + sizeof(send), &send_sge,
+                    sizeof(send_sge));
+        write(PairSenderSq + i * pvrdma::SqStride, send_slot);
+
+        if (i >= 4)
+            continue;
+        pvrdma::ReceiveWqeHeader receive{};
+        receive.workRequestId = htole(uint64_t{0x2000 + i});
+        receive.numSge = htole(uint32_t{1});
+        pvrdma::Sge receive_sge{
+            htole(static_cast<uint64_t>(PairReceiverPayload + 64 * i)),
+            htole(i == 3 ? 32U : 64U), htole(uint32_t{1})};
+        std::array<uint8_t, pvrdma::RqStride> receive_slot{};
+        std::memcpy(receive_slot.data(), &receive, sizeof(receive));
+        std::memcpy(receive_slot.data() + sizeof(receive), &receive_sge,
+                    sizeof(receive_sge));
+        write(PairReceiverRq + i * pvrdma::RqStride, receive_slot);
+    }
+
+    peerRdma->commandSlotAddress = CommandAddress;
+    peerRdma->responseSlotAddress = ResponseAddress;
+    peerRdma->commandSlotDmaAddress = peerRdma->pciToDma(CommandAddress);
+    peerRdma->responseSlotDmaAddress = peerRdma->pciToDma(ResponseAddress);
+
+    auto &receiver_qp = peerRdma->queuePairs.entries[1];
+    receiver_qp.state = pvrdma::QpState::Init;
+    receiver_qp.attributes = {};
+    receiver_qp.attributes.qpState = receiver_qp.attributes.currentQpState =
+        receiver_qp.state;
+    receiver_qp.attributes.qpAccessFlags = pvrdma::AccessLocalWrite;
+    receiver_qp.attributes.portNumber = 1;
+    receiver_qp.attributes.capabilities = receiver_qp.capabilities;
+    pvrdma::RingState receiver_rings{};
+    receiver_rings.rx.producerTail = htole(uint32_t{3});
+    write(PairReceiverQp, receiver_rings);
+    write(PeerUarBarAddress + pvrdma::UarPageSize,
+          htole(pvrdma::RqDoorbellAction | 1), MmioFlags);
+
+    pvrdma::CommandRequest request{};
+    request.header.response = htole(uint64_t{0x6060606060606060});
+    request.header.command = htole(
+        static_cast<uint32_t>(pvrdma::Command::ModifyQp));
+    request.modifyQp.qpHandle = htole(uint32_t{1});
+    request.modifyQp.attributeMask = htole(
+        pvrdma::QpAttrState | pvrdma::QpAttrAddressVector |
+        pvrdma::QpAttrPathMtu | pvrdma::QpAttrReceivePsn |
+        pvrdma::QpAttrMaxDestReadAtomic | pvrdma::QpAttrMinRnrTimer |
+        pvrdma::QpAttrDestinationQpn);
+    auto &attrs = request.modifyQp.attributes;
+    attrs.qpState = static_cast<pvrdma::QpState>(htole(
+        static_cast<uint32_t>(pvrdma::QpState::ReadyToReceive)));
+    attrs.pathMtu = static_cast<pvrdma::Mtu>(htole(
+        static_cast<uint32_t>(pvrdma::Mtu::Mtu1024)));
+    attrs.destinationQpNumber = htole(uint32_t{1});
+    attrs.receivePsn = htole(uint32_t{0x100});
+    attrs.maxDestinationReadAtomic = 1;
+    attrs.minRnrTimer = 12;
+    attrs.addressHandle.portNumber = 1;
+    std::copy(sender_mac.begin(), sender_mac.end(),
+              attrs.addressHandle.destinationMac);
+    write(CommandAddress, request);
+    write(ResponseAddress, pvrdma::CommandResponse{});
+    write(PeerRegisterBarAddress + pvrdma::RegRequest,
+          uint32_t{0}, MmioFlags);
+    panic_if(read<uint32_t>(PeerRegisterBarAddress + pvrdma::RegError,
+                            MmioFlags) != 0,
+             "PVRDMA immediate INIT-to-RTR command was rejected");
+}
+
+void
+PvrdmaTester::setupReliabilityPair()
+{
+    configurePci();
+    write(PeerPciConfigAddress + PCI0_BASE_ADDR0,
+          htole(static_cast<uint32_t>(PeerMsixBarAddress)), MmioFlags);
+    write(PeerPciConfigAddress + PCI0_BASE_ADDR1,
+          htole(static_cast<uint32_t>(PeerRegisterBarAddress)), MmioFlags);
+    write(PeerPciConfigAddress + PCI0_BASE_ADDR2,
+          htole(static_cast<uint32_t>(PeerUarBarAddress)), MmioFlags);
+    write(PeerPciConfigAddress + PCI_COMMAND,
+          htole(static_cast<uint16_t>(PCI_CMD_MSE | PCI_CMD_BME)), MmioFlags);
+
+    const pvrdma::rocev2::MacAddress sender_mac =
+        {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver_mac =
+        {0x02, 0, 0, 0, 0, 2};
+    setupPairEndpoint(*rdma, PairSenderQp, PairSenderCq,
+                      PairSenderPayload, receiver_mac, 0x100, 0x200);
+    setupPairEndpoint(*peerRdma, PairReceiverQp, PairReceiverCq,
+                      PairReceiverPayload, sender_mac, 0x200, 0x100);
+    rdma->queuePairs.entries[1].attributes.timeout = 8;
+    rdma->queuePairs.entries[1].attributes.retryCount = 2;
+    rdma->queuePairs.entries[1].attributes.rnrRetry = 2;
+    peerRdma->queuePairs.entries[1].attributes.minRnrTimer = 1;
+}
+
+void
+PvrdmaTester::postReliabilityReceive(uint32_t length)
+{
+    auto &qp = peerRdma->queuePairs.entries[1];
+    const uint32_t slot = qp.rqProducerTail & 7;
+    pvrdma::ReceiveWqeHeader receive{};
+    receive.workRequestId = htole(uint64_t{0x9000 + reliabilityCase});
+    receive.numSge = htole(uint32_t{1});
+    const pvrdma::Sge sge{htole(static_cast<uint64_t>(PairReceiverPayload)),
+                          htole(length), htole(uint32_t{1})};
+    std::array<uint8_t, pvrdma::RqStride> bytes{};
+    std::memcpy(bytes.data(), &receive, sizeof(receive));
+    std::memcpy(bytes.data() + sizeof(receive), &sge, sizeof(sge));
+    write(PairReceiverRq + slot * pvrdma::RqStride, bytes);
+    auto rings = read<pvrdma::RingState>(PairReceiverQp);
+    rings.rx.producerTail = htole(pvrdma::ringAdvance(
+        qp.rqProducerTail, qp.capabilities.maxRecvWr));
+    write(PairReceiverQp, rings);
+    write(PeerUarBarAddress + pvrdma::UarPageSize,
+          htole(pvrdma::RqDoorbellAction | 1), MmioFlags);
+}
+
+void
+PvrdmaTester::postReliabilitySend(uint32_t length)
+{
+    auto &qp = rdma->queuePairs.entries[1];
+    const uint32_t slot = qp.sqProducerTail & 7;
+    std::array<uint8_t, 4097> payload{};
+    for (size_t i = 0; i < length; ++i)
+        payload[i] = static_cast<uint8_t>(i ^ reliabilityCase ^ 0x5a);
+    write(PairSenderPayload, payload);
+    pvrdma::SendWqeHeader send{};
+    send.workRequestId = htole(uint64_t{0x8000 + reliabilityCase});
+    send.numSge = htole(uint32_t{1});
+    send.opcode = htole(static_cast<uint32_t>(
+        pvrdma::WorkRequestOpcode::Send));
+    send.sendFlags = htole(reliabilityCase == 6 ? 0U :
+                           pvrdma::SendSignaled);
+    const pvrdma::Sge sge{htole(static_cast<uint64_t>(PairSenderPayload)),
+                          htole(length), htole(uint32_t{1})};
+    std::array<uint8_t, pvrdma::SqStride> bytes{};
+    std::memcpy(bytes.data(), &send, sizeof(send));
+    std::memcpy(bytes.data() + sizeof(send), &sge, sizeof(sge));
+    write(PairSenderSq + slot * pvrdma::SqStride, bytes);
+    auto rings = read<pvrdma::RingState>(PairSenderQp);
+    rings.tx.producerTail = htole(pvrdma::ringAdvance(
+        qp.sqProducerTail, qp.capabilities.maxSendWr));
+    write(PairSenderQp, rings);
+    write(UarBarAddress + pvrdma::UarPageSize,
+          htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+}
+
+void
+PvrdmaTester::runSemanticPair()
+{
+    static constexpr std::array<uint32_t, 6> Lengths =
+        {0, 1, 64, 1024, 1025, 4097};
+    static constexpr uint32_t InitialPsn = 0x00fffffb;
+    const pvrdma::rocev2::MacAddress sender_mac =
+        {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver_mac =
+        {0x02, 0, 0, 0, 0, 2};
+    const auto expected_psn = [&](size_t last) {
+        uint32_t psn = InitialPsn;
+        for (size_t i = 0; i <= last; ++i) {
+            uint16_t segments = 0;
+            panic_if(!pvrdma::segmentGeometry(Lengths[i], segments),
+                     "PVRDMA semantic length was not segmentable");
+            while (segments--)
+                psn = pvrdma::advancePsn(psn);
+        }
+        return psn;
+    };
+    const auto clear_receive = [&] {
+        std::array<uint8_t, 4097> marker;
+        marker.fill(0xa5);
+        write(PairReceiverPayload, marker);
+    };
+
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        rdma->queuePairs.entries[1].attributes.sendPsn = InitialPsn;
+        peerRdma->queuePairs.entries[1].attributes.receivePsn = InitialPsn;
+        clear_receive();
+        postReliabilityReceive(Lengths[0]);
+        timingStage = TimingStage::SemanticPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::SemanticPostSq:
+        postReliabilitySend(Lengths[reliabilityCase]);
+        timingStage = TimingStage::SemanticVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      case TimingStage::SemanticVerify: {
+        const uint32_t length = Lengths[reliabilityCase];
+        const uint32_t completed = reliabilityCase + 1;
+        const auto received = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        for (size_t i = 0; i < received.size(); ++i) {
+            const uint8_t expected = i < length ?
+                static_cast<uint8_t>(i ^ reliabilityCase ^ 0x5a) : 0xa5;
+            panic_if(received[i] != expected,
+                     "PVRDMA semantic payload mismatch case %u byte %u",
+                     reliabilityCase, i);
+        }
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        uint64_t expected_bytes = 0;
+        uint64_t completed_bytes = 0;
+        for (size_t i = 0; i <= reliabilityCase; ++i) {
+            const auto send = read<pvrdma::CompletionQueueElement>(
+                PairSenderCqe + i * pvrdma::CqeSize);
+            const auto receive = read<pvrdma::CompletionQueueElement>(
+                PairReceiverCqe + i * pvrdma::CqeSize);
+            expected_bytes += Lengths[i];
+            completed_bytes += letoh(receive.byteLength);
+            panic_if(letoh(send.workRequestId) != 0x8000 + i ||
+                         letoh(send.opcode) != 0 || letoh(send.status) != 0 ||
+                         letoh(send.byteLength) != 0 || letoh(send.qp) != 1 ||
+                         letoh(send.sourceQp) != 0 ||
+                         letoh(receive.workRequestId) != 0x9000 + i ||
+                         letoh(receive.opcode) != 128 ||
+                         letoh(receive.status) != 0 ||
+                         letoh(receive.byteLength) != Lengths[i] ||
+                         letoh(receive.qp) != 1 ||
+                         letoh(receive.sourceQp) != 1,
+                     "PVRDMA semantic CQE mismatch case %u", i);
+        }
+        panic_if(letoh(sender_ring.tx.consumerHead) != completed ||
+                     letoh(receiver_ring.rx.consumerHead) != completed ||
+                     letoh(sender_cq.producerTail) != completed ||
+                     letoh(receiver_cq.producerTail) != completed ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != completed ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead !=
+                         completed ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn !=
+                         expected_psn(reliabilityCase) ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         expected_psn(reliabilityCase) ||
+                     completed_bytes != expected_bytes ||
+                     rdma->queueStats.sqPosted.value() != completed ||
+                     rdma->queueStats.sqConsumed.value() != completed ||
+                     rdma->queueStats.cqPublished.value() != completed ||
+                     rdma->queueStats.cqErrorPublished.value() != 0 ||
+                     peerRdma->queueStats.rqPosted.value() != completed ||
+                     peerRdma->queueStats.rqConsumed.value() != completed ||
+                     peerRdma->queueStats.cqPublished.value() != completed ||
+                     peerRdma->queueStats.cqErrorPublished.value() != 0 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA semantic accounting mismatch case %u",
+                 reliabilityCase);
+        if (++reliabilityCase < Lengths.size()) {
+            clear_receive();
+            postReliabilityReceive(Lengths[reliabilityCase]);
+            timingStage = TimingStage::SemanticPostSq;
+            schedule(testEvent, curTick() + microseconds(20));
+            return;
+        }
+
+        clear_receive();
+        postReliabilityReceive(128);
+        timingStage = TimingStage::SemanticMalformedPost;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      }
+      case TimingStage::SemanticMalformedPost: {
+        panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 7,
+                 "PVRDMA semantic malformed RQ was not observed");
+        const std::array<uint8_t, pvrdma::FixedMtu> payload = {0x5a};
+        pvrdma::rocev2::Packet malformed;
+        malformed.opcode = pvrdma::rocev2::Opcode::SendMiddle;
+        malformed.destinationQpn = 1;
+        malformed.psn = expected_psn(Lengths.size() - 1);
+        malformed.payload = {payload.data(), payload.size()};
+        panic_if(!rdma->interface.sendPacket(rocePacket(
+                     malformed, sender_mac, receiver_mac)),
+                 "PVRDMA semantic EtherLink rejected malformed DATA");
+        timingStage = TimingStage::SemanticMalformedVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::SemanticMalformedVerify: {
+        const auto marker = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const uint32_t psn = expected_psn(Lengths.size() - 1);
+        panic_if(std::any_of(marker.begin(), marker.end(),
+                            [](uint8_t byte) { return byte != 0xa5; }) ||
+                     letoh(sender_ring.tx.consumerHead) != Lengths.size() ||
+                     letoh(receiver_ring.rx.producerTail) != 7 ||
+                     letoh(receiver_ring.rx.consumerHead) != Lengths.size() ||
+                     peerRdma->queuePairs.entries[1].rqProducerTail != 7 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead !=
+                         Lengths.size() ||
+                     letoh(sender_cq.producerTail) != Lengths.size() ||
+                     letoh(receiver_cq.producerTail) != Lengths.size() ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != psn ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         psn ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA malformed DATA changed receive-visible state");
+
+        postReliabilitySend(128);
+        timingStage = TimingStage::SemanticMalformedValidVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::SemanticMalformedValidVerify: {
+        const auto receive = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + Lengths.size() * pvrdma::CqeSize);
+        const auto marker = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        const uint32_t next_psn = pvrdma::advancePsn(
+            expected_psn(Lengths.size() - 1));
+        for (size_t i = 0; i < marker.size(); ++i) {
+            const uint8_t expected = i < 128 ?
+                static_cast<uint8_t>(i ^ reliabilityCase ^ 0x5a) : 0xa5;
+            panic_if(marker[i] != expected,
+                     "PVRDMA malformed follow-up payload mismatch byte %u",
+                     i);
+        }
+        panic_if(peerRdma->queuePairs.entries[1].rqConsumerHead != 7 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 7 ||
+                     letoh(receive.workRequestId) != 0x9006 ||
+                     letoh(receive.opcode) != 128 ||
+                     letoh(receive.status) != 0 ||
+                     letoh(receive.byteLength) != 128 ||
+                     letoh(receive.qp) != 1 || letoh(receive.sourceQp) != 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn !=
+                         next_psn ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         next_psn ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA malformed DATA consumed or damaged posted RQ");
+        clear_receive();
+        rdma->queuePairs.entries[1].attributes.rnrRetry = 0;
+        ++reliabilityCase;
+        postReliabilitySend(64);
+        timingStage = TimingStage::SemanticRnrVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::SemanticRnrVerify: {
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + Lengths.size() * pvrdma::CqeSize);
+        const auto marker = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        const auto untouched = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + (Lengths.size() + 1) * pvrdma::CqeSize);
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const uint32_t psn = pvrdma::advancePsn(
+            expected_psn(Lengths.size() - 1));
+        panic_if(rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != 8 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 7 ||
+                     rdma->completionQueues.entries[1].producerTail != 7 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 7 ||
+                     letoh(sender_ring.tx.consumerHead) != 8 ||
+                     letoh(sender_cq.producerTail) != 7 ||
+                     letoh(error.workRequestId) != 0x8007 ||
+                     letoh(error.opcode) != 0 || letoh(error.status) != 13 ||
+                     letoh(error.byteLength) != 0 || letoh(error.qp) != 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != psn ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         psn ||
+                     rdma->queueStats.sqPosted.value() != 8 ||
+                     rdma->queueStats.sqConsumed.value() != 8 ||
+                     rdma->queueStats.cqPublished.value() != 7 ||
+                     rdma->queueStats.cqErrorPublished.value() != 1 ||
+                     peerRdma->queueStats.rqPosted.value() != 7 ||
+                     peerRdma->queueStats.rqConsumed.value() != 7 ||
+                     peerRdma->queueStats.cqPublished.value() != 7 ||
+                     std::any_of(marker.begin(), marker.end(),
+                                 [](uint8_t byte) { return byte != 0xa5; }) ||
+                     letoh(untouched.workRequestId) ||
+                     letoh(untouched.status) ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA no-RQ/RNR accounting mismatch");
+
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::ModifyQp));
+        request.modifyQp.qpHandle = htole(uint32_t{1});
+        request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+        request.modifyQp.attributes.qpState = pvrdma::QpState::Reset;
+        pvrdma::CommandResponse response{};
+        panic_if(pvrdma::detail::modifyQp(
+                     request, response, rdma->queuePairs).error,
+                 "PVRDMA RNR terminal reset failed");
+        write(PairSenderQp, pvrdma::RingState{});
+        auto &qp = rdma->queuePairs.entries[1];
+        qp.state = pvrdma::QpState::ReadyToSend;
+        qp.attributes.qpState = qp.attributes.currentQpState = qp.state;
+        qp.attributes.pathMtu = pvrdma::Mtu::Mtu1024;
+        qp.attributes.destinationQpNumber = 1;
+        qp.attributes.qpAccessFlags = pvrdma::AccessLocalWrite;
+        qp.attributes.sendPsn = psn;
+        qp.attributes.portNumber = 1;
+        qp.attributes.addressHandle.portNumber = 1;
+        qp.attributes.capabilities = qp.capabilities;
+        std::copy(receiver_mac.begin(), receiver_mac.end(),
+                  qp.attributes.addressHandle.destinationMac);
+        reliabilityCase = 8;
+        postReliabilityReceive(32);
+        timingStage = TimingStage::SemanticShortPost;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      }
+      case TimingStage::SemanticShortPost:
+        panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 8,
+                 "PVRDMA semantic short RQ was not observed");
+        postReliabilitySend(64);
+        timingStage = TimingStage::SemanticShortVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      case TimingStage::SemanticShortVerify: {
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + 7 * pvrdma::CqeSize);
+        const auto marker = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        const auto receive_error = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + (Lengths.size() + 1) * pvrdma::CqeSize);
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const uint32_t psn = pvrdma::advancePsn(
+            expected_psn(Lengths.size() - 1));
+        panic_if(rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != 1 ||
+                     peerRdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 8 ||
+                     rdma->completionQueues.entries[1].producerTail != 8 ||
+                     letoh(sender_ring.tx.consumerHead) != 1 ||
+                     letoh(sender_cq.producerTail) != 8 ||
+                     letoh(receiver_cq.producerTail) != 8 ||
+                     letoh(error.workRequestId) != 0x8008 ||
+                     letoh(error.opcode) != 0 || letoh(error.status) != 9 ||
+                     letoh(error.byteLength) != 0 || letoh(error.qp) != 1 ||
+                     letoh(receive_error.workRequestId) != 0x9008 ||
+                     letoh(receive_error.opcode) != 128 ||
+                     letoh(receive_error.status) != 1 ||
+                     letoh(receive_error.byteLength) != 64 ||
+                     letoh(receive_error.sourceQp) != 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != psn ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         psn ||
+                     rdma->queueStats.sqPosted.value() != 9 ||
+                     rdma->queueStats.sqConsumed.value() != 9 ||
+                     rdma->queueStats.cqPublished.value() != 8 ||
+                     rdma->queueStats.cqErrorPublished.value() != 2 ||
+                     peerRdma->queueStats.rqPosted.value() != 8 ||
+                     peerRdma->queueStats.rqConsumed.value() != 8 ||
+                     peerRdma->queueStats.cqPublished.value() != 8 ||
+                     peerRdma->queueStats.cqErrorPublished.value() != 1 ||
+                     std::any_of(marker.begin(), marker.end(),
+                                 [](uint8_t byte) { return byte != 0xa5; }) ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA terminal ERROR accounting mismatch");
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::ModifyQp));
+        request.modifyQp.qpHandle = htole(uint32_t{1});
+        request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+        request.modifyQp.attributes.qpState = pvrdma::QpState::Reset;
+        pvrdma::CommandResponse response{};
+        panic_if(pvrdma::detail::modifyQp(
+                     request, response, rdma->queuePairs).error ||
+                     pvrdma::detail::modifyQp(
+                         request, response, peerRdma->queuePairs).error ||
+                     rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Reset ||
+                     peerRdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Reset ||
+                     rdma->queuePairs.entries[1].sqProducerTail ||
+                     rdma->queuePairs.entries[1].sqConsumerHead ||
+                     rdma->queuePairs.entries[1].finalReplay.valid ||
+                     peerRdma->queuePairs.entries[1].finalReplay.valid,
+                 "PVRDMA terminal ERROR-to-Reset recovery failed");
+        inform("PVRDMA direct EtherLink semantic pair test passed");
+        exitSimLoop("PVRDMA semantic pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA semantic pair stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityPair()
+{
+    static constexpr std::array<uint32_t, 7> Lengths =
+        {0, 1, 1023, 1024, 1025, 4097, 2049};
+    using Direction = PvrdmaTestLink::Direction;
+    using FrameId = PvrdmaTestLink::FrameId;
+    const auto frame_id = [](Direction direction,
+                             pvrdma::rocev2::Opcode opcode, uint32_t psn,
+                             pvrdma::rocev2::Syndrome syndrome =
+                                 pvrdma::rocev2::Syndrome::Ack) {
+        return FrameId{direction, opcode, syndrome, psn};
+    };
+
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        postReliabilityReceive(Lengths[reliabilityCase]);
+        timingStage = TimingStage::ReliabilityPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::ReliabilityPostSq: {
+        const uint32_t length = Lengths[reliabilityCase];
+        auto &send_qp = rdma->queuePairs.entries[1];
+        auto &recv_qp = peerRdma->queuePairs.entries[1];
+        if (reliabilityCase == 4) {
+            send_qp.attributes.sendPsn = 0x00ffffff;
+            recv_qp.attributes.receivePsn = 0x00ffffff;
+        }
+        const uint32_t psn = send_qp.attributes.sendPsn;
+        if (reliabilityCase == 0) {
+            testLink->dropOnce(frame_id(Direction::Int0ToInt1,
+                pvrdma::rocev2::Opcode::SendOnly, psn));
+        } else if (reliabilityCase == 1) {
+            reliabilityRxDmasBefore = peerRdma->receivePayloadDmaStarts;
+            testLink->duplicateOnce(frame_id(Direction::Int0ToInt1,
+                pvrdma::rocev2::Opcode::SendOnly, psn));
+        } else if (reliabilityCase == 2) {
+            recv_qp.attributes.minRnrTimer = 5;
+        } else if (reliabilityCase == 3) {
+            testLink->holdOnce(frame_id(Direction::Int1ToInt0,
+                pvrdma::rocev2::Opcode::Acknowledge, psn));
+        } else if (reliabilityCase == 4) {
+            testLink->duplicateOnce(frame_id(Direction::Int1ToInt0,
+                pvrdma::rocev2::Opcode::Acknowledge, psn));
+        } else if (reliabilityCase == 5) {
+            testLink->dropOnce(frame_id(Direction::Int0ToInt1,
+                pvrdma::rocev2::Opcode::SendMiddle,
+                pvrdma::advancePsn(pvrdma::advancePsn(psn))));
+            testLink->dropOnce(frame_id(Direction::Int0ToInt1,
+                pvrdma::rocev2::Opcode::SendLast,
+                (psn + 4) & pvrdma::rocev2::Field24Mask));
+        } else if (reliabilityCase == 6) {
+            for (int retry = 0; retry < 3; ++retry)
+                testLink->dropOnce(frame_id(Direction::Int0ToInt1,
+                    pvrdma::rocev2::Opcode::SendMiddle,
+                    pvrdma::advancePsn(psn)));
+        }
+        postReliabilitySend(length);
+        timingStage = reliabilityCase == 2 ?
+            TimingStage::ReliabilityRnrPostRq :
+            reliabilityCase == 3 ?
+                TimingStage::ReliabilityDeadlineRelease :
+                TimingStage::ReliabilityVerify;
+        schedule(testEvent, curTick() +
+            microseconds(reliabilityCase == 2 ? 40 :
+                reliabilityCase == 3 ? 50 :
+                reliabilityCase == 6 ? 7000 : 3000));
+        return;
+      }
+      case TimingStage::ReliabilityRnrPostRq:
+        panic_if(!rdma->transportTimerEvent.scheduled() ||
+                     rdma->drain() != DrainState::Draining ||
+                     !rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences,
+                 "PVRDMA RNR timer was not drain-visible");
+        postReliabilityReceive(Lengths[reliabilityCase]);
+        timingStage = TimingStage::ReliabilityVerify;
+        schedule(testEvent, curTick() + microseconds(3000));
+        return;
+      case TimingStage::ReliabilityDeadlineRelease: {
+        const auto &qp = rdma->queuePairs.entries[1];
+        const PvrdmaTestLink::FrameId ack{
+            Direction::Int1ToInt0, pvrdma::rocev2::Opcode::Acknowledge,
+            pvrdma::rocev2::Syndrome::Ack, qp.attributes.sendPsn};
+        panic_if(!rdma->transportTimerEvent.scheduled() ||
+                     rdma->transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitResponse ||
+                     !testLink->releaseAt(
+                         ack, rdma->transportTimerEvent.when()),
+                 "PVRDMA exact-deadline ACK setup failed");
+        timingStage = TimingStage::ReliabilityVerify;
+        schedule(testEvent, rdma->transportTimerEvent.when() +
+            microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityVerify: {
+        const uint32_t length = Lengths[reliabilityCase];
+        if (reliabilityCase == 6) {
+            const auto error = read<pvrdma::CompletionQueueElement>(
+                PairSenderCqe + reliabilityCase * pvrdma::CqeSize);
+            const auto receive_error = read<pvrdma::CompletionQueueElement>(
+                PairReceiverCqe + reliabilityCase * pvrdma::CqeSize);
+            panic_if(rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     peerRdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     rdma->queuePairs.entries[1].sqConsumerHead !=
+                         reliabilityCase + 1 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead !=
+                         reliabilityCase + 1 ||
+                     rdma->completionQueues.entries[1].producerTail !=
+                         reliabilityCase + 1 ||
+                     peerRdma->completionQueues.entries[1].producerTail !=
+                         reliabilityCase + 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 7 ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         7 ||
+                     letoh(error.workRequestId) !=
+                         0x8000 + reliabilityCase ||
+                     letoh(error.status) != 12 ||
+                     letoh(receive_error.workRequestId) !=
+                         0x9000 + reliabilityCase ||
+                     letoh(receive_error.status) != 2 ||
+                     letoh(receive_error.byteLength) != pvrdma::FixedMtu ||
+                     letoh(receive_error.sourceQp) != 1 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     rdma->drain() != DrainState::Drained ||
+                     peerRdma->drain() != DrainState::Drained ||
+                     testLink->drain() != DrainState::Drained ||
+                     rdma->queueStats.cqErrorPublished.value() != 1 ||
+                     peerRdma->queueStats.cqErrorPublished.value() != 1 ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                     "PVRDMA retry exhaustion mismatch case %u",
+                     reliabilityCase);
+            pvrdma::CommandRequest request{};
+            request.header.command = htole(static_cast<uint32_t>(
+                pvrdma::Command::ModifyQp));
+            request.modifyQp.qpHandle = htole(uint32_t{1});
+            request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+            request.modifyQp.attributes.qpState =
+                pvrdma::QpState::Reset;
+            pvrdma::CommandResponse response{};
+            panic_if(pvrdma::detail::modifyQp(
+                         request, response, rdma->queuePairs).error ||
+                     pvrdma::detail::modifyQp(
+                         request, response, peerRdma->queuePairs).error ||
+                     rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Reset ||
+                     peerRdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Reset ||
+                     rdma->queuePairs.entries[1].finalReplay.valid ||
+                     peerRdma->queuePairs.entries[1].finalReplay.valid,
+                     "PVRDMA Error-to-Reset recovery failed");
+            inform("PVRDMA segmented reliability pair test passed");
+            exitSimLoop("PVRDMA reliability pair test passed");
+            return;
+        }
+        const auto received = read<std::array<uint8_t, 4097>>(
+            PairReceiverPayload);
+        for (size_t i = 0; i < length; ++i)
+            panic_if(received[i] !=
+                         static_cast<uint8_t>(i ^ reliabilityCase ^ 0x5a),
+                     "PVRDMA reliability payload mismatch case %u byte %u",
+                     reliabilityCase, i);
+        uint16_t segments = 0;
+        panic_if(!pvrdma::segmentGeometry(length, segments),
+                 "PVRDMA reliability test length was not segmentable");
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(sender_ring.tx.consumerHead) !=
+                         rdma->queuePairs.entries[1].sqConsumerHead ||
+                     letoh(receiver_ring.rx.consumerHead) !=
+                         peerRdma->queuePairs.entries[1].rqConsumerHead ||
+                     rdma->queuePairs.entries[1].sqConsumerHead !=
+                         reliabilityCase + 1 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead !=
+                         reliabilityCase + 1 ||
+                     letoh(sender_cq.producerTail) != reliabilityCase + 1 ||
+                     letoh(receiver_cq.producerTail) != reliabilityCase + 1 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     testLink->drain() != DrainState::Drained ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value() ||
+                     !peerRdma->queuePairs.entries[1].finalReplay.valid ||
+                     peerRdma->queuePairs.entries[1].finalReplay.finalOpcode !=
+                         pvrdma::sendOpcode(segments - 1, segments) ||
+                     (reliabilityCase == 1 &&
+                      peerRdma->receivePayloadDmaStarts !=
+                          reliabilityRxDmasBefore + 1) ||
+                     (reliabilityCase == 4 &&
+                      (rdma->queuePairs.entries[1].attributes.sendPsn != 1 ||
+                       peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                           1)),
+                 "PVRDMA reliability accounting mismatch case %u",
+                 reliabilityCase);
+        if (reliabilityCase == 1) {
+            const auto replay = peerRdma->queuePairs.entries[1].finalReplay;
+            const pvrdma::rocev2::MacAddress changed_mac =
+                {0x02, 0, 0, 0, 0, 3};
+            write(PeerRegisterBarAddress + pvrdma::RegMacHigh,
+                  htole(uint32_t{0x0300}), MmioFlags);
+            const uint8_t payload = 0x5b;
+            pvrdma::rocev2::Packet frame;
+            frame.sourceMac = replay.remoteMac;
+            frame.destinationMac = changed_mac;
+            frame.sourceGid = replay.remoteGid;
+            frame.destinationGid = replay.localGid;
+            frame.opcode = replay.finalOpcode;
+            frame.destinationQpn = replay.localQpn;
+            frame.psn = replay.finalPsn;
+            frame.trafficClass = TestTrafficClass;
+            frame.flowLabel = TestFlowLabel;
+            frame.hopLimit = TestHopLimit;
+            frame.sourcePort = pvrdma::rocev2::udpSourcePort(
+                frame.flowLabel, replay.remoteQpn, replay.localQpn);
+            frame.payload = {&payload, 1};
+            const size_t size = pvrdma::rocev2::encodedSize(frame);
+            auto packet = std::make_shared<EthPacketData>(size);
+            const auto encoded = pvrdma::rocev2::encode(
+                frame, {packet->data, packet->bufLength});
+            panic_if(!encoded, "PVRDMA mutated-MAC replay failed encode");
+            packet->length = packet->simLength = encoded.size;
+            const auto decoded = pvrdma::rocev2::decode(
+                {packet->data, packet->bufLength}, packet->length);
+            panic_if(!decoded || peerRdma->replayFinal(decoded.packet) ||
+                         peerRdma->transportActive() ||
+                         replay.localMac == changed_mac,
+                     "PVRDMA replay accepted a mutated local MAC");
+            write(PeerRegisterBarAddress + pvrdma::RegMacHigh,
+                  htole(uint32_t{0x0200}), MmioFlags);
+        }
+        if (++reliabilityCase == Lengths.size()) {
+            inform("PVRDMA segmented reliability pair test passed");
+            exitSimLoop("PVRDMA reliability pair test passed");
+            return;
+        }
+        if (reliabilityCase != 2 && reliabilityCase <= 6)
+            postReliabilityReceive(Lengths[reliabilityCase]);
+        timingStage = TimingStage::ReliabilityPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA reliability stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityRnrPair()
+{
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        rdma->queuePairs.entries[1].attributes.rnrRetry = 0;
+        timingStage = TimingStage::ReliabilityPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::ReliabilityPostSq:
+        postReliabilitySend(64);
+        timingStage = TimingStage::ReliabilityVerify;
+        schedule(testEvent, curTick() + microseconds(3000));
+        return;
+      case TimingStage::ReliabilityVerify: {
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe);
+        panic_if(rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != 1 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 0 ||
+                     rdma->completionQueues.entries[1].producerTail != 1 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 0 ||
+                     letoh(error.workRequestId) != 0x8000 ||
+                     letoh(error.status) != 13 ||
+                     rdma->queueStats.cqErrorPublished.value() != 1 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     testLink->drain() != DrainState::Drained ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA RNR exhaustion mismatch");
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::ModifyQp));
+        request.modifyQp.qpHandle = htole(uint32_t{1});
+        request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+        request.modifyQp.attributes.qpState = pvrdma::QpState::Reset;
+        pvrdma::CommandResponse response{};
+        panic_if(pvrdma::detail::modifyQp(
+                     request, response, rdma->queuePairs).error ||
+                     rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Reset ||
+                     rdma->queuePairs.entries[1].finalReplay.valid,
+                 "PVRDMA RNR Error-to-Reset recovery failed");
+        inform("PVRDMA RNR exhaustion reliability test passed");
+        exitSimLoop("PVRDMA reliability RNR pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA RNR reliability stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityTimeoutZeroPair()
+{
+    using Direction = PvrdmaTestLink::Direction;
+    switch (timingStage) {
+      case TimingStage::Configure: {
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        auto &qp = rdma->queuePairs.entries[1];
+        qp.attributes.timeout = 0;
+        testLink->dropOnce({Direction::Int0ToInt1,
+            pvrdma::rocev2::Opcode::SendOnly,
+            pvrdma::rocev2::Syndrome::Ack, qp.attributes.sendPsn});
+        postReliabilitySend(64);
+        timingStage = TimingStage::ReliabilityTimeoutZeroObserve;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityTimeoutZeroObserve: {
+        auto &qp = rdma->queuePairs.entries[1];
+        panic_if(rdma->transportTimerEvent.scheduled() ||
+                     rdma->transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitResponse ||
+                     rdma->transport.retryPending ||
+                     qp.state != pvrdma::QpState::ReadyToSend ||
+                     qp.sqConsumerHead ||
+                     rdma->completionQueues.entries[1].producerTail ||
+                     rdma->memoryRegions.entries[1].activeReferences != 1,
+                 "PVRDMA timeout=0 armed or terminated under loss");
+        reliabilityCase = 1;
+        postReliabilitySend(64);
+        rdma->failSend(pvrdma::CompletionStatus::RemoteOperationError,
+                        true);
+        rdma->scheduleTransport();
+        timingStage = TimingStage::ReliabilityTimeoutZeroVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityTimeoutZeroVerify: {
+        auto &qp = rdma->queuePairs.entries[1];
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe);
+        const auto rings = read<pvrdma::RingState>(PairSenderQp);
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::ModifyQp));
+        request.modifyQp.qpHandle = htole(uint32_t{1});
+        request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+        request.modifyQp.attributes.qpState = pvrdma::QpState::Reset;
+        pvrdma::CommandResponse response{};
+        panic_if(qp.state != pvrdma::QpState::Error ||
+                     qp.sqProducerTail != 2 || qp.sqConsumerHead != 1 ||
+                     letoh(rings.tx.producerTail) != 2 ||
+                     letoh(rings.tx.consumerHead) != 1 ||
+                     rdma->completionQueues.entries[1].producerTail != 1 ||
+                     letoh(error.workRequestId) != 0x8000 ||
+                     letoh(error.status) != 11 || rdma->transportActive() ||
+                     pvrdma::detail::modifyQp(
+                         request, response, rdma->queuePairs).error ||
+                     qp.state != pvrdma::QpState::Reset ||
+                     qp.sqProducerTail || qp.sqConsumerHead,
+                 "PVRDMA timeout=0 remote ERROR/reset recovery mismatch");
+        inform("PVRDMA timeout=0 reliability test passed");
+        exitSimLoop("PVRDMA reliability timeout-zero pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA timeout=0 reliability stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityInvalidPair()
+{
+    using Direction = PvrdmaTestLink::Direction;
+    using Opcode = pvrdma::rocev2::Opcode;
+    static constexpr uint32_t Length = 2049;
+
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        rdma->queuePairs.entries[1].attributes.sendPsn =
+            pvrdma::rocev2::Field24Mask;
+        peerRdma->queuePairs.entries[1].attributes.receivePsn =
+            pvrdma::rocev2::Field24Mask;
+        postReliabilityReceive(Length);
+        timingStage = TimingStage::ReliabilityPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::ReliabilityPostSq: {
+        const auto &qp = rdma->queuePairs.entries[1];
+        testLink->holdOnce({Direction::Int1ToInt0, Opcode::Acknowledge,
+                            pvrdma::rocev2::Syndrome::Ack,
+                            qp.attributes.sendPsn});
+        postReliabilitySend(Length);
+        timingStage = TimingStage::ReliabilityInvalidInject;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityInvalidInject: {
+        auto &receiver = *peerRdma;
+        panic_if(testLink->heldPackets() != 1 ||
+                     !receiver.transport.active() ||
+                     receiver.transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitReceiveData ||
+                     receiver.transport.acceptedSegmentIndex != 0,
+                 "PVRDMA invalid continuation setup did not become partial");
+        const auto &sender_qp = rdma->queuePairs.entries[1];
+        const uint8_t payload = 0x5a;
+        pvrdma::rocev2::Packet frame;
+        frame.opcode = Opcode::SendLast;
+        frame.destinationQpn = 1;
+        frame.psn = pvrdma::advancePsn(
+            pvrdma::advancePsn(sender_qp.attributes.sendPsn));
+        frame.payload = {&payload, 1};
+        const pvrdma::rocev2::MacAddress sender_mac =
+            {0x02, 0, 0, 0, 0, 1};
+        const pvrdma::rocev2::MacAddress receiver_mac =
+            {0x02, 0, 0, 0, 0, 2};
+        auto packet = rocePacket(frame, sender_mac, receiver_mac);
+        panic_if(!receiver.recvTransportPacket(std::move(packet)),
+                 "PVRDMA out-of-order frame was not accepted");
+        timingStage = TimingStage::ReliabilityInvalidVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityInvalidVerify: {
+        const PvrdmaTestLink::FrameId ack{
+            Direction::Int1ToInt0, Opcode::Acknowledge,
+            pvrdma::rocev2::Syndrome::Ack,
+            pvrdma::rocev2::Field24Mask};
+        if (!reliabilityCase++) {
+            panic_if(!testLink->release(ack),
+                     "PVRDMA stale held ACK was not releasable");
+            schedule(testEvent, curTick() + microseconds(20));
+            return;
+        }
+        const auto send = read<pvrdma::CompletionQueueElement>(PairSenderCqe);
+        const auto receive = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe);
+        panic_if(rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::ReadyToSend ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != 1 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 1 ||
+                     rdma->completionQueues.entries[1].producerTail != 1 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 1 ||
+                     letoh(send.status) || letoh(receive.status) ||
+                     letoh(receive.sourceQp) != 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 2 ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         2 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     testLink->drain() != DrainState::Drained ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA sequence NAK retry mismatch");
+        inform("PVRDMA sequence NAK reliability test passed");
+        exitSimLoop("PVRDMA reliability invalid pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA invalid-continuation test stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilitySequencePair()
+{
+    using Direction = PvrdmaTestLink::Direction;
+    using Opcode = pvrdma::rocev2::Opcode;
+    using Syndrome = pvrdma::rocev2::Syndrome;
+    const pvrdma::rocev2::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+    const auto sequence_nak = [&](uint32_t psn) {
+        pvrdma::rocev2::Packet frame;
+        frame.opcode = Opcode::Acknowledge;
+        frame.ackRequest = false;
+        frame.destinationQpn = 1;
+        frame.psn = psn;
+        frame.syndrome = Syndrome::SequenceNak;
+        return rocePacket(frame, receiver, sender);
+    };
+
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        busyPolls = 0;
+        testLink->dropOnce({Direction::Int0ToInt1, Opcode::SendFirst,
+                            Syndrome::Ack, 0x100});
+        postReliabilitySend(2049);
+        timingStage = TimingStage::ReliabilitySequenceFutureInject;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      case TimingStage::ReliabilitySequenceFutureInject:
+        panic_if(rdma->transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitResponse ||
+                     rdma->transport.segmentIndex != 0 ||
+                     rdma->transport.segmentCount != 3 ||
+                     rdma->transport.retryRemaining != 2 ||
+                     !rdma->recvTransportPacket(sequence_nak(0x102)),
+                 "PVRDMA unsent-future sequence NAK setup failed");
+        timingStage = TimingStage::ReliabilitySequenceFutureVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      case TimingStage::ReliabilitySequenceFutureVerify: {
+        const auto error = read<pvrdma::CompletionQueueElement>(PairSenderCqe);
+        auto &qp = rdma->queuePairs.entries[1];
+        panic_if(qp.state != pvrdma::QpState::Error ||
+                     qp.sqConsumerHead != 1 ||
+                     rdma->completionQueues.entries[1].producerTail != 1 ||
+                     letoh(error.workRequestId) != 0x8000 ||
+                     letoh(error.status) != 21 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive(),
+                 "PVRDMA unsent-future sequence NAK skipped payload");
+
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::ModifyQp));
+        request.modifyQp.qpHandle = htole(uint32_t{1});
+        request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+        request.modifyQp.attributes.qpState = pvrdma::QpState::Reset;
+        pvrdma::CommandResponse response{};
+        panic_if(pvrdma::detail::modifyQp(
+                     request, response, rdma->queuePairs).error,
+                 "PVRDMA sequence retry QP reset failed");
+        write(PairSenderQp, pvrdma::RingState{});
+        qp.state = pvrdma::QpState::ReadyToSend;
+        qp.attributes = {};
+        qp.attributes.qpState = qp.attributes.currentQpState = qp.state;
+        qp.attributes.pathMtu = pvrdma::Mtu::Mtu1024;
+        qp.attributes.destinationQpNumber = 1;
+        qp.attributes.qpAccessFlags = pvrdma::AccessLocalWrite;
+        qp.attributes.sendPsn = 0x100;
+        qp.attributes.receivePsn = 0x200;
+        qp.attributes.portNumber = 1;
+        qp.attributes.timeout = 8;
+        qp.attributes.retryCount = 2;
+        qp.attributes.rnrRetry = 2;
+        qp.attributes.maxReadAtomic = 1;
+        qp.attributes.addressHandle.portNumber = 1;
+        qp.attributes.capabilities = qp.capabilities;
+        std::copy(receiver.begin(), receiver.end(),
+                  qp.attributes.addressHandle.destinationMac);
+        reliabilityCase = 1;
+        testLink->dropOnce({Direction::Int0ToInt1, Opcode::SendOnly,
+                            Syndrome::Ack, 0x100});
+        postReliabilitySend(64);
+        timingStage = TimingStage::ReliabilitySequenceRetryInject;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilitySequenceRetryInject:
+        panic_if(rdma->transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitResponse ||
+                     rdma->transport.segmentIndex != 0,
+                 "PVRDMA sequence restart was not awaiting response");
+        if (busyPolls < 2) {
+            testLink->dropOnce({Direction::Int0ToInt1, Opcode::SendOnly,
+                                Syndrome::Ack, 0x100});
+        }
+        panic_if(!rdma->recvTransportPacket(sequence_nak(0x100)),
+                 "PVRDMA sequence restart NAK was rejected");
+        if (++busyPolls < 3) {
+            timingStage = TimingStage::ReliabilitySequenceRetryInject;
+            schedule(testEvent, curTick() + microseconds(100));
+        } else {
+            timingStage = TimingStage::ReliabilitySequenceRetryVerify;
+            schedule(testEvent, curTick() + microseconds(100));
+        }
+        return;
+      case TimingStage::ReliabilitySequenceRetryVerify: {
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + pvrdma::CqeSize);
+        const auto rings = read<pvrdma::RingState>(PairSenderQp);
+        auto &qp = rdma->queuePairs.entries[1];
+        panic_if(qp.state != pvrdma::QpState::Error ||
+                     qp.sqConsumerHead != 1 ||
+                     letoh(rings.tx.consumerHead) != 1 ||
+                     rdma->completionQueues.entries[1].producerTail != 2 ||
+                     letoh(error.workRequestId) != 0x8001 ||
+                     letoh(error.status) != 12 ||
+                     rdma->queueStats.cqErrorPublished.value() != 2 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() ||
+                     testLink->pendingRules() ||
+                     testLink->drain() != DrainState::Drained,
+                 "PVRDMA restart NAK did not exhaust retry budget");
+        inform("PVRDMA sequence NAK bounds/retry test passed");
+        exitSimLoop("PVRDMA reliability sequence pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA sequence reliability stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityUnrelatedPair()
+{
+    using Direction = PvrdmaTestLink::Direction;
+    using Opcode = pvrdma::rocev2::Opcode;
+    static constexpr uint32_t Length = 2049;
+    static constexpr uint32_t UnrelatedPsn = 0x456;
+    const pvrdma::rocev2::MacAddress sender_mac =
+        {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver_mac =
+        {0x02, 0, 0, 0, 0, 2};
+
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        postReliabilityReceive(Length);
+        timingStage = TimingStage::ReliabilityPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::ReliabilityPostSq: {
+        const auto &qp = rdma->queuePairs.entries[1];
+        testLink->holdOnce({Direction::Int1ToInt0, Opcode::Acknowledge,
+                            pvrdma::rocev2::Syndrome::Ack,
+                            qp.attributes.sendPsn});
+        postReliabilitySend(Length);
+        timingStage = TimingStage::ReliabilityUnrelatedInject;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityUnrelatedInject: {
+        auto &receiver = *peerRdma;
+        panic_if(testLink->heldPackets() != 1 ||
+                     !receiver.transport.active() ||
+                     receiver.transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitReceiveData ||
+                     receiver.transport.acceptedSegmentIndex != 0,
+                 "PVRDMA unrelated continuation setup did not become partial");
+        const uint8_t payload = 0xa5;
+        pvrdma::rocev2::Packet frame;
+        frame.opcode = Opcode::SendOnly;
+        frame.destinationQpn = 2;
+        frame.psn = UnrelatedPsn;
+        frame.payload = {&payload, 1};
+        panic_if(!receiver.recvTransportPacket(
+                     rocePacket(frame, sender_mac, receiver_mac)),
+                 "PVRDMA unrelated continuation was not accepted");
+        timingStage = TimingStage::ReliabilityUnrelatedVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityUnrelatedVerify: {
+        const PvrdmaTestLink::FrameId ack{
+            Direction::Int1ToInt0, Opcode::Acknowledge,
+            pvrdma::rocev2::Syndrome::Ack, 0x100};
+        const auto &receiver = *peerRdma;
+        panic_if(testLink->pendingRules() || testLink->heldPackets() != 1 ||
+                     receiver.pendingErrorPacket ||
+                     receiver.transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitReceiveData ||
+                     receiver.transport.remoteMac != sender_mac ||
+                     receiver.transport.remoteQpn != 1 ||
+                     receiver.transport.localQpn != 1 ||
+                     receiver.transport.totalLength != pvrdma::FixedMtu ||
+                     receiver.transport.segmentIndex != 0 ||
+                     receiver.transport.acceptedSegmentIndex != 0 ||
+                     receiver.transport.psn != 0x100 ||
+                     receiver.transport.acceptedPsn != 0x100 ||
+                     receiver.transport.livePsn != 0x101 ||
+                     !receiver.transport.leaseHeld ||
+                     receiver.memoryRegions.entries[1].activeReferences != 1 ||
+                     receiver.queuePairs.entries[1].rqConsumerHead ||
+                     !testLink->release(ack),
+                 "PVRDMA unrelated continuation disturbed active receive");
+        timingStage = TimingStage::ReliabilityUnrelatedComplete;
+        schedule(testEvent, curTick() + microseconds(3000));
+        return;
+      }
+      case TimingStage::ReliabilityUnrelatedComplete: {
+        const auto received = read<std::array<uint8_t, Length>>(
+            PairReceiverPayload);
+        for (size_t i = 0; i < received.size(); ++i)
+            panic_if(received[i] != static_cast<uint8_t>(i ^ 0x5a),
+                     "PVRDMA unrelated continuation payload mismatch at %u",
+                     i);
+        const auto send = read<pvrdma::CompletionQueueElement>(PairSenderCqe);
+        const auto receive = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe);
+        panic_if(rdma->queuePairs.entries[1].sqConsumerHead != 1 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 1 ||
+                     rdma->completionQueues.entries[1].producerTail != 1 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 1 ||
+                     letoh(send.status) != 0 || letoh(receive.status) != 0 ||
+                     letoh(receive.byteLength) != Length ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 0x103 ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         0x103 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     testLink->drain() != DrainState::Drained,
+                 "PVRDMA receive did not complete after unrelated DATA");
+        inform("PVRDMA unrelated continuation reliability test passed");
+        exitSimLoop("PVRDMA reliability unrelated pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA unrelated-continuation test stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityCqPair()
+{
+    static constexpr uint32_t Length = 1025;
+
+    switch (timingStage) {
+      case TimingStage::Configure: {
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        postReliabilityReceive(Length);
+        pvrdma::Ring blocked{};
+        blocked.consumerHead = htole(uint32_t{7});
+        write(PairReceiverCq + offsetof(pvrdma::RingState, rx), blocked);
+        timingStage = TimingStage::ReliabilityPostSq;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      }
+      case TimingStage::ReliabilityPostSq:
+        postReliabilitySend(Length);
+        timingStage = TimingStage::ReliabilityCqBlocked;
+        schedule(testEvent, curTick() + microseconds(1500));
+        return;
+      case TimingStage::ReliabilityCqBlocked: {
+        const auto received = read<std::array<uint8_t, Length>>(
+            PairReceiverPayload);
+        for (size_t i = 0; i < received.size(); ++i)
+            panic_if(received[i] != static_cast<uint8_t>(i ^ 0x5a),
+                     "PVRDMA CQ-backpressure payload mismatch at %u", i);
+        const auto drain_state = peerRdma->drain();
+        panic_if(rdma->transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitResponse ||
+                     rdma->transport.segmentIndex != 1 ||
+                     rdma->transport.retryRemaining != 1 ||
+                     peerRdma->transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitReceiveCq ||
+                     !peerRdma->transport.completionBackpressured ||
+                     rdma->queuePairs.entries[1].sqConsumerHead != 0 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 0 ||
+                     rdma->completionQueues.entries[1].producerTail != 0 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 0 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 0x101 ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         0x102 ||
+                     rdma->memoryRegions.entries[1].activeReferences != 1 ||
+                     peerRdma->memoryRegions.entries[1].activeReferences !=
+                         1 ||
+                     drain_state != DrainState::Draining,
+                 "PVRDMA duplicate final was not held behind receive CQ");
+        write(PairReceiverCq + offsetof(pvrdma::RingState, rx),
+              pvrdma::Ring{});
+        write(PeerUarBarAddress + pvrdma::UarPageSize +
+                  pvrdma::CqDoorbellOffset,
+              htole(pvrdma::CqPollAction | 1), MmioFlags);
+        timingStage = TimingStage::ReliabilityCqVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityCqVerify: {
+        const auto send = read<pvrdma::CompletionQueueElement>(PairSenderCqe);
+        const auto receive = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe);
+        panic_if(rdma->queuePairs.entries[1].sqConsumerHead != 1 ||
+                     peerRdma->queuePairs.entries[1].rqConsumerHead != 1 ||
+                     rdma->completionQueues.entries[1].producerTail != 1 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 1 ||
+                     letoh(send.workRequestId) != 0x8000 ||
+                     letoh(send.status) != 0 ||
+                     letoh(receive.workRequestId) != 0x9000 ||
+                     letoh(receive.status) != 0 ||
+                     letoh(receive.byteLength) != Length ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 0x102 ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         0x102 ||
+                     !peerRdma->queuePairs.entries[1].finalReplay.valid ||
+                     peerRdma->queuePairs.entries[1].finalReplay.finalOpcode !=
+                         pvrdma::rocev2::Opcode::SendLast ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || peerRdma->transportActive() ||
+                     testLink->drain() != DrainState::Drained ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA receive-CQ retry/replay recovery mismatch");
+        inform("PVRDMA receive-CQ reliability test passed");
+        exitSimLoop("PVRDMA reliability CQ pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA receive-CQ test stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityCqAbortPair()
+{
+    using Opcode = pvrdma::rocev2::Opcode;
+    static constexpr uint32_t Length = pvrdma::FixedMtu;
+    const pvrdma::rocev2::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        postReliabilityReceive(Length);
+        timingStage = TimingStage::ReliabilityCqBlocked;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::ReliabilityCqBlocked: {
+        std::array<uint8_t, Length> payload{};
+        pvrdma::rocev2::Packet first;
+        first.opcode = Opcode::SendFirst;
+        first.destinationQpn = 1;
+        first.psn = 0x100;
+        first.payload = {payload.data(), payload.size()};
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(first, sender, receiver)),
+                 "PVRDMA late-overflow FIRST was rejected");
+        timingStage = TimingStage::ReliabilityCqAbortHeld;
+        schedule(testEvent, curTick() + microseconds(1));
+        return;
+      }
+      case TimingStage::ReliabilityCqAbortHeld: {
+        if (peerRdma->transport.stage !=
+                Pvrdma::TransportState::Stage::WaitReceiveData) {
+            schedule(testEvent, curTick() + microseconds(1));
+            return;
+        }
+        panic_if(!peerRdma->transport.leaseHeld ||
+                     !peerRdma->transportTimerEvent.scheduled() ||
+                     peerRdma->receivePayloadDmaStarts != 1,
+                 "PVRDMA late-overflow FIRST did not become partial");
+        const uint8_t payload = 0x5a;
+        pvrdma::rocev2::Packet last;
+        last.opcode = Opcode::SendLast;
+        last.destinationQpn = 1;
+        last.psn = 0x101;
+        last.payload = {&payload, 1};
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(last, sender, receiver)),
+                 "PVRDMA late-overflow LAST was rejected");
+        timingStage = TimingStage::ReliabilityCqAbortVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::ReliabilityCqAbortVerify: {
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe);
+        const auto rings = read<pvrdma::RingState>(PairReceiverQp);
+        const auto cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        auto &qp = peerRdma->queuePairs.entries[1];
+        panic_if(qp.state != pvrdma::QpState::Error ||
+                     qp.rqConsumerHead != 1 ||
+                     letoh(rings.rx.consumerHead) != 1 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 1 ||
+                     letoh(cq.producerTail) != 1 ||
+                     letoh(error.workRequestId) != 0x9000 ||
+                     letoh(error.opcode) != 128 ||
+                     letoh(error.status) != 1 ||
+                     letoh(error.byteLength) != Length ||
+                     letoh(error.sourceQp) != 1 || qp.finalReplay.valid ||
+                     qp.responderMsn ||
+                     peerRdma->receivePayloadDmaStarts != 1 ||
+                     peerRdma->queueStats.rqConsumed.value() != 1 ||
+                     peerRdma->queueStats.cqErrorPublished.value() != 1 ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->transportTimerEvent.scheduled() ||
+                     peerRdma->transportActive() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA late receive overflow did not retire the RQ");
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::ModifyQp));
+        request.modifyQp.qpHandle = htole(uint32_t{1});
+        request.modifyQp.attributeMask = htole(pvrdma::QpAttrState);
+        request.modifyQp.attributes.qpState = pvrdma::QpState::Reset;
+        pvrdma::CommandResponse response{};
+        panic_if(pvrdma::detail::modifyQp(
+                     request, response, peerRdma->queuePairs).error ||
+                     qp.state != pvrdma::QpState::Reset ||
+                     qp.rqProducerTail || qp.rqConsumerHead ||
+                     qp.finalReplay.valid,
+                 "PVRDMA receive-error QP reset failed");
+        inform("PVRDMA late receive capacity failure test passed");
+        exitSimLoop("PVRDMA reliability CQ abort pair test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA late receive capacity stage");
+    }
+}
+
+void
+PvrdmaTester::runTerminalBackpressurePair()
+{
+    using Opcode = pvrdma::rocev2::Opcode;
+    using TransportStage = Pvrdma::TransportState::Stage;
+    static constexpr uint32_t Length = pvrdma::FixedMtu;
+    static constexpr uint64_t Marker = 0xfeedfacecafebeef;
+    const bool overflow = testMode.find("overflow") != std::string::npos;
+    const bool reset = testMode.find("terminal-reset") !=
+        std::string::npos;
+    const bool checkpoint = testMode == "checkpoint-terminal-drain-save";
+    const pvrdma::rocev2::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+
+    switch (timingStage) {
+      case TimingStage::Configure: {
+        setupReliabilityPair();
+        auto &cq = peerRdma->completionQueues.entries[1];
+        cq.producerTail = cq.cqe;
+        cq.consumerHead = 0;
+        pvrdma::Ring full{};
+        full.producerTail = htole(cq.cqe);
+        write(PairReceiverCq + offsetof(pvrdma::RingState, rx), full);
+        pvrdma::CompletionQueueElement marker{};
+        marker.workRequestId = htole(Marker);
+        write(PairReceiverCqe, marker);
+        peerRdma->queueStatsReset();
+        reliabilityCase = 0;
+        busyPolls = 0;
+        postReliabilityReceive(overflow ? Length : Length + 1);
+        timingStage = TimingStage::TerminalInject;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      }
+      case TimingStage::TerminalInject: {
+        if (peerRdma->queuePairs.entries[1].rqProducerTail != 1) {
+            panic_if(++busyPolls > 10000,
+                     "PVRDMA terminal RQ observation timed out");
+            schedule(testEvent, curTick() + microseconds(1));
+            return;
+        }
+        std::array<uint8_t, Length> payload{};
+        pvrdma::rocev2::Packet first;
+        first.opcode = Opcode::SendFirst;
+        first.destinationQpn = 1;
+        first.psn = 0x100;
+        first.payload = {payload.data(), payload.size()};
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(first, sender, receiver)),
+                 "PVRDMA terminal FIRST was rejected");
+        busyPolls = 0;
+        timingStage = TimingStage::TerminalPartial;
+        schedule(testEvent, curTick() + microseconds(1));
+        return;
+      }
+      case TimingStage::TerminalPartial: {
+        if (peerRdma->transport.stage !=
+                TransportStage::WaitReceiveData) {
+            panic_if(++busyPolls > 10000,
+                     "PVRDMA terminal partial receive timed out");
+            schedule(testEvent, curTick() + microseconds(1));
+            return;
+        }
+        panic_if(!peerRdma->transport.leaseHeld ||
+                     !peerRdma->transportTimerEvent.scheduled() ||
+                     peerRdma->memoryRegions.entries[1].activeReferences != 1,
+                 "PVRDMA terminal receive did not hold its MR");
+        if (overflow) {
+            const uint8_t payload = 0x5a;
+            pvrdma::rocev2::Packet last;
+            last.opcode = Opcode::SendLast;
+            last.destinationQpn = 1;
+            last.psn = 0x101;
+            last.payload = {&payload, 1};
+            panic_if(!peerRdma->recvTransportPacket(
+                         rocePacket(last, sender, receiver)),
+                     "PVRDMA terminal overflow LAST was rejected");
+            schedule(testEvent, curTick() + microseconds(100));
+        } else {
+            schedule(testEvent, peerRdma->transportTimerEvent.when() +
+                microseconds(100));
+        }
+        timingStage = TimingStage::TerminalBackpressured;
+        return;
+      }
+      case TimingStage::TerminalBackpressured: {
+        const auto rings = read<pvrdma::RingState>(PairReceiverQp);
+        const auto cq_ring = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto marker = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe);
+        const auto &qp = peerRdma->queuePairs.entries[1];
+        const auto &cq = peerRdma->completionQueues.entries[1];
+        const uint32_t cq_depth = cq.cqe;
+        panic_if(!peerRdma->terminalCompletionBackpressured() ||
+                     !peerRdma->transport.leaseHeld ||
+                     peerRdma->transport.status !=
+                         (overflow ?
+                              pvrdma::CompletionStatus::LocalLengthError :
+                              pvrdma::CompletionStatus::
+                                  LocalQpOperationError) ||
+                     peerRdma->memoryRegions.entries[1].activeReferences !=
+                         1 ||
+                     peerRdma->completionBusy() || peerRdma->dmaPending() ||
+                     peerRdma->transportTimerEvent.scheduled() ||
+                     qp.state != pvrdma::QpState::ReadyToSend ||
+                     qp.rqConsumerHead || letoh(rings.rx.consumerHead) ||
+                     cq.producerTail != cq.cqe || cq.consumerHead ||
+                     letoh(cq_ring.producerTail) != cq.cqe ||
+                     letoh(cq_ring.consumerHead) ||
+                     letoh(marker.workRequestId) != Marker ||
+                     peerRdma->queueStats.rqConsumed.value() ||
+                     peerRdma->queueStats.cqPublished.value() ||
+                     peerRdma->queueStats.cqErrorPublished.value() ||
+                     peerRdma->queueStats.cqPublicationBackpressured.value() !=
+                         1 ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA terminal receive did not backpressure cleanly");
+
+        if (checkpoint) {
+            for (auto *device : {rdma, peerRdma}) {
+                device->regs.dsrAddress = DsrAddress;
+                device->regs.control = static_cast<uint32_t>(
+                    pvrdma::DeviceControl::Activate);
+                device->commandSlotAddress = CommandAddress;
+                device->responseSlotAddress = ResponseAddress;
+            }
+            inform("PVRDMA terminal receive checkpoint is backpressured");
+            exitSimLoop("PVRDMA terminal drain checkpoint save ready");
+            return;
+        }
+        if (reset) {
+            write(PeerRegisterBarAddress + pvrdma::RegControl,
+                  htole(static_cast<uint32_t>(
+                      pvrdma::DeviceControl::Reset)), MmioFlags);
+            const auto reset_rings = read<pvrdma::RingState>(PairReceiverQp);
+            const auto reset_cq = read<pvrdma::Ring>(PairReceiverCq +
+                offsetof(pvrdma::RingState, rx));
+            const auto reset_marker = read<pvrdma::CompletionQueueElement>(
+                PairReceiverCqe);
+            panic_if(peerRdma->controlState !=
+                             pvrdma::ControlState::Unconfigured ||
+                         peerRdma->regs.error ||
+                         peerRdma->regs.control != static_cast<uint32_t>(
+                             pvrdma::DeviceControl::Reset) ||
+                         peerRdma->memoryRegions.entries[1].valid ||
+                         peerRdma->memoryRegions.entries[1].activeReferences ||
+                         peerRdma->completionQueues.entries[1].valid ||
+                         peerRdma->queuePairs.entries[1].valid ||
+                         peerRdma->transportActive() ||
+                         peerRdma->pendingRxPacket ||
+                         peerRdma->pendingErrorPacket ||
+                         peerRdma->transportEvent.scheduled() ||
+                         peerRdma->transportDmaEvent.scheduled() ||
+                         peerRdma->transportTimerEvent.scheduled() ||
+                         letoh(reset_rings.rx.consumerHead) ||
+                         letoh(reset_cq.producerTail) != cq_depth ||
+                         letoh(reset_marker.workRequestId) != Marker ||
+                         peerRdma->queueStats.rqAvailable.value() ||
+                         peerRdma->queueStats.cqOutstanding.value() ||
+                         peerRdma->queueStats.rqResetDiscarded.value() != 1 ||
+                         peerRdma->queueStats.cqResetDiscarded.value() !=
+                             cq_depth ||
+                         peerRdma->queueStats.cqPublished.value() ||
+                         peerRdma->queueStats.cqErrorPublished.value() ||
+                         peerRdma->queueStats.conservationViolations.value() ||
+                         peerRdma->drain() != DrainState::Drained,
+                     "PVRDMA terminal receive reset escape mismatch");
+            inform("PVRDMA terminal receive reset test passed");
+            exitSimLoop("PVRDMA terminal reset test passed");
+            return;
+        }
+
+        panic_if(peerRdma->drain() != DrainState::Draining ||
+                     peerRdma->transport.stage !=
+                         TransportStage::WriteRqConsumer ||
+                     peerRdma->transport.completionBackpressured ||
+                     !peerRdma->transport.leaseHeld ||
+                     peerRdma->memoryRegions.entries[1].activeReferences !=
+                         1 ||
+                     peerRdma->completionQueues.entries[1].producerTail !=
+                         cq.cqe ||
+                     peerRdma->queueStats.cqPublished.value() ||
+                     peerRdma->queueStats.cqErrorPublished.value(),
+                 "PVRDMA terminal drain did not abandon only the CQE");
+        timingStage = TimingStage::TerminalVerify;
+        schedule(testEvent, curTick() + microseconds(100));
+        return;
+      }
+      case TimingStage::TerminalVerify: {
+        const auto rings = read<pvrdma::RingState>(PairReceiverQp);
+        const auto cq_ring = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto marker = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe);
+        const auto &qp = peerRdma->queuePairs.entries[1];
+        const auto &cq = peerRdma->completionQueues.entries[1];
+        panic_if(qp.state != pvrdma::QpState::Error ||
+                     qp.attributes.qpState != pvrdma::QpState::Error ||
+                     qp.attributes.currentQpState != pvrdma::QpState::Error ||
+                     qp.rqProducerTail != 1 || qp.rqConsumerHead != 1 ||
+                     letoh(rings.rx.producerTail) != 1 ||
+                     letoh(rings.rx.consumerHead) != 1 ||
+                     qp.finalReplay.valid || cq.producerTail != cq.cqe ||
+                     cq.consumerHead ||
+                     letoh(cq_ring.producerTail) != cq.cqe ||
+                     letoh(cq_ring.consumerHead) ||
+                     letoh(marker.workRequestId) != Marker ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->transportActive() ||
+                     peerRdma->completionBusy() ||
+                     peerRdma->transportTimerEvent.scheduled() ||
+                     peerRdma->queueStats.rqPosted.value() != 1 ||
+                     peerRdma->queueStats.rqConsumed.value() != 1 ||
+                     peerRdma->queueStats.rqAvailable.value() ||
+                     peerRdma->queueStats.cqOutstanding.value() != cq.cqe ||
+                     peerRdma->queueStats.cqPublished.value() ||
+                     peerRdma->queueStats.cqErrorPublished.value() ||
+                     peerRdma->queueStats.cqPublicationBackpressured.value() !=
+                         1 ||
+                     peerRdma->queueStats.conservationViolations.value() ||
+                     peerRdma->drain() != DrainState::Drained,
+                 "PVRDMA terminal receive drain escape mismatch");
+        inform("PVRDMA terminal receive drain test passed");
+        exitSimLoop("PVRDMA terminal drain test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA terminal backpressure stage");
+    }
+}
+
+void
+PvrdmaTester::testCheckpointTerminalDrainRestore()
+{
+    const auto rings = read<pvrdma::RingState>(PairReceiverQp);
+    const auto cq_ring = read<pvrdma::Ring>(PairReceiverCq +
+        offsetof(pvrdma::RingState, rx));
+    const auto marker = read<pvrdma::CompletionQueueElement>(PairReceiverCqe);
+    const auto &qp = peerRdma->queuePairs.entries[1];
+    const auto &cq = peerRdma->completionQueues.entries[1];
+    const auto &mr = peerRdma->memoryRegions.entries[1];
+    panic_if(peerRdma->controlState != pvrdma::ControlState::Active ||
+                 !qp.valid || qp.state != pvrdma::QpState::Error ||
+                 qp.attributes.qpState != pvrdma::QpState::Error ||
+                 qp.attributes.currentQpState != pvrdma::QpState::Error ||
+                 qp.rqProducerTail != 1 || qp.rqConsumerHead != 1 ||
+                 letoh(rings.rx.producerTail) != 1 ||
+                 letoh(rings.rx.consumerHead) != 1 || qp.finalReplay.valid ||
+                 !cq.valid || cq.producerTail != cq.cqe || cq.consumerHead ||
+                 letoh(cq_ring.producerTail) != cq.cqe ||
+                 letoh(cq_ring.consumerHead) ||
+                 letoh(marker.workRequestId) != 0xfeedfacecafebeef ||
+                 !mr.valid || mr.activeReferences ||
+                 peerRdma->transportActive() || peerRdma->completionBusy() ||
+                 peerRdma->queueStats.rqAvailable.value() ||
+                 peerRdma->queueStats.cqOutstanding.value() != cq.cqe ||
+                 peerRdma->queueStats.conservationViolations.value() ||
+                 peerRdma->drain() != DrainState::Drained,
+             "PVRDMA terminal drain checkpoint restore mismatch");
+    inform("PVRDMA terminal receive drain checkpoint restored");
+    exitSimLoop("PVRDMA terminal drain checkpoint restored");
+}
+
+void
+PvrdmaTester::runSqTerminalBackpressure()
+{
+    using TransportStage = Pvrdma::TransportState::Stage;
+    static constexpr uint32_t Length = 64;
+    static constexpr uint64_t Marker = 0xfeedfacecafebeef;
+    const bool reset = testMode == "sq-terminal-reset-no-peer";
+    const bool checkpoint = testMode ==
+        "checkpoint-sq-terminal-drain-save";
+
+    switch (timingStage) {
+      case TimingStage::Configure: {
+        configurePci();
+        const pvrdma::rocev2::MacAddress remote =
+            {0x02, 0, 0, 0, 0, 2};
+        setupPairEndpoint(*rdma, PairSenderQp, PairSenderCq,
+                          PairSenderPayload, remote, 0x100, 0x200);
+        auto &cq = rdma->completionQueues.entries[1];
+        cq.producerTail = cq.cqe;
+        cq.consumerHead = 0;
+        pvrdma::Ring full{};
+        full.producerTail = htole(cq.cqe);
+        write(PairSenderCq + offsetof(pvrdma::RingState, rx), full);
+        pvrdma::CompletionQueueElement marker{};
+        marker.workRequestId = htole(Marker);
+        write(PairSenderCqe, marker);
+        rdma->queueStatsReset();
+        reliabilityCase = 0;
+        busyPolls = 0;
+        postReliabilitySend(Length);
+        timingStage = TimingStage::TerminalBackpressured;
+        schedule(testEvent, curTick() + microseconds(1));
+        return;
+      }
+      case TimingStage::TerminalBackpressured: {
+        if (!rdma->terminalCompletionBackpressured()) {
+            panic_if(++busyPolls > 10000,
+                     "PVRDMA terminal SQ backpressure timed out");
+            schedule(testEvent, curTick() + microseconds(1));
+            return;
+        }
+        const auto rings = read<pvrdma::RingState>(PairSenderQp);
+        const auto cq_ring = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto marker = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe);
+        const auto &qp = rdma->queuePairs.entries[1];
+        const auto &cq = rdma->completionQueues.entries[1];
+        const uint32_t cq_depth = cq.cqe;
+        panic_if(rdma->transport.kind != pvrdma::QueueKind::Sq ||
+                     rdma->transport.stage != TransportStage::WaitSendCq ||
+                     !rdma->transport.terminalQpError ||
+                     !rdma->transport.completionBackpressured ||
+                     !rdma->transport.leaseHeld ||
+                     rdma->transport.status !=
+                         pvrdma::CompletionStatus::GeneralError ||
+                     rdma->memoryRegions.entries[1].activeReferences != 1 ||
+                     rdma->completionBusy() || rdma->transportDmaBusy() ||
+                     rdma->dmaPending() ||
+                     rdma->transportTimerEvent.scheduled() ||
+                     qp.state != pvrdma::QpState::ReadyToSend ||
+                     qp.sqProducerTail != 1 || qp.sqConsumerHead ||
+                     letoh(rings.tx.producerTail) != 1 ||
+                     letoh(rings.tx.consumerHead) ||
+                     cq.producerTail != cq.cqe || cq.consumerHead ||
+                     letoh(cq_ring.producerTail) != cq.cqe ||
+                     letoh(cq_ring.consumerHead) ||
+                     letoh(marker.workRequestId) != Marker ||
+                     rdma->queueStats.sqPosted.value() != 1 ||
+                     rdma->queueStats.sqConsumed.value() ||
+                     rdma->queueStats.cqPublished.value() ||
+                     rdma->queueStats.cqErrorPublished.value() ||
+                     rdma->queueStats.cqPublicationBackpressured.value() != 1 ||
+                     rdma->queueStats.conservationViolations.value(),
+                 "PVRDMA terminal SEND did not backpressure cleanly");
+
+        rdma->transport.terminalQpError = false;
+        rdma->transport.status = pvrdma::CompletionStatus::Success;
+        panic_if(rdma->drain() != DrainState::Draining ||
+                     rdma->transport.stage != TransportStage::WaitSendCq ||
+                     !rdma->transport.completionBackpressured ||
+                     !rdma->transport.leaseHeld,
+                 "PVRDMA successful SEND CQ backpressure was drained");
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(pvrdma::DeviceControl::Reset)),
+              MmioFlags);
+        panic_if(rdma->controlState != pvrdma::ControlState::Active ||
+                     rdma->regs.error != pvrdma::CommandError ||
+                     rdma->transport.stage != TransportStage::WaitSendCq ||
+                     !rdma->transport.completionBackpressured ||
+                     !rdma->transport.leaseHeld,
+                 "PVRDMA successful SEND CQ backpressure was reset");
+        rdma->operationError.reset();
+        rdma->regs.error = 0;
+        rdma->transport.terminalQpError = true;
+        rdma->transport.status = pvrdma::CompletionStatus::GeneralError;
+
+        if (checkpoint) {
+            rdma->regs.dsrAddress = DsrAddress;
+            rdma->regs.control = static_cast<uint32_t>(
+                pvrdma::DeviceControl::Activate);
+            rdma->commandSlotAddress = CommandAddress;
+            rdma->responseSlotAddress = ResponseAddress;
+            inform("PVRDMA terminal SEND checkpoint is backpressured");
+            exitSimLoop("PVRDMA SQ terminal drain checkpoint save ready");
+            return;
+        }
+        if (!reset) {
+            panic_if(rdma->drain() != DrainState::Draining ||
+                         rdma->transport.stage !=
+                             TransportStage::WriteSqConsumer ||
+                         rdma->transport.completionBackpressured ||
+                         !rdma->transport.leaseHeld ||
+                         rdma->memoryRegions.entries[1].activeReferences != 1 ||
+                         rdma->queueStats.cqPublished.value() ||
+                         rdma->queueStats.cqErrorPublished.value(),
+                     "PVRDMA terminal SEND drain did not abandon only CQE");
+            timingStage = TimingStage::TerminalVerify;
+            schedule(testEvent, curTick() + microseconds(100));
+            return;
+        }
+
+        write(RegisterBarAddress + pvrdma::RegControl,
+              htole(static_cast<uint32_t>(pvrdma::DeviceControl::Reset)),
+              MmioFlags);
+        const auto reset_rings = read<pvrdma::RingState>(PairSenderQp);
+        const auto reset_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto reset_marker = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe);
+        panic_if(rdma->controlState != pvrdma::ControlState::Unconfigured ||
+                     rdma->regs.error ||
+                     rdma->regs.control != static_cast<uint32_t>(
+                         pvrdma::DeviceControl::Reset) ||
+                     rdma->memoryRegions.entries[1].valid ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->completionQueues.entries[1].valid ||
+                     rdma->queuePairs.entries[1].valid ||
+                     rdma->transportActive() || rdma->pendingRxPacket ||
+                     rdma->pendingErrorPacket ||
+                     rdma->transportEvent.scheduled() ||
+                     rdma->transportDmaEvent.scheduled() ||
+                     rdma->transportTimerEvent.scheduled() ||
+                     letoh(reset_rings.tx.consumerHead) ||
+                     letoh(reset_cq.producerTail) != cq_depth ||
+                     letoh(reset_marker.workRequestId) != Marker ||
+                     rdma->queueStats.sqOutstanding.value() ||
+                     rdma->queueStats.cqOutstanding.value() ||
+                     rdma->queueStats.sqResetDiscarded.value() != 1 ||
+                     rdma->queueStats.cqResetDiscarded.value() != cq_depth ||
+                     rdma->queueStats.cqPublished.value() ||
+                     rdma->queueStats.cqErrorPublished.value() ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     rdma->drain() != DrainState::Drained,
+                 "PVRDMA terminal SEND reset escape mismatch");
+        inform("PVRDMA terminal SEND reset test passed");
+        exitSimLoop("PVRDMA SQ terminal reset test passed");
+        return;
+      }
+      case TimingStage::TerminalVerify: {
+        const auto rings = read<pvrdma::RingState>(PairSenderQp);
+        const auto cq_ring = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto marker = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe);
+        const auto &qp = rdma->queuePairs.entries[1];
+        const auto &cq = rdma->completionQueues.entries[1];
+        panic_if(qp.state != pvrdma::QpState::Error ||
+                     qp.attributes.qpState != pvrdma::QpState::Error ||
+                     qp.attributes.currentQpState != pvrdma::QpState::Error ||
+                     qp.sqProducerTail != 1 || qp.sqConsumerHead != 1 ||
+                     letoh(rings.tx.producerTail) != 1 ||
+                     letoh(rings.tx.consumerHead) != 1 ||
+                     cq.producerTail != cq.cqe || cq.consumerHead ||
+                     letoh(cq_ring.producerTail) != cq.cqe ||
+                     letoh(cq_ring.consumerHead) ||
+                     letoh(marker.workRequestId) != Marker ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->transportActive() || rdma->completionBusy() ||
+                     rdma->queueStats.sqPosted.value() != 1 ||
+                     rdma->queueStats.sqConsumed.value() != 1 ||
+                     rdma->queueStats.sqOutstanding.value() ||
+                     rdma->queueStats.cqOutstanding.value() != cq.cqe ||
+                     rdma->queueStats.cqPublished.value() ||
+                     rdma->queueStats.cqErrorPublished.value() ||
+                     rdma->queueStats.cqPublicationBackpressured.value() != 1 ||
+                     rdma->queueStats.conservationViolations.value() ||
+                     rdma->drain() != DrainState::Drained,
+                 "PVRDMA terminal SEND drain escape mismatch");
+        inform("PVRDMA terminal SEND drain test passed");
+        exitSimLoop("PVRDMA SQ terminal drain test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA terminal SEND backpressure stage");
+    }
+}
+
+void
+PvrdmaTester::testCheckpointSqTerminalDrainRestore()
+{
+    const auto rings = read<pvrdma::RingState>(PairSenderQp);
+    const auto cq_ring = read<pvrdma::Ring>(PairSenderCq +
+        offsetof(pvrdma::RingState, rx));
+    const auto marker = read<pvrdma::CompletionQueueElement>(PairSenderCqe);
+    const auto &qp = rdma->queuePairs.entries[1];
+    const auto &cq = rdma->completionQueues.entries[1];
+    const auto &mr = rdma->memoryRegions.entries[1];
+    panic_if(rdma->controlState != pvrdma::ControlState::Active ||
+                 !qp.valid || qp.state != pvrdma::QpState::Error ||
+                 qp.attributes.qpState != pvrdma::QpState::Error ||
+                 qp.attributes.currentQpState != pvrdma::QpState::Error ||
+                 qp.sqProducerTail != 1 || qp.sqConsumerHead != 1 ||
+                 letoh(rings.tx.producerTail) != 1 ||
+                 letoh(rings.tx.consumerHead) != 1 ||
+                 !cq.valid || cq.producerTail != cq.cqe || cq.consumerHead ||
+                 letoh(cq_ring.producerTail) != cq.cqe ||
+                 letoh(cq_ring.consumerHead) ||
+                 letoh(marker.workRequestId) != 0xfeedfacecafebeef ||
+                 !mr.valid || mr.activeReferences || rdma->transportActive() ||
+                 rdma->completionBusy() ||
+                 rdma->queueStats.sqOutstanding.value() ||
+                 rdma->queueStats.cqOutstanding.value() != cq.cqe ||
+                 rdma->queueStats.conservationViolations.value() ||
+                 rdma->drain() != DrainState::Drained,
+             "PVRDMA terminal SEND drain checkpoint restore mismatch");
+    inform("PVRDMA terminal SEND drain checkpoint restored");
+    exitSimLoop("PVRDMA SQ terminal drain checkpoint restored");
+}
+
+void
+PvrdmaTester::runReliabilityPrecommitAbortPair()
+{
+    using CompletionStage = Pvrdma::CompletionDmaState::Stage;
+    using TransportStage = Pvrdma::TransportState::Stage;
+    using Opcode = pvrdma::rocev2::Opcode;
+    static constexpr uint32_t Length = 64;
+    const pvrdma::rocev2::MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        postReliabilityReceive(Length);
+        timingStage = TimingStage::ReliabilityPrecommitInject;
+        schedule(testEvent, curTick() + microseconds(20));
+        return;
+      case TimingStage::ReliabilityPrecommitInject: {
+        if (!reliabilityCase) {
+            std::array<uint8_t, Length> payload{};
+            pvrdma::rocev2::Packet frame;
+            frame.opcode = Opcode::SendOnly;
+            frame.destinationQpn = 1;
+            frame.psn = 0x100;
+            frame.payload = {payload.data(), payload.size()};
+            panic_if(!peerRdma->recvTransportPacket(
+                         rocePacket(frame, sender, receiver)),
+                     "PVRDMA deferral frame rejected");
+            ++reliabilityCase;
+            schedule(testEvent, curTick() + microseconds(1));
+            return;
+        }
+        if (peerRdma->transport.stage != TransportStage::WriteRqPayload ||
+            !peerRdma->transport.dmaBusy) {
+            schedule(testEvent, curTick() + microseconds(1));
+            return;
+        }
+        const auto dmas = peerRdma->receivePayloadDmaStarts;
+        pvrdma::rocev2::Packet duplicate;
+        duplicate.opcode = Opcode::SendOnly;
+        duplicate.destinationQpn = 1;
+        duplicate.psn = 0x100;
+        duplicate.payload = {peerRdma->transport.payload.data(), Length};
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(duplicate, sender, receiver)) ||
+                     peerRdma->transport.stage !=
+                         TransportStage::WriteRqPayload ||
+                     !peerRdma->transport.dmaBusy ||
+                     peerRdma->pendingRxPacket ||
+                     peerRdma->receivePayloadDmaStarts != dmas,
+                 "PVRDMA active-DMA duplicate was not idempotent");
+        timingStage = TimingStage::ReliabilityPrecommitCqInject;
+        schedule(testEvent, curTick() + microseconds(1));
+        return;
+      }
+      case TimingStage::ReliabilityPrecommitCqInject: {
+        if (peerRdma->completionDma.stage != CompletionStage::ReadCqRing) {
+            schedule(testEvent, curTick() + microseconds(1));
+            return;
+        }
+        const auto dmas = peerRdma->receivePayloadDmaStarts;
+        pvrdma::rocev2::Packet duplicate;
+        duplicate.opcode = Opcode::SendOnly;
+        duplicate.destinationQpn = 1;
+        duplicate.psn = 0x100;
+        duplicate.payload = {peerRdma->transport.payload.data(), Length};
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(duplicate, sender, receiver)) ||
+                     peerRdma->pendingRxPacket ||
+                     peerRdma->transport.stage !=
+                         TransportStage::WaitReceiveCq ||
+                     peerRdma->completionDma.stage !=
+                         CompletionStage::ReadCqRing,
+                 "PVRDMA accepted-segment retransmission was not absorbed");
+        const uint8_t payload = 0xa5;
+        pvrdma::rocev2::Packet next;
+        next.opcode = Opcode::SendOnly;
+        next.destinationQpn = 1;
+        next.psn = 0x101;
+        next.payload = {&payload, 1};
+        auto malformed = rocePacket(next, sender, receiver);
+        malformed->data[pvrdma::rocev2::BthOffset] =
+            static_cast<uint8_t>(Opcode::SendFirst);
+        const size_t icrc = malformed->length - pvrdma::rocev2::IcrcSize;
+        pvrdma::rocev2::detail::put32Le(
+            malformed->data, icrc,
+            pvrdma::rocev2::detail::icrc(
+                malformed->data + pvrdma::rocev2::EthernetHeaderSize,
+                icrc - pvrdma::rocev2::EthernetHeaderSize));
+        panic_if(!peerRdma->recvTransportPacket(std::move(malformed)) ||
+                     peerRdma->transport.stage !=
+                         TransportStage::WaitReceiveCq ||
+                     peerRdma->completionDma.stage !=
+                         CompletionStage::ReadCqRing,
+                 "PVRDMA malformed precommit frame changed receive stage");
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(next, sender, receiver)) ||
+                     !peerRdma->pendingRxPacket ||
+                     peerRdma->transport.stage !=
+                         TransportStage::WaitReceiveCq ||
+                     peerRdma->completionDma.stage !=
+                         CompletionStage::ReadCqRing ||
+                     peerRdma->receivePayloadDmaStarts != dmas,
+                 "PVRDMA next PSN was not deferred behind receive CQ");
+        timingStage = TimingStage::ReliabilityPrecommitVerify;
+        schedule(testEvent, curTick() + microseconds(200));
+        return;
+      }
+      case TimingStage::ReliabilityPrecommitVerify: {
+        const auto cqe = read<pvrdma::CompletionQueueElement>(PairReceiverCqe);
+        panic_if(peerRdma->queuePairs.entries[1].rqConsumerHead != 1 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 1 ||
+                     letoh(cqe.workRequestId) != 0x9000 ||
+                     letoh(cqe.status) || letoh(cqe.byteLength) != Length ||
+                     letoh(cqe.sourceQp) != 1 ||
+                     peerRdma->receivePayloadDmaStarts != 1 ||
+                     peerRdma->pendingRxPacket ||
+                     peerRdma->pendingErrorPacket ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->transportActive() ||
+                     peerRdma->queueStats.conservationViolations.value(),
+                 "PVRDMA deferred receive completion mismatch");
+        inform("PVRDMA receive DMA/CQ deferral test passed");
+        exitSimLoop("PVRDMA reliability precommit CQ abort test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA receive deferral stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityCommitPair()
+{
+    static constexpr uint32_t Length = 64;
+    using Direction = PvrdmaTestLink::Direction;
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        postReliabilityReceive(Length);
+        testLink->duplicateOnce({Direction::Int0ToInt1,
+            pvrdma::rocev2::Opcode::SendOnly,
+            pvrdma::rocev2::Syndrome::Ack, 0x100});
+        postReliabilitySend(Length);
+        timingStage = TimingStage::ReliabilityCommitVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      case TimingStage::ReliabilityCommitVerify: {
+        const auto cqe = read<pvrdma::CompletionQueueElement>(PairReceiverCqe);
+        const auto &qp = peerRdma->queuePairs.entries[1];
+        panic_if(qp.rqConsumerHead != 1 ||
+                     peerRdma->completionQueues.entries[1].producerTail != 1 ||
+                     letoh(cqe.byteLength) != Length || !qp.finalReplay.valid ||
+                     qp.responderMsn != 1 ||
+                     qp.finalReplay.completedMsn != 1 ||
+                     peerRdma->receivePayloadDmaStarts != 1 ||
+                     rdma->transportActive() || peerRdma->transportActive(),
+                 "PVRDMA committed duplicate was not singular");
+        inform("PVRDMA committed receive reliability test passed");
+        exitSimLoop("PVRDMA reliability committed receive test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA committed receive stage");
+    }
+}
+
+void
+PvrdmaTester::runReliabilityCommitBoundaryPair()
+{
+    static constexpr uint32_t Length = 64;
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupReliabilityPair();
+        reliabilityCase = 0;
+        postReliabilityReceive(Length);
+        postReliabilitySend(Length);
+        timingStage = TimingStage::ReliabilityBoundaryVerify;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      case TimingStage::ReliabilityBoundaryVerify: {
+        const auto &replay = peerRdma->queuePairs.entries[1].finalReplay;
+        const auto cqe = read<pvrdma::CompletionQueueElement>(PairReceiverCqe);
+        panic_if(!replay.valid || replay.finalOpcode !=
+                         pvrdma::rocev2::Opcode::SendOnly ||
+                     replay.finalSegmentLength != Length ||
+                     replay.completedMsn != 1 ||
+                     letoh(cqe.byteLength) != Length ||
+                     rdma->transportActive() || peerRdma->transportActive(),
+                 "PVRDMA receive commit boundary mismatch");
+        inform("PVRDMA receive commit-boundary reliability test passed");
+        exitSimLoop(
+            "PVRDMA reliability receive commit-boundary test passed");
+        return;
+      }
+      default:
+        panic("Invalid PVRDMA receive commit-boundary stage");
+    }
+}
+
+void
+PvrdmaTester::testInboundFrames()
+{
+    using namespace pvrdma::rocev2;
+    const MacAddress sender = {0x02, 0, 0, 0, 0, 1};
+    const MacAddress receiver = {0x02, 0, 0, 0, 0, 2};
+    std::array<uint8_t, pvrdma::FixedMtu> payload{};
+
+    pvrdma::rocev2::Packet unknown;
+    unknown.opcode = Opcode::SendOnly;
+    unknown.destinationQpn = 2;
+    unknown.psn = 0x103;
+    unknown.payload = {payload.data(), 1};
+    panic_if(!peerRdma->recvTransportPacket(
+                 rocePacket(unknown, sender, receiver)) ||
+                 peerRdma->pendingErrorPacket,
+             "PVRDMA unknown QPN did not drop silently");
+
+    const auto fix_icrc = [](const EthPacketPtr &packet) {
+        const size_t offset = packet->length - IcrcSize;
+        detail::put32Le(packet->data, offset,
+                        detail::icrc(packet->data + EthernetHeaderSize,
+                                     offset - EthernetHeaderSize));
+    };
+    pvrdma::rocev2::Packet route_probe;
+    route_probe.opcode = Opcode::SendOnly;
+    route_probe.destinationQpn = 1;
+    route_probe.psn = 0x103;
+    route_probe.payload = {payload.data(), 1};
+    auto below_range = rocePacket(route_probe, sender, receiver);
+    detail::put16(below_range->data, UdpSourcePortOffset,
+                  MinUdpSourcePort - 1);
+    fix_icrc(below_range);
+    panic_if(!peerRdma->recvTransportPacket(std::move(below_range)) ||
+                 peerRdma->pendingErrorPacket || peerRdma->pendingRxPacket,
+             "PVRDMA accepted a below-range RoCEv2 source port");
+
+    auto unrelated_udp = rocePacket(route_probe, sender, receiver);
+    detail::put16(unrelated_udp->data, UdpDestinationPortOffset, 1234);
+    fix_icrc(unrelated_udp);
+    panic_if(!peerRdma->recvTransportPacket(std::move(unrelated_udp)) ||
+                 peerRdma->pendingErrorPacket || peerRdma->pendingRxPacket,
+             "PVRDMA answered unrelated IPv6/UDP traffic");
+
+    auto &route_qp = peerRdma->queuePairs.entries[1];
+    const auto saved_route = route_qp.attributes.addressHandle.globalRoute;
+    const auto saved_gid = peerRdma->gids[0];
+    const auto saved_gid_valid = peerRdma->gidValid[0];
+    const Gid mapped = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1,
+    };
+    const auto reject_mapped_route = [&](const Gid &local,
+                                          const Gid &remote,
+                                          const char *message) {
+        auto &route = route_qp.attributes.addressHandle.globalRoute;
+        route.sourceGidIndex = 0;
+        std::copy(local.begin(), local.end(), peerRdma->gids[0].raw);
+        peerRdma->gidValid[0] = 1;
+        std::copy(remote.begin(), remote.end(), route.destinationGid.raw);
+        auto frame = route_probe;
+        frame.sourceGid = remote;
+        frame.destinationGid = local;
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(frame, sender, receiver)) ||
+                     peerRdma->pendingErrorPacket ||
+                     peerRdma->pendingRxPacket,
+                 message);
+    };
+    reject_mapped_route(mapped, testGid(sender),
+                        "PVRDMA accepted an IPv4-mapped local GID route");
+    reject_mapped_route(testGid(receiver), mapped,
+                        "PVRDMA accepted an IPv4-mapped destination GID "
+                        "route");
+    route_qp.attributes.addressHandle.globalRoute = saved_route;
+    peerRdma->gids[0] = saved_gid;
+    peerRdma->gidValid[0] = saved_gid_valid;
+
+    const auto check_nak = [&](pvrdma::rocev2::Packet frame,
+                               Syndrome syndrome) {
+        panic_if(!peerRdma->recvTransportPacket(
+                     rocePacket(frame, sender, receiver)),
+                 "PVRDMA malformed RoCE frame was not consumed");
+        peerRdma->startInbound();
+        panic_if(!peerRdma->pendingErrorPacket,
+                 "PVRDMA malformed RoCE frame did not produce NAK");
+        const auto decoded = decode(
+            {peerRdma->pendingErrorPacket->data,
+             peerRdma->pendingErrorPacket->bufLength},
+            peerRdma->pendingErrorPacket->length);
+        const auto &route = peerRdma->queuePairs.entries[
+            1].attributes.addressHandle.globalRoute;
+        panic_if(!decoded || decoded.packet.opcode != Opcode::Acknowledge ||
+                     decoded.packet.syndrome != syndrome ||
+                     decoded.packet.destinationQpn != 1 ||
+                     decoded.packet.sourceMac != receiver ||
+                     decoded.packet.destinationMac != sender ||
+                     decoded.packet.trafficClass != route.trafficClass ||
+                     decoded.packet.flowLabel != route.flowLabel ||
+                     decoded.packet.hopLimit !=
+                         (route.hopLimit ? route.hopLimit : TestHopLimit) ||
+                     decoded.packet.sourcePort != udpSourcePort(
+                         route.flowLabel, 1, 1),
+                 "PVRDMA malformed RoCE NAK route mismatch");
+        peerRdma->pendingErrorPacket.reset();
+    };
+
+    pvrdma::rocev2::Packet future;
+    future.opcode = Opcode::SendOnly;
+    future.destinationQpn = 1;
+    future.psn = 0x104;
+    future.payload = {payload.data(), 1};
+    auto alternate_port = rocePacket(future, sender, receiver);
+    detail::put16(alternate_port->data, UdpSourcePortOffset,
+                  MinUdpSourcePort);
+    fix_icrc(alternate_port);
+    panic_if(!peerRdma->recvTransportPacket(std::move(alternate_port)) ||
+                 !peerRdma->pendingRxPacket,
+             "PVRDMA rejected a valid alternate RoCEv2 source port");
+    peerRdma->startInbound();
+    panic_if(!peerRdma->pendingErrorPacket,
+             "PVRDMA alternate source port bypassed PSN handling");
+    const auto alternate_nak = decode(
+        {peerRdma->pendingErrorPacket->data,
+         peerRdma->pendingErrorPacket->bufLength},
+        peerRdma->pendingErrorPacket->length);
+    panic_if(!alternate_nak ||
+                 alternate_nak.packet.syndrome != Syndrome::SequenceNak,
+             "PVRDMA alternate source port produced the wrong PSN result");
+    peerRdma->pendingErrorPacket.reset();
+
+    const MacAddress last_hop = {0x02, 0, 0, 0, 0, 3};
+    auto routed = future;
+    routed.sourceGid = testGid(sender);
+    routed.destinationGid = testGid(receiver);
+    panic_if(!peerRdma->recvTransportPacket(
+                 rocePacket(routed, last_hop, receiver)) ||
+                 !peerRdma->pendingRxPacket,
+             "PVRDMA rejected a routed frame from a last-hop MAC");
+    peerRdma->startInbound();
+    const auto routed_nak = peerRdma->pendingErrorPacket ? decode(
+        {peerRdma->pendingErrorPacket->data,
+         peerRdma->pendingErrorPacket->bufLength},
+        peerRdma->pendingErrorPacket->length) : DecodeResult{};
+    panic_if(!routed_nak ||
+                 routed_nak.packet.syndrome != Syndrome::SequenceNak ||
+                 routed_nak.packet.destinationMac != sender ||
+                 routed_nak.packet.destinationMac == last_hop,
+             "PVRDMA routed response did not use the configured AV MAC");
+    peerRdma->pendingErrorPacket.reset();
+
+    pvrdma::rocev2::Packet continuation;
+    continuation.opcode = Opcode::SendMiddle;
+    continuation.destinationQpn = 1;
+    continuation.psn = 0x103;
+    continuation.payload = {payload.data(), payload.size()};
+    check_nak(continuation, Syndrome::InvalidRequestNak);
+
+    auto stale_icrc = rocePacket(future, sender, receiver);
+    stale_icrc->data[pvrdma::rocev2::BthOffset] =
+        static_cast<uint8_t>(Opcode::SendFirst);
+    panic_if(!peerRdma->recvTransportPacket(std::move(stale_icrc)) ||
+                 peerRdma->pendingErrorPacket || peerRdma->pendingRxPacket,
+             "PVRDMA answered malformed frame with a stale ICRC");
+
+    auto malformed = rocePacket(future, sender, receiver);
+    malformed->data[pvrdma::rocev2::BthOffset] =
+        static_cast<uint8_t>(Opcode::SendFirst);
+    const size_t icrc = malformed->length - pvrdma::rocev2::IcrcSize;
+    pvrdma::rocev2::detail::put32Le(
+        malformed->data, icrc,
+        pvrdma::rocev2::detail::icrc(
+            malformed->data + pvrdma::rocev2::EthernetHeaderSize,
+            icrc - pvrdma::rocev2::EthernetHeaderSize));
+    panic_if(!peerRdma->recvTransportPacket(std::move(malformed)) ||
+                 !peerRdma->pendingErrorPacket,
+             "PVRDMA malformed wire length did not produce NAK");
+    const auto malformed_nak = decode(
+        {peerRdma->pendingErrorPacket->data,
+         peerRdma->pendingErrorPacket->bufLength},
+        peerRdma->pendingErrorPacket->length);
+    panic_if(!malformed_nak ||
+                 malformed_nak.packet.syndrome !=
+                     Syndrome::InvalidRequestNak,
+             "PVRDMA malformed wire length produced the wrong NAK");
+    peerRdma->pendingErrorPacket.reset();
+
+    const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+    const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+        offsetof(pvrdma::RingState, rx));
+    const auto untouched = read<std::array<uint8_t, 384>>(
+        PairReceiverPayload + 128);
+    panic_if(letoh(receiver_ring.rx.consumerHead) != 3 ||
+                 letoh(receiver_cq.producerTail) != 3 ||
+                 peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                     0x103 ||
+                 peerRdma->queueStats.rqConsumed.value() != 3 ||
+                 peerRdma->memoryRegions.entries[1].activeReferences ||
+                 std::any_of(untouched.begin(), untouched.end(),
+                             [](uint8_t byte) { return byte != 0; }),
+             "PVRDMA malformed RoCE frames exposed receive success");
+}
+
+void
+PvrdmaTester::runPair()
+{
+    switch (timingStage) {
+      case TimingStage::Configure:
+        setupPair();
+        timingStage = TimingStage::PairPostSq;
+        schedule(testEvent, curTick() + microseconds(50));
+        return;
+      case TimingStage::PairPostSq: {
+        const auto response = read<pvrdma::CommandResponse>(ResponseAddress);
+        const uint32_t cause = read<uint32_t>(
+            PeerRegisterBarAddress + pvrdma::RegInterruptCause, MmioFlags);
+        const auto &receiver_qp = peerRdma->queuePairs.entries[1];
+        panic_if(read<uint32_t>(
+                     PeerRegisterBarAddress + pvrdma::RegError,
+                     MmioFlags) != 0 ||
+                     !(cause & pvrdma::InterruptCauseResponse) ||
+                     letoh(response.header.response) !=
+                         0x6060606060606060 ||
+                     letoh(response.header.acknowledgement) !=
+                         pvrdma::responseCommand(
+                             pvrdma::Command::ModifyQp) ||
+                     response.header.error ||
+                     receiver_qp.state !=
+                         pvrdma::QpState::ReadyToReceive ||
+                     receiver_qp.rqProducerTail != 3 ||
+                     peerRdma->queueStats.rqPosted.value() != 3 ||
+                     peerRdma->queueStats.doorbellWritesRejected.value(),
+                 "PVRDMA INIT RQ/ immediate RTR command did not complete");
+        peerRdma->transportPaused = true;
+        pvrdma::RingState sender_rings{};
+        sender_rings.tx.producerTail = htole(uint32_t{3});
+        write(PairSenderQp, sender_rings);
+        write(UarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+        busyPolls = 0;
+        timingStage = TimingStage::PairPollSq;
+        schedule(testEvent, curTick() + sim_clock::as_int::ns);
+        return;
+      }
+      case TimingStage::PairPollSq:
+        if (rdma->transportActive() && peerRdma->pendingRxPacket) {
+            panic_if(busyPolls < 2,
+                     "PVRDMA SQ advanced without repeated empty CQ polls");
+            timingStage = TimingStage::PairMacWrite;
+            schedule(testEvent, curTick() + sim_clock::as_int::ns);
+            return;
+        }
+        write(UarBarAddress + pvrdma::UarPageSize +
+                  pvrdma::CqDoorbellOffset,
+              htole(pvrdma::CqPollAction | 1), MmioFlags);
+        panic_if(rdma->cqDirty & (uint64_t{1} << 1),
+                 "PVRDMA empty CQ poll queued an observation");
+        panic_if(++busyPolls > 100000,
+                 "PVRDMA empty CQ polls starved runnable SQ transport");
+        schedule(testEvent, curTick() + sim_clock::as_int::ns);
+        return;
+      case TimingStage::PairMacWrite: {
+        panic_if(!rdma->transportActive() || !peerRdma->pendingRxPacket,
+                 "PVRDMA pair DATA was not active for MAC-write test");
+        const auto low = read<uint32_t>(
+            RegisterBarAddress + pvrdma::RegMacLow, MmioFlags);
+        const auto high = read<uint32_t>(
+            RegisterBarAddress + pvrdma::RegMacHigh, MmioFlags);
+        write(RegisterBarAddress + pvrdma::RegMacLow,
+              htole(uint32_t{0xdeadbeef}), MmioFlags);
+        write(RegisterBarAddress + pvrdma::RegMacHigh,
+              htole(uint32_t{0xcafe}), MmioFlags);
+        panic_if(read<uint32_t>(RegisterBarAddress + pvrdma::RegMacLow,
+                                MmioFlags) != low ||
+                     read<uint32_t>(RegisterBarAddress + pvrdma::RegMacHigh,
+                                    MmioFlags) != high ||
+                     read<uint32_t>(RegisterBarAddress + pvrdma::RegError,
+                                    MmioFlags) != pvrdma::CommandError,
+                 "PVRDMA active MAC write was not rejected unchanged");
+        peerRdma->transportPaused = false;
+        peerRdma->scheduleTransport();
+        busyPolls = 0;
+        sawCqPublishPollRace = false;
+        timingStage = TimingStage::PairPollInbound;
+        schedule(testEvent, curTick() + sim_clock::as_int::ns);
+        return;
+      }
+      case TimingStage::PairPollInbound: {
+        if (peerRdma->completionQueues.entries[1].producerTail !=
+                peerRdma->completionQueues.entries[1].consumerHead) {
+            panic_if(busyPolls < 2 ||
+                         (!system->isAtomicMode() &&
+                          !sawCqPublishPollRace),
+                     "PVRDMA inbound empty-poll race was not exercised");
+            timingStage = TimingStage::PairVerify;
+            schedule(testEvent, curTick() + microseconds(1000));
+            return;
+        }
+        const bool publish_in_flight =
+            peerRdma->completionDma.stage ==
+                Pvrdma::CompletionDmaState::Stage::PublishCqProducer &&
+            peerRdma->completionDma.record.cqHandle == 1;
+        write(PeerUarBarAddress + pvrdma::UarPageSize +
+                  pvrdma::CqDoorbellOffset,
+              htole(pvrdma::CqPollAction | 1), MmioFlags);
+        const bool dirty = peerRdma->cqDirty & (uint64_t{1} << 1);
+        panic_if(dirty != publish_in_flight,
+                 "PVRDMA empty CQ poll publication-race handling mismatch");
+        sawCqPublishPollRace |= publish_in_flight;
+        panic_if(++busyPolls > 100000,
+                 "PVRDMA empty CQ polls starved inbound transport");
+        schedule(testEvent, curTick() + sim_clock::as_int::ns);
+        return;
+      }
+      case TimingStage::PairVerify: {
+        const auto received = read<std::array<uint8_t, 128>>(
+            PairReceiverPayload);
+        for (size_t i = 0; i < received.size(); ++i)
+            panic_if(received[i] != static_cast<uint8_t>(i ^ 0x5a),
+                     "PVRDMA pair payload mismatch at %u", i);
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto send0 = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe);
+        const auto send1 = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + pvrdma::CqeSize);
+        panic_if(letoh(sender_ring.tx.consumerHead) != 3 ||
+                     letoh(receiver_ring.rx.consumerHead) != 3 ||
+                     letoh(sender_cq.producerTail) != 2 ||
+                     letoh(receiver_cq.producerTail) != 3 ||
+                     letoh(send0.workRequestId) != 0x1000 ||
+                     letoh(send0.opcode) != 0 || letoh(send0.status) != 0 ||
+                     letoh(send1.workRequestId) != 0x1002 ||
+                     letoh(send1.opcode) != 0 || letoh(send1.status) != 0 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 0x103 ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         0x103 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->queueStats.sqConsumed.value() != 3 ||
+                     peerRdma->queueStats.rqConsumed.value() != 3 ||
+                     rdma->queueStats.conservationViolations.value() != 0 ||
+                     peerRdma->queueStats.conservationViolations.value() !=
+                         0 ||
+                     rdma->transportActive() || peerRdma->transportActive(),
+                 "PVRDMA pair completion/consumer/PSN/accounting mismatch");
+        for (uint32_t i = 0; i < 3; ++i) {
+            const auto cqe = read<pvrdma::CompletionQueueElement>(
+                PairReceiverCqe + i * pvrdma::CqeSize);
+            panic_if(letoh(cqe.workRequestId) != 0x2000 + i ||
+                         letoh(cqe.opcode) != 128 ||
+                         letoh(cqe.status) != 0 ||
+                         letoh(cqe.byteLength) != (i == 2 ? 0 : 64) ||
+                         letoh(cqe.sourceQp) != 1,
+                     "PVRDMA pair receive CQE %u mismatch", i);
+        }
+        testInboundFrames();
+        auto rings = sender_ring;
+        rings.tx.producerTail = htole(uint32_t{4});
+        write(PairSenderQp, rings);
+        write(UarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+        timingStage = TimingStage::PairVerifyRnr;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::PairVerifyRnr: {
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + 2 * pvrdma::CqeSize);
+        panic_if(letoh(sender_ring.tx.consumerHead) != 4 ||
+                     letoh(receiver_ring.rx.consumerHead) != 3 ||
+                     letoh(sender_cq.producerTail) != 3 ||
+                     letoh(error.workRequestId) != 0x1003 ||
+                     letoh(error.opcode) != 0 ||
+                     letoh(error.status) != 13 ||
+                     rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 0x103 ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         0x103,
+                 "PVRDMA pair terminal RNR mismatch");
+        rdma->queuePairs.entries[1].state = pvrdma::QpState::ReadyToSend;
+        rdma->queuePairs.entries[1].attributes.qpState =
+            rdma->queuePairs.entries[1].attributes.currentQpState =
+                pvrdma::QpState::ReadyToSend;
+        auto rings = receiver_ring;
+        rings.rx.producerTail = htole(uint32_t{4});
+        write(PairReceiverQp, rings);
+        write(PeerUarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::RqDoorbellAction | 1), MmioFlags);
+        timingStage = TimingStage::PairPostShort;
+        schedule(testEvent, curTick() + microseconds(50));
+        return;
+      }
+      case TimingStage::PairPostShort: {
+        panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 4,
+                 "PVRDMA pair short RQ was not observed first");
+        auto rings = read<pvrdma::RingState>(PairSenderQp);
+        rings.tx.producerTail = htole(uint32_t{5});
+        write(PairSenderQp, rings);
+        write(UarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+        timingStage = TimingStage::PairVerifyShort;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::PairVerifyShort: {
+        auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + 3 * pvrdma::CqeSize);
+        const auto receive_error = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + 3 * pvrdma::CqeSize);
+        const auto untouched = read<std::array<uint8_t, 192>>(
+            PairReceiverPayload + 128);
+        auto &receiver_qp = peerRdma->queuePairs.entries[1];
+        panic_if(letoh(sender_ring.tx.consumerHead) != 5 ||
+                     letoh(receiver_ring.rx.consumerHead) != 4 ||
+                     letoh(sender_cq.producerTail) != 4 ||
+                     letoh(receiver_cq.producerTail) != 4 ||
+                     letoh(error.workRequestId) != 0x1004 ||
+                     letoh(error.opcode) != 0 || letoh(error.status) != 9 ||
+                     letoh(receive_error.workRequestId) != 0x2003 ||
+                     letoh(receive_error.opcode) != 128 ||
+                     letoh(receive_error.status) != 1 ||
+                     letoh(receive_error.byteLength) != 64 ||
+                     letoh(receive_error.sourceQp) != 1 ||
+                     rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     receiver_qp.state != pvrdma::QpState::Error ||
+                     std::any_of(untouched.begin(), untouched.end(),
+                                 [](uint8_t byte) { return byte != 0; }) ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 0x103 ||
+                     receiver_qp.attributes.receivePsn != 0x103 ||
+                     rdma->memoryRegions.entries[1].activeReferences ||
+                     peerRdma->memoryRegions.entries[1].activeReferences ||
+                     rdma->queueStats.sqConsumed.value() != 5 ||
+                     peerRdma->queueStats.rqConsumed.value() != 4 ||
+                     rdma->queueStats.conservationViolations.value() != 0 ||
+                     peerRdma->queueStats.conservationViolations.value() !=
+                         0 ||
+                     rdma->transportActive() || peerRdma->transportActive(),
+                 "PVRDMA pair terminal short-RQ mismatch");
+        rdma->queuePairs.entries[1].state = pvrdma::QpState::ReadyToSend;
+        rdma->queuePairs.entries[1].attributes.qpState =
+            rdma->queuePairs.entries[1].attributes.currentQpState =
+                pvrdma::QpState::ReadyToSend;
+        receiver_qp.state = pvrdma::QpState::ReadyToReceive;
+        receiver_qp.attributes.qpState =
+            receiver_qp.attributes.currentQpState = receiver_qp.state;
+
+        pvrdma::ReceiveWqeHeader receive{};
+        receive.workRequestId = htole(uint64_t{0x2004});
+        receive.numSge = htole(uint32_t{1});
+        const pvrdma::Sge receive_sge{
+            htole(static_cast<uint64_t>(PairReceiverPayload + 320)),
+            htole(uint32_t{32}), htole(uint32_t{1})};
+        std::array<uint8_t, pvrdma::RqStride> receive_slot{};
+        std::memcpy(receive_slot.data(), &receive, sizeof(receive));
+        std::memcpy(receive_slot.data() + sizeof(receive), &receive_sge,
+                    sizeof(receive_sge));
+        write(PairReceiverRq + 4 * pvrdma::RqStride, receive_slot);
+        auto posted = receiver_ring;
+        posted.rx.producerTail = htole(uint32_t{5});
+        write(PairReceiverQp, posted);
+        write(PeerUarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::RqDoorbellAction | 1), MmioFlags);
+        timingStage = TimingStage::PairPostOversized;
+        schedule(testEvent, curTick() + microseconds(50));
+        return;
+      }
+      case TimingStage::PairPostOversized: {
+        panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 5,
+                 "PVRDMA pair oversized RQ was not observed first");
+        auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        sender_ring.tx.producerTail = htole(uint32_t{6});
+        write(PairSenderQp, sender_ring);
+        write(UarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+        timingStage = TimingStage::PairVerifyOversized;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::PairVerifyOversized: {
+        auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto error = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + 4 * pvrdma::CqeSize);
+        const auto receive_error = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + 4 * pvrdma::CqeSize);
+        auto &receiver_qp = peerRdma->queuePairs.entries[1];
+        panic_if(letoh(sender_ring.tx.consumerHead) != 6 ||
+                     letoh(receiver_ring.rx.consumerHead) != 5 ||
+                     letoh(sender_cq.producerTail) != 5 ||
+                     letoh(receiver_cq.producerTail) != 5 ||
+                     letoh(error.workRequestId) != 0x1005 ||
+                     letoh(error.opcode) != 0 || letoh(error.status) != 9 ||
+                     letoh(receive_error.workRequestId) != 0x2004 ||
+                     letoh(receive_error.opcode) != 128 ||
+                     letoh(receive_error.status) != 1 ||
+                     letoh(receive_error.byteLength) != pvrdma::FixedMtu ||
+                     letoh(receive_error.sourceQp) != 1 ||
+                     rdma->queuePairs.entries[1].state !=
+                         pvrdma::QpState::Error ||
+                     receiver_qp.state != pvrdma::QpState::Error ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 0x103 ||
+                     receiver_qp.attributes.receivePsn != 0x103 ||
+                     rdma->queueStats.sqConsumed.value() != 6 ||
+                     peerRdma->queueStats.rqConsumed.value() != 5 ||
+                     rdma->transportActive() || peerRdma->transportActive(),
+                 "PVRDMA pair terminal oversized-SEND mismatch");
+        rdma->queuePairs.entries[1].state = pvrdma::QpState::ReadyToSend;
+        rdma->queuePairs.entries[1].attributes.qpState =
+            rdma->queuePairs.entries[1].attributes.currentQpState =
+                pvrdma::QpState::ReadyToSend;
+        receiver_qp.state = pvrdma::QpState::ReadyToReceive;
+        receiver_qp.attributes.qpState =
+            receiver_qp.attributes.currentQpState = receiver_qp.state;
+
+        pvrdma::ReceiveWqeHeader receive{};
+        receive.workRequestId = htole(uint64_t{0x2006});
+        receive.numSge = htole(uint32_t{1});
+        const pvrdma::Sge receive_sge{
+            htole(static_cast<uint64_t>(PairReceiverPayload + 384)),
+            htole(uint32_t{64}), htole(uint32_t{1})};
+        std::array<uint8_t, pvrdma::RqStride> receive_slot{};
+        std::memcpy(receive_slot.data(), &receive, sizeof(receive));
+        std::memcpy(receive_slot.data() + sizeof(receive), &receive_sge,
+                    sizeof(receive_sge));
+        write(PairReceiverRq + 5 * pvrdma::RqStride, receive_slot);
+        auto posted = receiver_ring;
+        posted.rx.producerTail = htole(uint32_t{6});
+        write(PairReceiverQp, posted);
+        write(PeerUarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::RqDoorbellAction | 1), MmioFlags);
+        timingStage = TimingStage::PairPostCq;
+        schedule(testEvent, curTick() + microseconds(50));
+        return;
+      }
+      case TimingStage::PairPostCq: {
+        panic_if(peerRdma->queuePairs.entries[1].rqProducerTail != 6,
+                 "PVRDMA CQ recovery RQ was not observed first");
+        pvrdma::Ring malformed_cq{};
+        malformed_cq.producerTail = htole(uint32_t{5});
+        malformed_cq.consumerHead = htole(uint32_t{7});
+        write(PairReceiverCq + offsetof(pvrdma::RingState, rx),
+              malformed_cq);
+        auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        sender_ring.tx.producerTail = htole(uint32_t{7});
+        write(PairSenderQp, sender_ring);
+        write(UarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+        timingStage = TimingStage::PairVerifyCqBlocked;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::PairVerifyCqBlocked: {
+        const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        panic_if(letoh(sender_ring.tx.consumerHead) != 6 ||
+                     letoh(receiver_ring.rx.consumerHead) != 5 ||
+                     letoh(receiver_cq.producerTail) != 5 ||
+                     !rdma->transport.active() ||
+                     rdma->transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitResponse ||
+                     !peerRdma->transport.completionBackpressured ||
+                     peerRdma->transport.stage !=
+                         Pvrdma::TransportState::Stage::WaitReceiveCq,
+                 "PVRDMA malformed CQ did not retain transport safely");
+        pvrdma::Ring fixed_cq{};
+        fixed_cq.producerTail = htole(uint32_t{5});
+        write(PairReceiverCq + offsetof(pvrdma::RingState, rx), fixed_cq);
+        write(PeerUarBarAddress + pvrdma::UarPageSize +
+                  pvrdma::CqDoorbellOffset,
+              htole(pvrdma::CqPollAction | 1), MmioFlags);
+        panic_if(!(peerRdma->cqDirty & (uint64_t{1} << 1)),
+                 "PVRDMA nonempty CQ poll skipped observation");
+        timingStage = TimingStage::PairVerifyCqRecovered;
+        schedule(testEvent, curTick() + microseconds(1000));
+        return;
+      }
+      case TimingStage::PairVerifyCqRecovered: {
+        auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+        const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+        const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+            offsetof(pvrdma::RingState, rx));
+        const auto send = read<pvrdma::CompletionQueueElement>(
+            PairSenderCqe + 5 * pvrdma::CqeSize);
+        const auto receive = read<pvrdma::CompletionQueueElement>(
+            PairReceiverCqe + 5 * pvrdma::CqeSize);
+        panic_if(letoh(sender_ring.tx.consumerHead) != 7 ||
+                     letoh(receiver_ring.rx.consumerHead) != 6 ||
+                     letoh(sender_cq.producerTail) != 6 ||
+                     letoh(receiver_cq.producerTail) != 6 ||
+                     letoh(send.workRequestId) != 0x1006 ||
+                     letoh(send.status) != 0 ||
+                     letoh(receive.workRequestId) != 0x2006 ||
+                     letoh(receive.status) != 0 ||
+                     letoh(receive.byteLength) != 64 ||
+                     letoh(receive.sourceQp) != 1 ||
+                     rdma->queuePairs.entries[1].attributes.sendPsn != 0x104 ||
+                     peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                         0x104 ||
+                     rdma->transportActive() || peerRdma->transportActive(),
+                 "PVRDMA CQ poll/fix did not recover transport");
+        peerRdma->queuePairs.entries[1].generation++;
+        peerRdma->queuePairs.entries[1].qpn +=
+            pvrdma::ObjectTableEntries;
+        rdma->queuePairs.entries[1].attributes.timeout = 8;
+        rdma->queuePairs.entries[1].attributes.retryCount = 2;
+        sender_ring.tx.producerTail = htole(uint32_t{8});
+        write(PairSenderQp, sender_ring);
+        write(UarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+        timingStage = TimingStage::PairVerifyStale;
+        schedule(testEvent, curTick() + microseconds(10000));
+        return;
+      }
+      case TimingStage::PairVerifyStale:
+        break;
+      default:
+        panic("Invalid PVRDMA pair stage");
+    }
+
+    const auto sender_ring = read<pvrdma::RingState>(PairSenderQp);
+    const auto receiver_ring = read<pvrdma::RingState>(PairReceiverQp);
+    const auto sender_cq = read<pvrdma::Ring>(PairSenderCq +
+        offsetof(pvrdma::RingState, rx));
+    const auto receiver_cq = read<pvrdma::Ring>(PairReceiverCq +
+        offsetof(pvrdma::RingState, rx));
+    const auto error = read<pvrdma::CompletionQueueElement>(
+        PairSenderCqe + 6 * pvrdma::CqeSize);
+    panic_if(letoh(sender_ring.tx.consumerHead) != 8 ||
+                 letoh(receiver_ring.rx.consumerHead) != 6 ||
+                 letoh(sender_cq.producerTail) != 7 ||
+                 letoh(receiver_cq.producerTail) != 6 ||
+                 letoh(error.workRequestId) != 0x1007 ||
+                 letoh(error.opcode) != 0 || letoh(error.status) != 12 ||
+                 rdma->queuePairs.entries[1].attributes.sendPsn != 0x104 ||
+                 peerRdma->queuePairs.entries[1].attributes.receivePsn !=
+                     0x104 ||
+                 rdma->memoryRegions.entries[1].activeReferences ||
+                 peerRdma->memoryRegions.entries[1].activeReferences ||
+                 rdma->queueStats.sqConsumed.value() != 8 ||
+                 peerRdma->queueStats.rqConsumed.value() != 6 ||
+                 rdma->queueStats.conservationViolations.value() != 0 ||
+                 peerRdma->queueStats.conservationViolations.value() != 0 ||
+                 rdma->transportActive() || peerRdma->transportActive(),
+             "PVRDMA stale-QPN retry exhaustion did not terminate sender");
+    inform("PVRDMA one-segment pair SEND/RECV test passed");
+    exitSimLoop("PVRDMA transport pair test passed");
+}
+
+EthPacketPtr
+PvrdmaTester::faultPacket(uint32_t psn)
+{
+    const uint8_t payload = static_cast<uint8_t>(psn);
+    pvrdma::rocev2::Packet frame;
+    frame.opcode = pvrdma::rocev2::Opcode::SendOnly;
+    frame.destinationQpn = 1;
+    frame.psn = psn;
+    frame.payload = {&payload, 1};
+    const pvrdma::rocev2::MacAddress source = {2, 0, 0, 0, 0, 1};
+    const pvrdma::rocev2::MacAddress destination = {2, 0, 0, 0, 0, 2};
+    return rocePacket(frame, source, destination);
+}
+
+void
+PvrdmaTester::runFaultLink()
+{
+    using Direction = PvrdmaTestLink::Direction;
+    using FrameId = PvrdmaTestLink::FrameId;
+    const auto id = [](Direction direction, uint32_t psn) {
+        return FrameId{direction, pvrdma::rocev2::Opcode::SendOnly,
+                       pvrdma::rocev2::Syndrome::Ack, psn};
+    };
+
+    switch (timingStage) {
+      case TimingStage::Configure:
+        faultRejectOnce[1] = true;
+        panic_if(!faultPort0.sendPacket(faultPacket(7)),
+                 "PVRDMA fault link rejected backpressure packet");
+        timingStage = TimingStage::FaultCheckBackpressure;
+        schedule(testEvent, curTick() + 3);
+        return;
+      case TimingStage::FaultCheckBackpressure:
+        panic_if(faultReceived[1] != std::vector<uint64_t>{7} ||
+                     faultSendDone[0] != 1 || !faultDrainWhileRejected ||
+                     testLink->drain() != DrainState::Drained,
+                 "PVRDMA fault-link retained delivery was not retried once");
+        testLink->dropOnce(id(Direction::Int0ToInt1, 2));
+        testLink->duplicateOnce(id(Direction::Int0ToInt1, 3));
+        testLink->holdOnce(id(Direction::Int0ToInt1, 4));
+        testLink->delayOnce(id(Direction::Int0ToInt1, 5), 10);
+        for (uint32_t value = 1; value <= 5; ++value) {
+            panic_if(!faultPort0.sendPacket(faultPacket(value)),
+                     "PVRDMA fault link rejected packet %u", value);
+        }
+        panic_if(!faultPort1.sendPacket(faultPacket(6)),
+                 "PVRDMA fault link rejected reverse packet");
+        timingStage = TimingStage::FaultCheckHeld;
+        schedule(testEvent, curTick() + 2);
+        return;
+      case TimingStage::FaultCheckHeld:
+        panic_if(faultReceived[0] != std::vector<uint64_t>{6} ||
+                     faultReceived[1] !=
+                         std::vector<uint64_t>({7, 1, 3, 3}) ||
+                     faultSendDone[0] != 6 || faultSendDone[1] != 1 ||
+                     testLink->heldPackets() != 1 ||
+                     testLink->pendingRules() != 0 ||
+                     testLink->drain() != DrainState::Draining,
+                 "PVRDMA fault-link drop/duplicate/hold result mismatch");
+        panic_if(!testLink->release(
+                     id(Direction::Int0ToInt1, 4)) ||
+                     testLink->release(id(Direction::Int0ToInt1, 4)),
+                 "PVRDMA fault-link release was not one-shot");
+        timingStage = TimingStage::FaultCheckReleased;
+        schedule(testEvent, curTick() + 2);
+        return;
+      case TimingStage::FaultCheckReleased:
+        panic_if(faultReceived[1] !=
+                         std::vector<uint64_t>({7, 1, 3, 3, 4}) ||
+                     testLink->heldPackets() != 0 ||
+                     testLink->drain() != DrainState::Draining,
+                 "PVRDMA fault-link release/drain result mismatch");
+        timingStage = TimingStage::FaultCheckDelayed;
+        schedule(testEvent, curTick() + 8);
+        return;
+      case TimingStage::FaultCheckDelayed:
+        panic_if(faultReceived[1] !=
+                         std::vector<uint64_t>({7, 1, 3, 3, 4, 5}) ||
+                     faultSendDone[0] != 6 ||
+                     testLink->drain() != DrainState::Drained,
+                 "PVRDMA fault-link delay/final drain result mismatch");
+        inform("PVRDMA deterministic fault-link test passed");
+        exitSimLoop("PVRDMA fault-link test passed");
+        return;
+      default:
+        panic("Invalid PVRDMA fault-link test stage");
+    }
+}
+
+void
 PvrdmaTester::run()
 {
+    if (testMode == "fault-link" || testMode == "timing-fault-link") {
+        runFaultLink();
+        return;
+    }
+    if (testMode == "reliability-pair" ||
+        testMode == "timing-reliability-pair") {
+        runReliabilityPair();
+        return;
+    }
+    if (testMode == "reliability-rnr-pair" ||
+        testMode == "timing-reliability-rnr-pair") {
+        runReliabilityRnrPair();
+        return;
+    }
+    if (testMode == "reliability-timeout-zero-pair" ||
+        testMode == "timing-reliability-timeout-zero-pair") {
+        runReliabilityTimeoutZeroPair();
+        return;
+    }
+    if (testMode == "reliability-invalid-pair" ||
+        testMode == "timing-reliability-invalid-pair") {
+        runReliabilityInvalidPair();
+        return;
+    }
+    if (testMode == "reliability-sequence-pair" ||
+        testMode == "timing-reliability-sequence-pair") {
+        runReliabilitySequencePair();
+        return;
+    }
+    if (testMode == "reliability-unrelated-pair" ||
+        testMode == "timing-reliability-unrelated-pair") {
+        runReliabilityUnrelatedPair();
+        return;
+    }
+    if (testMode == "reliability-cq-pair" ||
+        testMode == "timing-reliability-cq-pair") {
+        runReliabilityCqPair();
+        return;
+    }
+    if (testMode == "reliability-cq-abort-pair" ||
+        testMode == "timing-reliability-cq-abort-pair") {
+        runReliabilityCqAbortPair();
+        return;
+    }
+    if (testMode == "timing-reliability-precommit-abort-pair") {
+        runReliabilityPrecommitAbortPair();
+        return;
+    }
+    if (testMode == "timing-reliability-commit-pair") {
+        runReliabilityCommitPair();
+        return;
+    }
+    if (testMode == "timing-reliability-commit-boundary-pair") {
+        runReliabilityCommitBoundaryPair();
+        return;
+    }
+    if (testMode == "checkpoint-sq-terminal-drain-restore") {
+        testCheckpointSqTerminalDrainRestore();
+        return;
+    }
+    if (testMode == "sq-terminal-reset-no-peer" ||
+        testMode == "timing-sq-terminal-drain-no-peer" ||
+        testMode == "checkpoint-sq-terminal-drain-save") {
+        runSqTerminalBackpressure();
+        return;
+    }
+    if (testMode == "checkpoint-terminal-drain-restore") {
+        testCheckpointTerminalDrainRestore();
+        return;
+    }
+    if (testMode.find("terminal-reset-") != std::string::npos ||
+        (testMode.find("terminal-drain-") != std::string::npos &&
+         testMode != "checkpoint-terminal-drain-restore")) {
+        runTerminalBackpressurePair();
+        return;
+    }
+    if (testMode == "transport-pair" ||
+        testMode == "timing-transport-pair") {
+        runPair();
+        return;
+    }
+    if (testMode == "semantic-pair" ||
+        testMode == "timing-semantic-pair") {
+        runSemanticPair();
+        return;
+    }
     if (testMode == "timing-mr") {
         runTimingMr();
         return;

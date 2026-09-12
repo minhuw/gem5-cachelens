@@ -143,6 +143,7 @@ if isa == ISA.X86:
         assert board.get_rdma_bdfs() == ["0000:00:02.1"]
         assert rdma.get_parent() is board
         assert str(rdma.hardware_address) == str(nic.hardware_address)
+        assert rdma.companion_mac_word_swap
         assert int(rdma.VendorID) == 0x15AD
         assert int(rdma.DeviceID) == 0x0820
         assert int(rdma.Revision) == 1
