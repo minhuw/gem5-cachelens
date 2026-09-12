@@ -61,7 +61,8 @@ class RubyCache(SimObject):
 
     # DDIO way partitioning: when > 0, all NIC-originated DMA writes
     # (payload, headers, and descriptor writebacks) are allocated only in
-    # ways [0, ddio_way_part). -1 is a true NIC-write no-retention mode.
+    # ways [0, ddio_way_part). -1 disables NIC-write retention unless a CHI
+    # write-stash hint is accepted (which uses ordinary ways, not this subset).
     # NIC-read allocation is controlled by the CHI HNF controller/profile.
     ddio_way_part = Param.Int(
         -1, "number of NIC DDIO allocation ways [0, D); -1 disables"

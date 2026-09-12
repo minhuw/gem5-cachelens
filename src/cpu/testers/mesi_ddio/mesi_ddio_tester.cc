@@ -62,6 +62,7 @@ MESIDDIODirectedTester::MESIDDIODirectedTester(const Params &params)
       dmaPort(name() + ".dma_port", *this),
       dmaRacePort(name() + ".dma_race_port", *this),
       scenario(params.scenario),
+      coldReadIsTx(params.cold_read_is_tx),
       baseAddress(params.base_addr),
       setStride(params.set_stride),
       blockSize(params.block_size),
@@ -241,8 +242,68 @@ MESIDDIODirectedTester::buildScenario()
 
     if (scenario == "cold_full_write") {
         addWrite(PortKind::Dma, 0, a, rxPayload, first, "cold RX write");
-        addRead(PortKind::Dma, 0, a, generic, first,
-                "generic directory read after RX ACK");
+        addRead(PortKind::Dma, 0, a,
+                coldReadIsTx ? txPayload : generic, first,
+                "directory read after RX ACK");
+    } else if (scenario == "stash_unclassified") {
+        addWrite(PortKind::Dma, 0, a, rxDescWrite, first,
+                 "ordinary descriptor write");
+        addWrite(PortKind::Dma, 0, b, rxHeader, second,
+                 "ordinary RX header write");
+        addWrite(PortKind::Dma, 0, c, generic, third,
+                 "ordinary unclassified write");
+        // These first reads probe retention before any CPU demand fill.
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "descriptor must not be stashed");
+        addRead(PortKind::Dma, 0, b, txPayload, second,
+                "header must not be stashed");
+        addRead(PortKind::Dma, 0, c, txPayload, third,
+                "ordinary allocation is independent of stashing");
+        addRead(PortKind::Dma, 0, a, rxDescRead, first,
+                "descriptor read is not a stash hint");
+        addWrite(PortKind::Cpu, 0, d + 7, generic, {0xee},
+                 "CPU store is not a stash hint");
+        addRead(PortKind::Cpu, 1, d + 7, generic, {0xee},
+                "CPU store remains coherent");
+    } else if (scenario == "stash_replacement") {
+        // The CHI test HNF holds eight lines (two four-way sets). Ten
+        // consecutive fills use ordinary ways and evict both private copies.
+        auto dirty = first;
+        dirty[7] = 0xee;
+        for (unsigned i = 0; i < 10; ++i) {
+            const Addr address = a + i * blockSize;
+            const auto data = pattern(0x10 + i);
+            addWrite(PortKind::Dma, 0, address, rxPayload, data,
+                     csprintf("stash capacity fill %u", i));
+            if (i == 0) {
+                addRead(PortKind::Cpu, 0, address, generic, {data[0]},
+                        "create replacement victim owner");
+                addWrite(PortKind::Cpu, 0, address + 7, generic, {dirty[7]},
+                         "dirty replacement victim");
+            } else if (i == 1) {
+                addRead(PortKind::Cpu, 0, address, generic, {data[0]},
+                        "create first replacement victim sharer");
+                addRead(PortKind::Cpu, 1, address, generic, {data[0]},
+                        "create second replacement victim sharer");
+            }
+        }
+        // Probe all four ways of one set, newest first, before any miss
+        // can demand-fill a line and disturb the residency oracle.
+        for (int i = 9; i >= 3; i -= 2) {
+            addRead(PortKind::Dma, 0, a + i * blockSize, txPayload,
+                    pattern(0x10 + i), "ordinary-way retained TX read");
+        }
+        addRead(PortKind::Dma, 0, a, txPayload, dirty,
+                "evicted dirty owner recovered from memory");
+        for (unsigned i = 0; i < 10; ++i) {
+            const auto data = i == 0 ? dirty : pattern(0x10 + i);
+            addRead(PortKind::Dma, 0, a + i * blockSize, generic, data,
+                    csprintf("full capacity readback %u", i));
+        }
+        addRead(PortKind::Cpu, 0, a + 7, generic, {dirty[7]},
+                "backinvalidated dirty owner readback");
+        addRead(PortKind::Cpu, 1, a + blockSize, generic, {0x11},
+                "backinvalidated shared victim readback");
     } else if (scenario == "pvrdma_provenance") {
         addWrite(PortKind::Dma, 0, a, rdmaRxPayload, first,
                  "PVRDMA RX payload write");
@@ -497,12 +558,16 @@ MESIDDIODirectedTester::buildScenario()
                  "aligned one-byte retained NIC write");
         addRead(PortKind::Dma, 0, a, txPayload, merged,
                 "TX observes aligned one-byte merge");
-    } else if (scenario == "partial_unaligned") {
+    } else if (scenario == "partial_unaligned" ||
+               scenario == "stash_partial_cold") {
         auto merged = first;
         const auto partial = bytes(13, 0xa0);
         std::copy(partial.begin(), partial.end(), merged.begin() + 17);
-        addWrite(PortKind::Dma, 0, a, generic, first,
-                 "initialize clean memory for unaligned partial write");
+        // With DDIO disabled, a descriptor seed leaves no HNF copy. Keep
+        // the original unclassified seed for existing MESI regressions.
+        addWrite(PortKind::Dma, 0, a,
+                 scenario == "stash_partial_cold" ? rxDescWrite : generic,
+                 first, "initialize clean memory for unaligned partial write");
         addWrite(PortKind::Dma, 0, a + 17, rxPayload, partial,
                  "unaligned retained NIC write");
         addRead(PortKind::Dma, 0, a, txPayload, merged,
@@ -535,22 +600,29 @@ MESIDDIODirectedTester::buildScenario()
                 "first CPU observes SS invalidation");
         addRead(PortKind::Cpu, 1, a + 23, generic, {merged[23]},
                 "second CPU observes SS invalidation");
-    } else if (scenario == "partial_clean_owner") {
+    } else if (scenario == "partial_clean_owner" ||
+               scenario == "stash_clean_owner") {
         auto merged = first;
         const auto partial = bytes(3, 0x70);
         std::copy(partial.begin(), partial.end(), merged.begin() + 2);
-        addWrite(PortKind::Dma, 0, a, generic, first,
-                 "initialize clean-owner partial line");
+        addWrite(PortKind::Dma, 0, a,
+                 scenario == "stash_clean_owner" ? rxDescWrite : generic,
+                 first, "initialize clean-owner partial line");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create clean exclusive partial-write owner");
         addWrite(PortKind::Dma, 0, a + 2, rxPayload, partial,
                  "partial NIC write invalidates clean owner");
         addRead(PortKind::Dma, 0, a, txPayload, merged,
                 "retained line preserves clean-owner untouched bytes");
-        addRead(PortKind::Dma, 0, a, generic, merged,
-                "generic DMA receives merged retained line");
-        addRead(PortKind::Dma, 0, a, txPayload, merged,
-                "TX miss observes merged memory after L2 invalidation");
+        if (scenario == "stash_clean_owner") {
+            addRead(PortKind::Cpu, 0, a + 2, generic, {merged[2]},
+                    "clean owner sees merged byte after invalidation");
+        } else {
+            addRead(PortKind::Dma, 0, a, generic, merged,
+                    "generic DMA receives merged retained line");
+            addRead(PortKind::Dma, 0, a, txPayload, merged,
+                    "TX miss observes merged memory after L2 invalidation");
+        }
     } else if (scenario == "partial_dirty_owner") {
         auto merged = first;
         merged[7] = 0xee;

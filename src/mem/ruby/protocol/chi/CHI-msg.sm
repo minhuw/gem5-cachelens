@@ -68,6 +68,9 @@ enumeration(CHIRequestType, desc="") {
   WriteEvictFull;
   WriteUniquePtl;
   WriteUniqueFull;
+  // No-target system-cache allocation hints (no StashNID or LPID).
+  WriteUniqueFullStash;
+  WriteUniquePtlStash;
   WriteUniqueZero;
 
   AtomicReturn;

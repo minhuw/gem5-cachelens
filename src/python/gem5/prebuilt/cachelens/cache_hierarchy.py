@@ -196,6 +196,7 @@ class _CachedHNF(AbstractNode):
         assoc: int,
         ddio_way_part: int,
         nic_read_no_allocate: bool,
+        accept_write_stash: bool,
         addr_hash: bool,
         dealloc_on_unique: bool,
         hnf_inclusion: str,
@@ -229,6 +230,7 @@ class _CachedHNF(AbstractNode):
         self.enable_DMT = not inclusive
         self.enable_DCT = not inclusive
         self.nic_read_no_allocate = nic_read_no_allocate
+        self.accept_write_stash = accept_write_stash
         self.allow_SD = True
         self.alloc_on_seq_acc = False
         self.alloc_on_seq_line_write = False
@@ -312,6 +314,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         dealloc_on_unique: bool = False,
         hnf_inclusion: str = "noninclusive",
         model_profile: str = "abstract",
+        cache_stashing: str = "off",
         core_clock: Optional[str] = None,
         link_latency: int = 1,
         router_latency: int = 1,
@@ -326,6 +329,8 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             raise ValueError(
                 f"Unknown model_profile '{model_profile}'; use {choices}."
             )
+        if cache_stashing not in ("off", "hnf"):
+            raise ValueError("cache_stashing must be 'off' or 'hnf'.")
         if num_hnfs <= 0 or num_hnfs & (num_hnfs - 1):
             raise ValueError("num_hnfs must be a positive power of two.")
         for name, assoc in (
@@ -336,6 +341,10 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         ):
             if assoc <= 0:
                 raise ValueError(f"{name} must be positive.")
+        if cache_stashing == "hnf" and hnf_assoc == 1:
+            raise ValueError(
+                "cache_stashing=hnf requires hnf_assoc > 1 (TreePLRU)."
+            )
         if link_latency <= 0 or router_latency <= 0:
             raise ValueError("Network latencies must be positive.")
         if network_buffer_size <= 0:
@@ -366,6 +375,8 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             raise ValueError(
                 "ddio_way_part must be -1 or between 1 and hnf_assoc."
             )
+        if cache_stashing == "hnf" and ddio_way_part != -1:
+            raise ValueError("cache_stashing=hnf requires ddio_way_part=-1.")
         if ddio_way_part > 0 and model_profile in (
             "arm-generic",
             "x86-generic",
@@ -395,6 +406,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         self._hnf_assoc = hnf_assoc
         self._num_hnfs = num_hnfs
         self._ddio_way_part = ddio_way_part
+        self._cache_stashing = cache_stashing
         self._nic_read_no_allocate = _MODEL_PROFILES[model_profile][
             "nic_read_no_allocate"
         ]
@@ -427,6 +439,8 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
 
     def validate_architecture(self, isa: ISA) -> None:
         """Reject profiles whose stated architecture is not being modeled."""
+        if self._cache_stashing == "hnf" and isa != ISA.ARM:
+            raise ValueError("cache_stashing=hnf requires ARM.")
         if self._model_profile == "intel-ddio" and isa != ISA.X86:
             raise ValueError("The Intel-DDIO profile is only valid for x86.")
         if self._model_profile == "arm-generic" and isa != ISA.ARM:
@@ -460,6 +474,13 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             "cache_state_continuity": False,
             "indexing_policy": self._indexing_policy,
             "ddio_way_part": self._ddio_way_part,
+            "cache_stashing": self._cache_stashing,
+            "cache_stashing_scope": (
+                "ARM CHI HNF only, all normal ways; RX payload writes only; "
+                "WriteUniqueFullStash/WriteUniquePtlStash without target; "
+                "no private target, DataPull, or StashOnce"
+                if self._cache_stashing == "hnf" else "disabled"
+            ),
             "nic_read_no_allocate": self._nic_read_no_allocate,
             "hnf_inclusion": self._hnf_inclusion,
             "num_hnfs": self._num_hnfs,
@@ -535,6 +556,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 assoc=self._hnf_assoc,
                 ddio_way_part=self._ddio_way_part,
                 nic_read_no_allocate=self._nic_read_no_allocate,
+                accept_write_stash=self._cache_stashing == "hnf",
                 addr_hash=self._addr_hash,
                 dealloc_on_unique=self._dealloc_on_unique,
                 hnf_inclusion=self._hnf_inclusion,
@@ -724,6 +746,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 board.get_cache_line_size(),
                 board.get_clock_domain(),
             )
+            controller.emit_rx_write_stash = self._cache_stashing == "hnf"
             controller.sequencer = RubySequencer(
                 version=sequence_base + index,
                 in_ports=port,

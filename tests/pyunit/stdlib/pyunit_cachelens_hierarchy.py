@@ -4,16 +4,28 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import unittest
+from unittest.mock import Mock
 
-from m5.objects import RubySystem
+from m5.objects import (
+    AddrRange,
+    IOXBar,
+    RubySystem,
+    SimpleMemory,
+    SrcClockDomain,
+    VoltageDomain,
+)
+
+from m5.params import Int
 
 from gem5.coherence_protocol import CoherenceProtocol
-from gem5.runtime import get_supported_protocols
+from gem5.runtime import get_supported_isas, get_supported_protocols
 
 if CoherenceProtocol.CHI not in get_supported_protocols():
     raise unittest.SkipTest("Requires a CHI build")
 
 from gem5.isas import ISA
+from gem5.components.processors.cpu_types import CPUTypes
+from gem5.components.processors.simple_processor import SimpleProcessor
 from gem5.prebuilt import cachelens
 from gem5.prebuilt.cachelens.cache_hierarchy import CacheLensCHIHierarchy
 from gem5.prebuilt.cachelens.topology import SimpleCrossbar
@@ -32,6 +44,97 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
         for profile in ("arm-generic", "x86-generic"):
             with self.assertRaisesRegex(ValueError, "Positive ddio_way_part"):
                 CacheLensCHIHierarchy(ddio_way_part=2, model_profile=profile)
+
+    def test_cache_stashing_validation_and_reporting(self) -> None:
+        self.assertEqual(
+            "off",
+            CacheLensCHIHierarchy().get_configuration()["cache_stashing"],
+        )
+        for invalid in ("", "private", "HNF"):
+            with self.assertRaisesRegex(ValueError, "cache_stashing"):
+                CacheLensCHIHierarchy(cache_stashing=invalid)
+        for profile in ("abstract", "arm-generic", "intel-ddio"):
+            with self.subTest(profile=profile):
+                with self.assertRaisesRegex(ValueError, "ddio_way_part=-1"):
+                    CacheLensCHIHierarchy(
+                        cache_stashing="hnf", model_profile=profile,
+                        ddio_way_part=2,
+                    )
+        with self.assertRaisesRegex(ValueError, "ddio_way_part=-1"):
+            CacheLensCHIHierarchy(
+                cache_stashing="hnf", model_profile="intel-ddio"
+            )
+        CacheLensCHIHierarchy(hnf_assoc=1)  # Preserve disabled-mode behavior.
+        for invalid in (
+            {"hnf_size": "0B"}, {"hnf_assoc": 0}, {"hnf_assoc": 1}
+        ):
+            with self.assertRaises(ValueError):
+                CacheLensCHIHierarchy(cache_stashing="hnf", **invalid)
+        for profile in ("abstract", "arm-generic"):
+            hierarchy = CacheLensCHIHierarchy(
+                cache_stashing="hnf", model_profile=profile
+            )
+            hierarchy.validate_architecture(ISA.ARM)
+            config = hierarchy.get_configuration()
+            self.assertEqual("hnf", config["cache_stashing"])
+            self.assertEqual(-1, config["ddio_way_part"])
+            self.assertFalse(config["nic_read_no_allocate"])
+            self.assertIn(
+                "WriteUniqueFullStash/WriteUniquePtlStash",
+                config["cache_stashing_scope"],
+            )
+            board = Mock()
+            board.get_processor.return_value.get_isa.return_value = ISA.X86
+            with self.assertRaisesRegex(ValueError, "requires ARM"):
+                hierarchy.incorporate_cache(board)
+
+    def test_cache_stashing_controller_wiring(self) -> None:
+        if ISA.ARM not in get_supported_isas():
+            self.skipTest("Requires ARM cores for the controller graph")
+        for mode in ("off", "hnf"):
+            for inclusion in ("noninclusive", "inclusive"):
+                with self.subTest(mode=mode, inclusion=inclusion):
+                    hierarchy = CacheLensCHIHierarchy(
+                        cache_stashing=mode, model_profile="arm-generic",
+                        num_hnfs=2, hnf_inclusion=inclusion,
+                    )
+                    board = Mock()
+                    board.get_processor.return_value = SimpleProcessor(
+                        cpu_type=CPUTypes.TIMING, isa=ISA.ARM, num_cores=1
+                    )
+                    board.has_io_bus.return_value = False
+                    board.get_cache_line_size.return_value = Int(64)
+                    board.get_clock_domain.return_value = SrcClockDomain(
+                        clock="1GHz", voltage_domain=VoltageDomain()
+                    )
+                    memory_component = board.get_memory.return_value
+                    memory_component.get_uninterleaved_range.return_value = [
+                        AddrRange("1GiB")
+                    ]
+                    memory = SimpleMemory(range=AddrRange("1GiB"))
+                    board.get_mem_ports.return_value = [
+                        (memory.range, memory.port)
+                    ]
+                    # No ARM bootmem range on this minimal board.
+                    del board.realview
+                    buses = [IOXBar(), IOXBar()]
+                    board.has_dma_ports.return_value = True
+                    board.get_dma_ports.return_value = [
+                        bus.mem_side_ports for bus in buses
+                    ]
+                    hierarchy.incorporate_cache(board)
+                    self.assertEqual(2, len(hierarchy.hnfs))
+                    self.assertEqual(2, len(hierarchy.dma_requestors))
+                    for hnf in hierarchy.hnfs:
+                        self.assertEqual(
+                            mode == "hnf", bool(hnf.accept_write_stash)
+                        )
+                        self.assertEqual(-1, int(hnf.cache.ddio_way_part))
+                        self.assertEqual(8, int(hnf.cache.assoc))
+                    for requestor in hierarchy.dma_requestors:
+                        self.assertEqual(
+                            mode == "hnf", bool(requestor.emit_rx_write_stash)
+                        )
 
     def test_hnf_count_validation(self) -> None:
         CacheLensCHIHierarchy(num_hnfs=1)

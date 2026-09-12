@@ -50,6 +50,7 @@ class CacheLensRunnerTestSuite(unittest.TestCase):
         parser = _RUNNER._create_parser()
         args = self._parse()
         self.assertEqual("chi", args.coherence_protocol)
+        self.assertEqual("off", args.cache_stashing)
         self.assertIsNone(args.hnf_inclusion)
         _RUNNER._validate_args(parser, args)
         self.assertEqual(
@@ -64,6 +65,59 @@ class CacheLensRunnerTestSuite(unittest.TestCase):
         self.assertEqual(
             CoherenceProtocol.CHI, _RUNNER._selected_protocol(args)
         )
+
+    def test_cache_stashing_forwarding(self) -> None:
+        args = self._parse(
+            "--isa", "arm", "--bootloader", str(_RUNNER_PATH),
+            "--cache-stashing", "hnf",
+        )
+        _RUNNER._validate_args(_RUNNER._create_parser(), args)
+        module_name = "gem5.prebuilt.cachelens.cache_hierarchy"
+        module = types.ModuleType(module_name)
+        module.CacheLensCHIHierarchy = Mock()
+        with patch.dict(sys.modules, {module_name: module}):
+            _RUNNER._create_cache_hierarchy(args, ISA.ARM)
+        forwarded = module.CacheLensCHIHierarchy.call_args.kwargs
+        self.assertEqual("hnf", forwarded["cache_stashing"])
+        self.assertEqual("arm-generic", forwarded["model_profile"])
+        self.assertIsNone(forwarded["ddio_way_part"])
+
+    def test_cache_stashing_rejected_before_guest_assets(self) -> None:
+        for protocol in ("chi", "mesi-two-level", "mesi-three-level"):
+            for isa in ("arm", "x86"):
+                if (protocol, isa) == ("chi", "arm"):
+                    continue
+                for cpu_type in ("atomic", "timing"):
+                    with self.subTest(
+                        protocol=protocol, isa=isa, cpu=cpu_type
+                    ):
+                        argv = [
+                            str(_RUNNER_PATH), "--isa", isa,
+                            "--coherence-protocol", protocol,
+                            "--cpu-type", cpu_type,
+                            "--cache-stashing", "hnf",
+                            "--kernel", "/missing/kernel",
+                            "--disk-image", "/missing/disk",
+                        ]
+                        stderr = io.StringIO()
+                        with patch.object(sys, "argv", argv), patch.object(
+                            _RUNNER, "KernelResource"
+                        ) as kernel, patch.object(
+                            _RUNNER, "DiskImageResource"
+                        ) as disk, contextlib.redirect_stderr(stderr):
+                            with self.assertRaises(SystemExit):
+                                _RUNNER.main()
+                        self.assertIn("requires ARM CHI", stderr.getvalue())
+                        kernel.assert_not_called()
+                        disk.assert_not_called()
+        args = self._parse(
+            "--isa", "arm", "--bootloader", str(_RUNNER_PATH),
+            "--cache-stashing", "hnf", "--ddio-way-part", "2",
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            _RUNNER._validate_args(_RUNNER._create_parser(), args)
+        self.assertIn("requires --ddio-way-part=-1", stderr.getvalue())
 
     def test_mesi_options_report_protocol_inclusion(self) -> None:
         parser = _RUNNER._create_parser()
@@ -222,7 +276,7 @@ class CacheLensRunnerTestSuite(unittest.TestCase):
                 if protocol == "chi":
                     expected.update(
                         addr_hash=None, dealloc_on_unique=False,
-                        hnf_inclusion="noninclusive",
+                        hnf_inclusion="noninclusive", cache_stashing="off",
                     )
                 constructor.assert_called_once_with(**expected)
                 banner = _RUNNER._format_configuration_banner(

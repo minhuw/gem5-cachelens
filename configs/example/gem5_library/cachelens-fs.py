@@ -163,6 +163,15 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ddio-way-part", type=int, default=None)
     parser.add_argument(
+        "--cache-stashing", choices=("off", "hnf"), default="off",
+        help=(
+            "Synthetic ARM CHI bridge policy: classified RX payload writes "
+            "emit WriteUniqueFullStash/WriteUniquePtlStash to the HNF using "
+            "all normal ways, without a private target; other NIC traffic "
+            "is unchanged. Requires DDIO disabled."
+        ),
+    )
+    parser.add_argument(
         "--hnf-inclusion",
         choices=("noninclusive", "inclusive"),
         default=None,
@@ -230,6 +239,12 @@ def _require_selected_protocol(parser, args) -> None:
 
 
 def _validate_args(parser, args) -> None:
+    if args.cache_stashing == "hnf":
+        if args.coherence_protocol != "chi" or args.isa != "arm":
+            parser.error("--cache-stashing hnf requires ARM CHI.")
+        if args.ddio_way_part not in (None, -1):
+            parser.error("--cache-stashing hnf requires --ddio-way-part=-1.")
+
     for name in ("kernel", "disk_image"):
         path = getattr(args, name)
         if not path.is_file():
@@ -406,6 +421,7 @@ def _create_cache_hierarchy(args, isa: ISA):
                 addr_hash=args.addr_hash,
                 dealloc_on_unique=args.dealloc_on_unique,
                 hnf_inclusion=args.hnf_inclusion or "noninclusive",
+                cache_stashing=args.cache_stashing,
                 **common,
             ),
             "cachelens-chi",
@@ -477,6 +493,7 @@ def _checkpoint_prep_configuration(args):
         "hnf_assoc": "inactive/deferred",
         "total_hnf_capacity_bytes": "inactive/deferred",
         "ddio_way_part": "inactive/deferred",
+        "cache_stashing": "inactive/deferred",
         "llc_replacement_policy": "inactive/deferred",
         "cache_state_restore_policy": "n/a",
         "cache_state_continuity": False,

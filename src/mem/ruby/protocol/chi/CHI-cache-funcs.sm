@@ -418,6 +418,11 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
 
   tbe.is_stale := false;
   tbe.nic_merge_read_profiled := false;
+  tbe.is_write_stash := false;
+}
+
+bool acceptedWriteStash(TBE tbe) {
+  return is_HN && tbe.is_write_stash && accept_write_stash;
 }
 
 TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes" {
@@ -448,6 +453,18 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   tbe.wuAccessMask.orMask(in_msg.accessMask);
   tbe.requestor := in_msg.requestor;
   tbe.reqType := in_msg.type;
+  // Preserve the hint for forwarding, but reuse ordinary WriteUnique data,
+  // snoop, and completion semantics throughout the transaction.
+  if (in_msg.type == CHIRequestType:WriteUniqueFullStash) {
+    tbe.is_write_stash := true;
+    tbe.reqType := CHIRequestType:WriteUniqueFull;
+  } else if (in_msg.type == CHIRequestType:WriteUniquePtlStash) {
+    tbe.is_write_stash := true;
+    tbe.reqType := CHIRequestType:WriteUniquePtl;
+  }
+  if (is_HN && tbe.is_write_stash) {
+    cache.profileWriteStash(acceptedWriteStash(tbe));
+  }
 
   tbe.isSeqReqValid := in_msg.isSeqReqValid;
   tbe.seqReq := in_msg.seqReq;
@@ -455,8 +472,8 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   tbe.is_remote_pf := in_msg.is_remote_pf;
 
   // NIC classification: the original gem5 request (from the NIC's DMA
-  // port) carries the category flags end-to-end. All NIC writes use the same
-  // allocation policy; payload/header telemetry remains category-specific.
+  // port) carries the category flags end-to-end. Accepted stash hints can
+  // override placement; payload/header telemetry remains category-specific.
   tbe.is_ddio_write := is_HN && in_msg.isSeqReqValid &&
       cache.isNicDdioWriteReq(in_msg.seqReq);
   tbe.is_ddio_payload := is_HN && in_msg.isSeqReqValid &&
@@ -491,17 +508,17 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
       // a classified WriteUniqueZero is malformed and must not be projected
       // into either write class.
       assert(tbe.is_nic_read == false);
-      assert((in_msg.type == CHIRequestType:WriteUniquePtl) ||
-             (in_msg.type == CHIRequestType:WriteUniqueFull));
-      write_partial := in_msg.type == CHIRequestType:WriteUniquePtl;
+      assert((tbe.reqType == CHIRequestType:WriteUniquePtl) ||
+             (tbe.reqType == CHIRequestType:WriteUniqueFull));
+      write_partial := tbe.reqType == CHIRequestType:WriteUniquePtl;
       if (write_partial == false) {
         assert(nic_dma_bytes == blockSize);
       }
     } else {
       assert(tbe.is_nic_read);
-      assert((in_msg.type != CHIRequestType:WriteUniquePtl) &&
-             (in_msg.type != CHIRequestType:WriteUniqueFull) &&
-             (in_msg.type != CHIRequestType:WriteUniqueZero));
+      assert((tbe.reqType != CHIRequestType:WriteUniquePtl) &&
+             (tbe.reqType != CHIRequestType:WriteUniqueFull) &&
+             (tbe.reqType != CHIRequestType:WriteUniqueZero));
     }
     cache.profileNicDma(
         addr, in_msg.seqReq, write_partial, nic_dma_bytes);
@@ -1266,6 +1283,8 @@ bool isWriteReqType(CHIRequestType type) {
       type == CHIRequestType:StoreLine ||
       type == CHIRequestType:WriteUniquePtl ||
       type == CHIRequestType:WriteUniqueFull ||
+      type == CHIRequestType:WriteUniquePtlStash ||
+      type == CHIRequestType:WriteUniqueFullStash ||
       type == CHIRequestType:WriteUniqueZero ||
       type == CHIRequestType:ReadUnique) {
     return true;
@@ -1338,13 +1357,15 @@ Event reqToEvent(CHIRequestType type, bool is_prefetch) {
     return Event:WriteEvictFull;
   } else if (type == CHIRequestType:WriteCleanFull) {
     return Event:WriteCleanFull;
-  } else if (type == CHIRequestType:WriteUniquePtl) {
+  } else if ((type == CHIRequestType:WriteUniquePtl) ||
+             (type == CHIRequestType:WriteUniquePtlStash)) {
     if (is_HN) {
       return Event:WriteUniquePtl_PoC;
     } else {
       return Event:WriteUnique; // all WriteUnique handled the same when ~PoC
     }
-  } else if (type == CHIRequestType:WriteUniqueFull) {
+  } else if ((type == CHIRequestType:WriteUniqueFull) ||
+             (type == CHIRequestType:WriteUniqueFullStash)) {
     if (is_HN && alloc_on_writeback) {
       return Event:WriteUniqueFull_PoC_Alloc;
     } else if (is_HN) {

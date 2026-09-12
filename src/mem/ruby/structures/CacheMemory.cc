@@ -612,6 +612,23 @@ CacheMemory::cacheProbeInWays(Addr address, int ways) const
                         getVictim(candidates)->getWay()]->m_Address;
 }
 
+void
+CacheMemory::profileWriteStash(bool accepted)
+{
+    cacheMemoryStats.writeStashRequests++;
+    if (accepted) {
+        cacheMemoryStats.writeStashAccepted++;
+    } else {
+        cacheMemoryStats.writeStashDeclined++;
+    }
+}
+
+void
+CacheMemory::profileWriteStashAllocation()
+{
+    cacheMemoryStats.writeStashAllocations++;
+}
+
 AbstractCacheEntry*
 CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
 {
@@ -958,6 +975,11 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
                "Classified DMA requests recycled in a transient cache state"),
       ADD_STAT(ddioReplacementStalls,
                "Classified DMA writes stalled for DDIO subset replacement"),
+      ADD_STAT(writeStashRequests, "No-target write-stash requests at HN"),
+      ADD_STAT(writeStashAccepted, "Write-stash hints accepted by HN policy"),
+      ADD_STAT(writeStashDeclined, "Write-stash hints declined by HN policy"),
+      ADD_STAT(writeStashAllocations,
+               "New cache entries allocated for accepted write-stash hints"),
       ADD_STAT(ddioOwnershipRequests,
                "Retained DDIO ownership requests sent to the directory"),
       ADD_STAT(ddioOwnershipAcks,

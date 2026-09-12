@@ -227,6 +227,8 @@ structure (CacheMemory, external = "yes") {
   // Generic source/extent metrics are CHI-only (unsupported in MESI).
   void profileNicDma(Addr, RequestPtr, bool, int);
   void profileNicDmaMergeRead(RequestPtr);
+  void profileWriteStash(bool);
+  void profileWriteStashAllocation();
   int getNicDmaRequestSize(RequestPtr);
   void profileRxPayload(Addr);
   void profileRdmaRxPayload(Addr);

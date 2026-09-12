@@ -135,6 +135,11 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // This is a model/profile choice, not an unconditional CHI rule.
   bool nic_read_no_allocate := "False";
 
+  // Synthetic bridge policy: hint system-cache allocation for RX payloads.
+  bool emit_rx_write_stash := "False";
+  // HN acceptance of no-target write-stash hints, independent of DDIO ways.
+  bool accept_write_stash := "False";
+
   // Atomic Operation Policy
   // All Near executes all Atomics at L1 (variable set to 0; default)
   // Unique Near executes Atomics at HNF for states I, SC, SD (set to 1)
@@ -684,9 +689,10 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     RequestPtr seqReq,      default="nullptr", desc="Pointer to original request from CPU/sequencer";
     bool isSeqReqValid,     default="false",   desc="Set if seqReq is valid (not nullptr)";
 
-    // NIC classification of the transaction (home node only). Payload and
-    // header telemetry remain separate, while all NIC writes share the DDIO
-    // allocation policy.
+    // Preserve stash hints separately from NIC classification (HN only).
+    // Accepted hints override DDIO allocation; payload/header provenance
+    // and telemetry remain independent of that placement decision.
+    bool is_write_stash,    default="false",   desc="Original request carried a no-target write-stash hint";
     bool is_ddio_write,     default="false",   desc="NIC DMA write subject to DDIO policy";
     bool is_ddio_payload,   default="false",   desc="NIC RX payload DMA write";
     bool is_ddio_header,    default="false",   desc="NIC RX header DMA write";

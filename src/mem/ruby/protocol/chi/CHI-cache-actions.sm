@@ -277,11 +277,13 @@ action(Initiate_Request, desc="") {
                                      cache_entry, dir_entry,
                                      tbe.is_local_pf);
   bool dealloc_entry := needDeallocCacheEntry(tbe.reqType);
-  // NIC writes either allocate in the configured DDIO subset or, when
-  // disabled, use the write-through/no-retention path below. NIC-read
-  // no-allocation is an explicit controller/profile policy.
+  // Accepted stash hints override the NIC DDIO allocation policy. Other
+  // NIC writes use its subset or write-through/no-retention when disabled.
+  // NIC-read no-allocation is an explicit controller/profile policy.
   if (is_HN && is_invalid(cache_entry)) {
-    if (tbe.is_nic_read && nic_read_no_allocate) {
+    if (acceptedWriteStash(tbe)) {
+      alloc_entry := true;
+    } else if (tbe.is_nic_read && nic_read_no_allocate) {
       alloc_entry := false;
     } else if (tbe.is_ddio_write) {
       alloc_entry := cache.getDDIOWayPart() > 0;
@@ -1012,7 +1014,8 @@ action(Initiate_StoreUpgrade, desc="") {
 
 action(Initiate_WriteUnique_Zero, desc="") {
   assert(is_HN);
-  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0;
+  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0 &&
+      !acceptedWriteStash(tbe);
   tbe.dataUnique := true;
   if (no_ddio) {
     tbe.use_DMT := false;
@@ -1044,7 +1047,7 @@ action(Initiate_WriteUnique_Zero, desc="") {
 
 action(Initiate_WriteUnique_LocalWrite, desc="") {
   bool no_ddio := is_HN && tbe.is_ddio_write &&
-      cache.getDDIOWayPart() < 0;
+      cache.getDDIOWayPart() < 0 && !acceptedWriteStash(tbe);
   if (no_ddio) {
     // Disabled DDIO is write-through/no-retention on both HNF hits and
     // misses. Preserve an authoritative full line long enough to merge a
@@ -1075,6 +1078,13 @@ action(Initiate_WriteUnique_LocalWrite, desc="") {
     tbe.dataUnique := true;
     if (tbe.dir_sharers.count() > 0) {
       tbe.actions.push(Event:SendSnpCleanInvalid);
+    }
+    if (is_HN && (tbe.is_ddio_write || acceptedWriteStash(tbe))) {
+      // A retained UC_RU entry is not authoritative until snoops complete.
+      // Clean owners may return no data; obtain untouched bytes before
+      // acknowledging a partial stash or DDIO write.
+      tbe.use_DMT := false;
+      tbe.actions.push(Event:PrepareDDIOWrite);
     }
     if (comp_wu) {
       tbe.actions.push(Event:SendDBIDResp_WU);
@@ -1108,8 +1118,10 @@ action(Initiate_WriteUnique_LocalWrite_AfterUpgrade, desc="") {
 action(Initiate_WriteUnique_Writeback, desc="") {
   assert(is_HN);
   assert(tbe.dir_sharers.count() > 0);
-  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0;
-  bool ddio_fill := tbe.is_ddio_write && cache.getDDIOWayPart() > 0;
+  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0 &&
+      !acceptedWriteStash(tbe);
+  bool ddio_fill := acceptedWriteStash(tbe) ||
+      (tbe.is_ddio_write && cache.getDDIOWayPart() > 0);
   if (no_ddio) {
     tbe.use_DMT := false;
     tbe.doCacheFill := false;
@@ -1130,8 +1142,9 @@ action(Initiate_WriteUnique_Writeback, desc="") {
     tbe.actions.pushNB(Event:TagArrayWrite);
   } else if (ddio_fill) {
     // Upstream ownership is directory state, not an LLC allocation. Bring
-    // the NIC write into the constrained DDIO subset after invalidating the
-    // owner. Partial writes also fetch bytes not supplied by the request.
+    // the write into the cache after invalidating the owner. Accepted stash
+    // hints use ordinary ways; DDIO alone uses its constrained subset.
+    // Partial writes also fetch bytes not supplied by the request.
     tbe.use_DMT := false;
     tbe.doCacheFill := true;
     tbe.dataToBeInvalid := false;
@@ -1169,8 +1182,10 @@ action(Initiate_WriteUnique_Writeback, desc="") {
 
 action(Initiate_WriteUnique_PartialWrite, desc="") {
   assert(is_HN);
-  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0;
-  bool ddio_fill := tbe.is_ddio_write && cache.getDDIOWayPart() > 0;
+  bool no_ddio := tbe.is_ddio_write && cache.getDDIOWayPart() < 0 &&
+      !acceptedWriteStash(tbe);
+  bool ddio_fill := acceptedWriteStash(tbe) ||
+      (tbe.is_ddio_write && cache.getDDIOWayPart() > 0);
 
   if (no_ddio) {
     tbe.use_DMT := false;
@@ -1193,8 +1208,8 @@ action(Initiate_WriteUnique_PartialWrite, desc="") {
     tbe.actions.push(Event:SendWBData);
     tbe.actions.pushNB(Event:TagArrayWrite);
   } else if (ddio_fill) {
-    // Allocate classified NIC writes independently of the generic writeback
-    // allocation policy. PrepareDDIOWrite obtains untouched bytes only for a
+    // Allocate accepted stash hints or classified DDIO writes independently
+    // of generic writeback policy. PrepareDDIOWrite fetches bytes only for a
     // partial write which has no authoritative complete line.
     tbe.use_DMT := false;
     tbe.doCacheFill := true;
@@ -1256,11 +1271,12 @@ action(Prepare_DDIOWrite, desc="") {
   bool needs_read := cache.ddioWriteNeedsRead(
       tbe.reqType == CHIRequestType:WriteUniquePtl, tbe.dataValid);
   if (needs_read) {
-    assert(tbe.is_ddio_write);
-    assert(tbe.isSeqReqValid);
-    assert(tbe.nic_merge_read_profiled == false);
-    cache.profileNicDmaMergeRead(tbe.seqReq);
-    tbe.nic_merge_read_profiled := true;
+    assert(tbe.is_ddio_write || acceptedWriteStash(tbe));
+    if (tbe.is_ddio_write && tbe.isSeqReqValid) {
+      assert(tbe.nic_merge_read_profiled == false);
+      cache.profileNicDmaMergeRead(tbe.seqReq);
+      tbe.nic_merge_read_profiled := true;
+    }
     tbe.dataUnique := false;
     tbe.actions.pushFront(Event:SendReadNoSnp);
   } else {
@@ -1974,13 +1990,26 @@ action(Send_WriteNoSnp_Partial, desc="") {
 
 action(Send_WriteUnique, desc="") {
   assert(is_valid(tbe));
+  bool stash := tbe.is_write_stash ||
+      (emit_rx_write_stash && tbe.isSeqReqValid &&
+       cache.isNicRxPayloadWriteReq(tbe.seqReq));
 
   enqueue(reqOutPort, CHIRequestMsg, request_latency) {
-    if (tbe.wuAccessMask.isFull() ||
-        (tbe.wuAccessMask.isEmpty() && tbe.accSize == blockSize)) {
-      prepareRequest(tbe, CHIRequestType:WriteUniqueFull, out_msg);
-    } else {
-      prepareRequest(tbe, CHIRequestType:WriteUniquePtl, out_msg);
+    CHIRequestType req_type := CHIRequestType:WriteUniquePtl;
+    bool full := tbe.wuAccessMask.isFull() ||
+        (tbe.wuAccessMask.isEmpty() && tbe.accSize == blockSize);
+    if (full) {
+      if (stash) {
+        req_type := CHIRequestType:WriteUniqueFullStash;
+      } else {
+        req_type := CHIRequestType:WriteUniqueFull;
+      }
+    } else if (stash) {
+      req_type := CHIRequestType:WriteUniquePtlStash;
+    }
+    // prepareRequest saves the raw opcode in pendReqType for retries.
+    prepareRequest(tbe, req_type, out_msg);
+    if (!full || stash) {
       out_msg.accAddr := tbe.accAddr;
       out_msg.accSize := tbe.accSize;
     }
@@ -3773,10 +3802,11 @@ action(CheckCacheFill, desc="") {
   bool need_fill := tbe.dataValid && (tbe.dataToBeInvalid == false) && tbe.doCacheFill;
   bool execute_next := true;
 
-  // DDIO (home node only): confine all NIC write fills to the configured
-  // way subset [0, ddio_way_part).
+  // Accepted no-target stash hints use all ordinary ways. DDIO fills without
+  // an accepted hint use the configured subset [0, ddio_way_part).
   int ddio_ways := cache.getDDIOWayPart();
-  bool ddio_fill := is_HN && tbe.is_ddio_write && ddio_ways > 0;
+  bool ddio_fill := is_HN && tbe.is_ddio_write && ddio_ways > 0 &&
+      !acceptedWriteStash(tbe);
 
   if (need_fill && is_valid(cache_entry)) {
     // can write
@@ -3794,6 +3824,9 @@ action(CheckCacheFill, desc="") {
   } else if (need_fill && !ddio_fill && cache.cacheAvail(address)) {
     // don't have a cache block, but there is space to allocate one
     set_cache_entry(cache.allocate(address, new CacheEntry));
+    if (acceptedWriteStash(tbe)) {
+      cache.profileWriteStashAllocation();
+    }
     if (is_HN) {
       cache.profileDdioWayFill(
           ddioSrcClass(tbe), cache_entry.getWay(), address);

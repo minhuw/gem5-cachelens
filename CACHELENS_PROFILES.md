@@ -57,6 +57,13 @@ is not Intel DDIO or a claim about a particular ARM SoC. `arm-generic` and
 `x86-generic` disable DDIO by default and reject positive DDIO partitions.
 `intel-ddio` is x86-only. `abstract` permits explicit experimental allocation.
 
+For specification-based Arm **HNF write stashing**, instead use
+`--model-profile arm-generic --cache-stashing hnf --ddio-way-part -1`.
+This opt-in mode emits no-target CHI write-stash hints for RX payloads and uses
+ordinary LLC ways, not a DDIO partition. See [the supported subset and primary
+specification references](CACHELENS_STASHING.md); private-target and independent
+stashing are not implemented.
+
 For both three-level profiles, `l1d_*` controls private L1D, `l2_*` controls
 private L2, and `hnf_*` controls each shared LLC bank. `num_hnfs` is the number
 of banks, so total shared capacity is per-bank size times bank count. The old

@@ -317,6 +317,11 @@ class CacheMemory : public SimObject
           statistics::Scalar dmaRoutingTransientRecycles;
           statistics::Scalar ddioReplacementStalls;
 
+          statistics::Scalar writeStashRequests;
+          statistics::Scalar writeStashAccepted;
+          statistics::Scalar writeStashDeclined;
+          statistics::Scalar writeStashAllocations;
+
           // Retained DDIO ownership handshakes. A cold/subset-replacement
           // fill must publish its L2 owner at the directory before the DMA
           // write is acknowledged.
@@ -475,6 +480,8 @@ class CacheMemory : public SimObject
       void profileNicDma(Addr address, const RequestPtr &req,
                          bool write_partial, int bytes);
       void profileNicDmaMergeRead(const RequestPtr &req);
+      void profileWriteStash(bool accepted);
+      void profileWriteStashAllocation();
       int getNicDmaRequestSize(const RequestPtr &req) const;
       static NicDmaSource classifyNicDmaSource(const RequestPtr &req);
       static NicDmaOperation classifyNicDmaOperation(

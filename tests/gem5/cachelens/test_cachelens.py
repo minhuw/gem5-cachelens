@@ -122,6 +122,33 @@ def cachelens_chi_dma_test(scenario):
     )
 
 
+def cachelens_chi_stash_test(scenario, mode="hnf", decline=False,
+                            inclusion="inclusive"):
+    # Native synthetic DMA, including RDMA provenance; not ARM PVRDMA boot.
+    config_args = ["--scenario", scenario, "--cache-stashing", mode,
+                   "--ddio-way-part", "-1", "--hnf-inclusion", inclusion]
+    if decline:
+        config_args.append("--decline-stash")
+    gem5_verify_config(
+        name=(f"cachelens-arm-chi-stash-{mode}-{scenario}"
+              f"-decline-{int(decline)}-{inclusion}"),
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(
+            f"CACHELENS_CHI_STASH_OK scenario={scenario} "
+            f"mode={mode} decline={int(decline)}"
+        )),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "chi_dma_directed.py"
+        ),
+        config_args=config_args,
+        valid_isas=(constants.arm_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+        protocol="CHI",
+        gem5_fixture_factory=CacheLensExactProtocolFixture,
+    )
+
+
 def cachelens_chi_dma_mask_rejection_test(host):
     def run_rejection(params):
         tempdir = Path(params.fixtures[constants.tempdir_fixture_name].path)
@@ -129,7 +156,12 @@ def cachelens_chi_dma_mask_rejection_test(host):
         probe = joinpath(
             absdirpath(__file__), "configs", "chi_dma_directed.py"
         )
-        for scenario in ("zero_mask", "sparse_mask"):
+        for scenario, extra, diagnostic in (
+            ("zero_mask", [], r"fatal:.*RubySequencer does not support masked writes"),
+            ("sparse_mask", [], r"fatal:.*RubySequencer does not support masked writes"),
+            ("cold_full_write", ["--cache-stashing", "hnf", "--abs-max-tick", "1"],
+             r"RuntimeError: Unexpected simulation exit:"),
+        ):
             result = subprocess.run(
                 [
                     gem5,
@@ -138,6 +170,7 @@ def cachelens_chi_dma_mask_rejection_test(host):
                     probe,
                     "--scenario",
                     scenario,
+                    *extra,
                 ],
                 cwd=config.base_dir,
                 stdout=subprocess.PIPE,
@@ -148,9 +181,9 @@ def cachelens_chi_dma_mask_rejection_test(host):
             print(result.stdout)
             assert result.returncode != 0, f"{scenario} unexpectedly succeeded"
             assert re.search(
-                r"fatal:.*RubySequencer does not support masked writes",
+                diagnostic,
                 result.stdout,
-            ), f"{scenario} did not report the unsupported-mask diagnostic"
+            ), f"{scenario} did not report {diagnostic}"
 
     name = f"cachelens-arm-chi-dma-mask-rejection-{host}-opt"
     TestSuite(
@@ -595,6 +628,25 @@ def run_pcap_replay_tests(params):
 for scenario in ("cold_full_write", "partial_dirty_owner", "pvrdma_provenance"):
     cachelens_chi_dma_test(scenario)
 
+
+for scenario in (
+    "cold_full_write", "stash_partial_cold", "partial_dirty_owner",
+    "partial_ss_sharers", "hit_update", "stash_unclassified", "stash_clean_owner",
+    "stash_replacement", "pvrdma_provenance",
+):
+    cachelens_chi_stash_test(scenario)
+for scenario in ("cold_full_write", "stash_partial_cold", "partial_dirty_owner",
+                 "stash_clean_owner"):
+    cachelens_chi_stash_test(scenario, decline=True)
+for scenario in ("cold_full_write", "stash_partial_cold", "stash_unclassified",
+                 "stash_clean_owner",
+                 "pvrdma_provenance"):
+    cachelens_chi_stash_test(scenario, mode="off")
+
+
+for scenario in ("cold_full_write", "stash_partial_cold", "partial_dirty_owner",
+                 "stash_clean_owner", "pvrdma_provenance"):
+    cachelens_chi_stash_test(scenario, inclusion="noninclusive")
 
 for host in constants.supported_hosts:
     cachelens_chi_dma_mask_rejection_test(host)

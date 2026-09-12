@@ -5,7 +5,7 @@
 
 Two requestor adapters drive real private caches using the existing directed
 CPU/DMA tester. Empty decoder lists deliberately issue no instructions/DVM.
-No external TLM library, guest resources, or protocol policy overrides.
+No external TLM library or guest resources. Stash decline is test-only.
 """
 
 import argparse
@@ -101,30 +101,49 @@ class DirectedBoard:
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--scenario", required=True, choices=(
     "cold_full_write", "partial_dirty_owner", "pvrdma_provenance",
+    "stash_partial_cold", "partial_ss_sharers", "hit_update",
+    "stash_unclassified", "stash_replacement", "stash_clean_owner",
     "zero_mask", "sparse_mask",  # Unsupported by RubySequencer: must fail.
 ))
+parser.add_argument("--cache-stashing", choices=("off", "hnf"), default=None)
+parser.add_argument("--decline-stash", action="store_true")
+parser.add_argument("--ddio-way-part", type=int, default=None)
+parser.add_argument("--hnf-inclusion", choices=("inclusive", "noninclusive"),
+                    default="inclusive")
 parser.add_argument("--abs-max-tick", type=int, default=10000000000)
 args = parser.parse_args()
+stash_test = args.cache_stashing is not None
+if args.decline_stash and args.cache_stashing != "hnf":
+    parser.error("--decline-stash requires --cache-stashing hnf")
+if args.scenario.startswith("stash_") and not stash_test:
+    parser.error("stash scenarios require --cache-stashing")
+ddio = args.ddio_way_part
+if ddio is None:
+    ddio = -1 if stash_test else 1
 
 system = System(
     clk_domain=SrcClockDomain(clock="1GHz", voltage_domain=VoltageDomain()),
     mem_ranges=[AddrRange("64MiB")], mem_mode="timing", cache_line_size=64,
 )
 system.memory = SimpleMemory(range=system.mem_ranges[0])
-system.tester = MESIDDIODirectedTester(scenario=args.scenario, block_size=64)
+system.tester = MESIDDIODirectedTester(
+    scenario=args.scenario, block_size=64, cold_read_is_tx=stash_test,
+)
 system.cache_hierarchy = CacheLensCHIHierarchy(
     l1i_size="256B", l1i_assoc=2, l1d_size="256B", l1d_assoc=2,
     l2_size="256B", l2_assoc=2, hnf_size="512B", hnf_assoc=4,
-    num_hnfs=1, ddio_way_part=1, model_profile="abstract",
-    hnf_inclusion="inclusive", indexing_policy="linear",
+    num_hnfs=1, ddio_way_part=ddio,
+    model_profile="arm-generic" if stash_test else "abstract",
+    cache_stashing=args.cache_stashing or "off",
+    hnf_inclusion=args.hnf_inclusion, indexing_policy="linear",
 )
 hierarchy = system.cache_hierarchy
 hierarchy.incorporate_cache(DirectedBoard(system))
 hierarchy.ruby_system.randomization = False
 metadata = hierarchy.get_configuration()
 assert metadata["coherence_protocol"] == "CHI"
-assert metadata["hnf_inclusion"] == "inclusive"
-assert metadata["ddio_way_part"] == 1
+assert metadata["hnf_inclusion"] == args.hnf_inclusion
+assert metadata["ddio_way_part"] == ddio
 assert metadata["nic_read_no_allocate"] is False
 assert len(hierarchy.core_clusters) == 2
 assert len(hierarchy.hnfs) == len(hierarchy.dma_requestors) == 1
@@ -134,11 +153,31 @@ for cluster in hierarchy.core_clusters:
     assert list(cluster.l2.downstream_destinations) == list(hierarchy.hnfs)
 hnf = hierarchy.hnfs[0]
 assert bool(hnf.is_HN) and not bool(hnf.nic_read_no_allocate)
-assert bool(hnf.alloc_on_readunique)
-assert bool(hnf.dealloc_backinv_unique) and bool(hnf.dealloc_backinv_shared)
-assert not bool(hnf.enable_DMT) and not bool(hnf.enable_DCT)
-assert int(hnf.cache.ddio_way_part) == 1
+inclusive = args.hnf_inclusion == "inclusive"
+assert bool(hnf.alloc_on_readunique) == inclusive
+assert bool(hnf.dealloc_backinv_unique) == inclusive
+assert bool(hnf.dealloc_backinv_shared) == inclusive
+assert bool(hnf.enable_DMT) == (not inclusive)
+assert bool(hnf.enable_DCT) == (not inclusive)
+assert int(hnf.cache.ddio_way_part) == ddio
 assert list(hierarchy.dma_requestors[0].downstream_destinations) == [hnf]
+
+if args.scenario == "stash_clean_owner":
+    # Exercise UC_RU: retain the clean HNF copy while granting its private
+    # L2 owner uniqueness. A normal ReadShared otherwise grants only SC.
+    hnf.fwd_unique_on_readshared = True
+
+if stash_test:
+    assert metadata["model_profile"] == "arm-generic"
+    assert bool(hierarchy.dma_requestors[0].emit_rx_write_stash) == (
+        args.cache_stashing == "hnf"
+    )
+    if args.decline_stash:
+        for node in hierarchy.hnfs:
+            node.accept_write_stash = False
+    assert bool(hnf.accept_write_stash) == (
+        args.cache_stashing == "hnf" and not args.decline_stash
+    )
 
 root = Root(full_system=False, system=system)
 m5.ticks.setGlobalFrequency("1ps")
@@ -147,27 +186,74 @@ exit_event = m5.simulate(args.abs_max_tick)
 print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
 if exit_event.getCause() != "MESI DDIO directed scenario completed":
     raise RuntimeError(f"Unexpected simulation exit: {exit_event.getCause()}")
-# CHI counts tag presence at HNF acceptance, not MESI eviction outcomes.
-# The inclusive HNF retains the dirty-owner line; the partial RX is a hit.
-partial = args.scenario == "partial_dirty_owner"
+# Acceptance-time TX hits below occur before CPU demand reads: unlike a
+# final tag lookup, these cannot mistake a later CPU fill for a stash fill.
+partial = args.scenario in (
+    "partial_dirty_owner", "partial_ss_sharers", "stash_clean_owner",
+)
+if args.scenario == "stash_clean_owner" and not inclusive:
+    # DMT fills the clean private owner directly, bypassing HNF allocation.
+    partial = False
 rdma = args.scenario == "pvrdma_provenance"
-tx = int(partial or rdma)
+retained = ddio >= 0 or (
+    args.cache_stashing == "hnf" and not args.decline_stash
+)
+rx, rx_hits, tx, tx_hits = 1, int(partial), 1, int(retained)
+allocations = int(retained and not partial)
+if args.scenario == "cold_full_write" and not stash_test:
+    tx = tx_hits = 0
+elif args.scenario == "hit_update":
+    rx, rx_hits = 2, int(retained)
+elif args.scenario == "stash_unclassified":
+    rx = rx_hits = allocations = 0
+    # Generic (unclassified) writes retain normally, without a stash hint.
+    tx, tx_hits = 3, 1
+elif args.scenario == "stash_replacement":
+    rx, rx_hits, tx, tx_hits = 10, 0, 5, 4 if retained else 0
+    allocations = 10 if retained else 0
 expected = {
-    "rxPayloadRequests": 1,
-    "rxPayloadHits": int(partial),
-    "rxPayloadMisses": int(not partial),
+    "rxPayloadRequests": rx,
+    "rxPayloadHits": rx_hits,
+    "rxPayloadMisses": rx - rx_hits,
     "txPayloadRequests": tx,
-    "txPayloadHits": tx,
-    "txPayloadMisses": 0,
-    "nicDmaWriteRequests": 1,
+    "txPayloadHits": tx_hits,
+    "txPayloadMisses": tx - tx_hits,
+    "nicDmaWriteRequests": rx,
     "nicDmaReadRequests": tx,
     "rdmaRxPayloadRequests": int(rdma),
     "rdmaTxPayloadRequests": int(rdma),
     "rdmaRxPayloadCpuUniqueLines": int(rdma),
 }
+if args.scenario in ("stash_partial_cold", "stash_clean_owner"):
+    expected.update(nicDmaWriteRequests=2, nicDescWriteRequests=1)
+if args.scenario == "stash_unclassified":
+    expected.update(nicDmaWriteRequests=2, nicDmaReadRequests=4,
+                    nicDescWriteRequests=1, nicDescReadRequests=1,
+                    rxHeaderRequests=1, rxHeaderMisses=1)
+if stash_test:
+    hints = rx if args.cache_stashing == "hnf" else 0
+    expected.update(
+        writeStashRequests=hints,
+        writeStashAccepted=0 if args.decline_stash else hints,
+        writeStashDeclined=hints if args.decline_stash else 0,
+        # Only new physical stash fills; hits and CPU/TX fills do not count.
+        writeStashAllocations=allocations if hints else 0,
+    )
 for name, value in expected.items():
     stat = hnf.cache.resolveStat(name)
     stat.prepare()
     assert stat.value == value, f"{name}: observed={stat.value}, expected={value}"
     print(f"CHI_HNF_STAT {name}={stat.value}")
+if stash_test and args.scenario in (
+    "stash_partial_cold", "stash_clean_owner", "partial_dirty_owner",
+):
+    stat = hnf.cache.resolveStat("nicDmaMergeReads")
+    stat.prepare()
+    merges = sum(stat.value)
+    expected_merges = int(args.scenario != "partial_dirty_owner")
+    assert merges == expected_merges, (merges, expected_merges)
+    print(f"CHI_HNF_STAT nicDmaMergeReads.total={merges}")
+if stash_test:
+    print(f"CACHELENS_CHI_STASH_OK scenario={args.scenario} "
+          f"mode={args.cache_stashing} decline={int(args.decline_stash)}")
 print(f"CACHELENS_CHI_DMA_OK scenario={args.scenario}")
