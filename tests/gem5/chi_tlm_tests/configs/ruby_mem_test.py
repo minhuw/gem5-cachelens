@@ -64,12 +64,20 @@ from ruby.CHI_config import (
 class TLM_RNF(CHI_Node):
     # The CHI controller can be a child of this object or another if
     # 'parent' is specified
-    def __init__(self, ruby_system, parent):
+    def __init__(
+        self,
+        ruby_system,
+        parent,
+        classify_ddio=False,
+        nic_dma_category="",
+    ):
         super().__init__(ruby_system)
 
         self._cntrl = TlmController(
-            version=Versions.getVersion(Cache_Controller),
+            version=Versions.getVersion(CHI_Cache_Controller),
             ruby_system=ruby_system,
+            test_nic_rx_payload_write=classify_ddio,
+            test_nic_dma_category=nic_dma_category,
         )
 
         parent.chi_controller = self._cntrl
@@ -86,7 +94,17 @@ class TLM_RNF(CHI_Node):
 
 
 def rnf_gen(options, ruby_system, cpus):
-    return [TLM_RNF(ruby_system, cpu) for cpu in system.cpu]
+    classify_ddio = getattr(suite, "classify_ddio", False)
+    nic_dma_category = getattr(suite, "nic_dma_category", "")
+    return [
+        TLM_RNF(
+            ruby_system,
+            cpu,
+            classify_ddio=classify_ddio,
+            nic_dma_category=nic_dma_category,
+        )
+        for cpu in system.cpu
+    ]
 
 
 def mn_gen(options, ruby_system, cpus):
@@ -182,9 +200,11 @@ args.mem_size = "4GiB"
 # Currently ruby does not support atomic or uncacheable accesses
 #
 cpus = [TlmGenerator(cpu_id=i) for i in range(args.num_cpus)]
+suite = suite_importer(args.suite)
+if hasattr(suite, "ddio_way_part"):
+    args.ddio_way_part = suite.ddio_way_part
 
 for cpu in cpus:
-    suite = suite_importer(args.suite)
     suite.test_all(cpu)
 
 system = System(
@@ -199,6 +219,10 @@ system._rnf_gen = rnf_gen
 system._mn_gen = mn_gen
 
 create_system(args, system)
+
+if hasattr(suite, "hnf_alloc_on_writeback"):
+    for hnf in system.ruby.hnf:
+        hnf._cntrl.alloc_on_writeback = suite.hnf_alloc_on_writeback
 
 # Create a top-level voltage domain and clock domain
 system.voltage_domain = VoltageDomain(voltage=args.sys_voltage)
@@ -230,3 +254,6 @@ m5.instantiate()
 exit_event = m5.simulate(args.abs_max_tick)
 
 print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
+
+if hasattr(suite, "check"):
+    suite.check(system)

@@ -245,6 +245,25 @@ class WriteMask
         return count;
     }
 
+    int
+    countChunks(int chunk_size) const
+    {
+        assert(mSize > 0);
+        assert(chunk_size > 0);
+        assert((mSize % chunk_size) == 0);
+
+        int chunks = 0;
+        for (int offset = 0; offset < mSize; offset += chunk_size) {
+            for (int byte = offset; byte < offset + chunk_size; ++byte) {
+                if (mMask[byte]) {
+                    ++chunks;
+                    break;
+                }
+            }
+        }
+        return chunks;
+    }
+
     void print(std::ostream& out) const;
 
     /*

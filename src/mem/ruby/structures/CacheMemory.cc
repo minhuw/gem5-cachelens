@@ -49,6 +49,7 @@
 #include "debug/RubyCacheTrace.hh"
 #include "debug/RubyResourceStalls.hh"
 #include "debug/RubyStats.hh"
+#include "mem/cache/replacement_policies/lru_rp.hh"
 #include "mem/cache/replacement_policies/weighted_lru_rp.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -83,6 +84,16 @@ CacheMemory::CacheMemory(const Params &p)
     m_block_size = p.block_size;  // may be 0 at this point. Updated in init()
     m_use_occupancy = dynamic_cast<replacement_policy::WeightedLRU*>(
                                     m_replacementPolicy_ptr) ? true : false;
+    m_ddio_way_part = p.ddio_way_part;
+    fatal_if(m_ddio_way_part != -1 &&
+             (m_ddio_way_part < 1 || m_ddio_way_part > m_cache_assoc),
+             "DDIO way partition must be -1 or in [1, %d], got %d",
+             m_cache_assoc, m_ddio_way_part);
+    fatal_if(m_ddio_way_part > 0 &&
+             !dynamic_cast<replacement_policy::LRU*>(
+                 m_replacementPolicy_ptr),
+             "DDIO way partition requires the subset-safe LRU replacement "
+             "policy");
 }
 
 void
@@ -111,8 +122,15 @@ CacheMemory::init()
 
     m_cache.resize(m_cache_num_sets,
                     std::vector<AbstractCacheEntry*>(m_cache_assoc, nullptr));
+    m_next_invalid_way.resize(m_cache_num_sets, 0);
     replacement_data.resize(m_cache_num_sets,
                                std::vector<ReplData>(m_cache_assoc, nullptr));
+
+    // Size the DDIO way-histogram stats now that the associativity is known
+    cacheMemoryStats.rxPayloadHitWays.init(m_cache_assoc).flags(
+        statistics::nozero | statistics::total);
+    cacheMemoryStats.rxPayloadAllocWays.init(m_cache_assoc).flags(
+        statistics::nozero | statistics::total);
     // instantiate all the replacement_data here
     for (int i = 0; i < m_cache_num_sets; i++) {
         for ( int j = 0; j < m_cache_assoc; j++) {
@@ -150,10 +168,14 @@ CacheMemory::findTagInSet(int64_t cacheSet, Addr tag) const
     assert(tag == makeLineAddress(tag));
     // search the set for the tags
     auto it = m_tag_index.find(tag);
-    if (it != m_tag_index.end())
-        if (m_cache[cacheSet][it->second]->m_Permission !=
+    if (it != m_tag_index.end() && it->second >= 0 &&
+        it->second < m_cache_assoc) {
+        AbstractCacheEntry* entry = m_cache[cacheSet][it->second];
+        if (entry && entry->m_Address == tag &&
+            entry->m_Permission !=
             AccessPermission_NotPresent)
             return it->second;
+    }
     return -1; // Not found
 }
 
@@ -288,6 +310,165 @@ CacheMemory::cacheAvail(Addr address) const
     return false;
 }
 
+bool
+CacheMemory::cacheAvailInWays(Addr address, int ways) const
+{
+    assert(address == makeLineAddress(address));
+    fatal_if(ways < 1 || ways > m_cache_assoc,
+             "Invalid DDIO way subset [0, %d) for %d-way cache",
+             ways, m_cache_assoc);
+
+    // A present tag match in *any* way is available (NIC writes may hit in
+    // any way, like real DDIO). A NotPresent placeholder outside the subset
+    // is not capacity in the subset; allocateInWays will reclaim it safely.
+    int64_t cacheSet = addressToCacheSet(address);
+    int matching_way = -1;
+    for (int i = 0; i < m_cache_assoc; i++) {
+        AbstractCacheEntry* entry = m_cache[cacheSet][i];
+        if (entry != NULL && entry->m_Address == address) {
+            fatal_if(matching_way >= 0,
+                     "Duplicate cache entries for address %#x in ways %d "
+                     "and %d", address, matching_way, i);
+            matching_way = i;
+        }
+    }
+    if (matching_way >= 0) {
+        AbstractCacheEntry* entry = m_cache[cacheSet][matching_way];
+        if (entry->m_Permission != AccessPermission_NotPresent) {
+            return true;
+        }
+        if (matching_way < ways)
+            return true;
+    }
+    for (int i = 0; i < ways; i++) {
+        AbstractCacheEntry* entry = m_cache[cacheSet][i];
+        if (entry == NULL ||
+            entry->m_Permission == AccessPermission_NotPresent) {
+            return true;
+        }
+    }
+    return false;
+}
+
+AbstractCacheEntry*
+CacheMemory::allocateInWays(Addr address, AbstractCacheEntry *entry,
+                            int ways)
+{
+    assert(address == makeLineAddress(address));
+    assert(!isTagPresent(address));
+    fatal_if(ways < 1 || ways > m_cache_assoc,
+             "Invalid DDIO way subset [0, %d) for %d-way cache",
+             ways, m_cache_assoc);
+    DPRINTF(RubyCache, "allocating address (DDIO ways [0,%d)): %#x\n",
+            ways, address);
+
+    entry->initBlockSize(m_block_size);
+    entry->setRubySystem(m_ruby_system);
+
+    int64_t cacheSet = addressToCacheSet(address);
+    std::vector<AbstractCacheEntry*> &set = m_cache[cacheSet];
+
+    // NotPresent is not a protocol-visible line. Reclaim a stale
+    // same-address placeholder even when it was left in an unrestricted way,
+    // then allocate the line in the configured subset.
+    int way = -1;
+    for (int i = 0; i < m_cache_assoc; i++) {
+        if (set[i] && set[i]->m_Address == address) {
+            fatal_if(way >= 0,
+                     "Duplicate cache entries for address %#x in ways %d "
+                     "and %d", address, way, i);
+            fatal_if(set[i]->m_Permission != AccessPermission_NotPresent,
+                     "Cannot allocate already-present address %#x in DDIO "
+                     "ways [0, %d)", address, ways);
+            fatal_if(i >= ways,
+                     "NotPresent placeholder for address %#x is in way %d "
+                     "outside DDIO subset [0, %d)", address, i, ways);
+            way = i;
+        }
+    }
+
+    // Otherwise find a free slot within the DDIO way subset, again using
+    // the replacement policy among the free slots rather than way order.
+    if (way < 0) {
+        std::vector<ReplaceableEntry*> free_candidates;
+        std::vector<std::unique_ptr<ReplaceableEntry>> tmp_entries;
+        for (int i = 0; i < ways; i++) {
+            if (!set[i]) {
+                auto te = std::make_unique<ReplaceableEntry>();
+                te->setPosition(cacheSet, i);
+                te->replacementData = replacement_data[cacheSet][i];
+                free_candidates.push_back(te.get());
+                tmp_entries.push_back(std::move(te));
+            } else if (set[i]->m_Permission == AccessPermission_NotPresent) {
+                free_candidates.push_back(
+                    static_cast<ReplaceableEntry*>(set[i]));
+            }
+        }
+        if (!free_candidates.empty()) {
+            // Invalid LRU entries commonly all have tick zero. Select such
+            // ties round-robin rather than relying on candidate order.
+            for (int offset = 0; offset < ways; ++offset) {
+                const int candidate =
+                    (m_next_invalid_way[cacheSet] + offset) % ways;
+                if (!set[candidate] || set[candidate]->m_Permission ==
+                        AccessPermission_NotPresent) {
+                    way = candidate;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (way >= 0) {
+        int i = way;
+        if (set[i] && set[i]->m_Address != address) {
+            auto old = m_tag_index.find(set[i]->m_Address);
+            if (old != m_tag_index.end() && old->second == i) {
+                m_tag_index.erase(old);
+            }
+        }
+        set[i] = entry;  // Init entry
+        set[i]->m_Address = address;
+        set[i]->m_Permission = AccessPermission_Invalid;
+        set[i]->m_locked = -1;
+        m_tag_index[address] = i;
+        set[i]->setPosition(cacheSet, i);
+        set[i]->replacementData = replacement_data[cacheSet][i];
+        set[i]->setLastAccess(curTick());
+
+        // Call reset function here to set initial value for different
+        // replacement policies.
+        m_replacementPolicy_ptr->reset(entry->replacementData);
+        m_next_invalid_way[cacheSet] = (i + 1) % ways;
+
+        return entry;
+    }
+    panic("allocateInWays didn't find an available entry in ways [0,%d)",
+          ways);
+}
+
+Addr
+CacheMemory::cacheProbeInWays(Addr address, int ways) const
+{
+    assert(address == makeLineAddress(address));
+    assert(!cacheAvailInWays(address, ways));
+    fatal_if(ways < 1 || ways > m_cache_assoc,
+             "Invalid DDIO way subset [0, %d) for %d-way cache",
+             ways, m_cache_assoc);
+
+    // Choose a victim only among the DDIO way subset.  The replacement
+    // policy must be subset-safe (e.g. LRU); tree/associativity-indexed
+    // policies are not.
+    int64_t cacheSet = addressToCacheSet(address);
+    std::vector<ReplaceableEntry*> candidates;
+    for (int i = 0; i < ways; i++) {
+        candidates.push_back(static_cast<ReplaceableEntry*>(
+                                                       m_cache[cacheSet][i]));
+    }
+    return m_cache[cacheSet][m_replacementPolicy_ptr->
+                        getVictim(candidates)->getWay()]->m_Address;
+}
+
 AbstractCacheEntry*
 CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
 {
@@ -299,11 +480,61 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
     entry->initBlockSize(m_block_size);
     entry->setRubySystem(m_ruby_system);
 
-    // Find the first open slot
+    // Find a free slot.  Pick the replacement policy's victim among the
+    // free slots (LRU naturally prefers the one invalidated longest ago,
+    // since invalidate() zeroes the touch tick) instead of the first
+    // slot in way order: with a first-free-way policy, low-numbered ways
+    // are consumed preferentially by all fill sources, which biases any
+    // way-partitioned region (e.g. DDIO ways).
     int64_t cacheSet = addressToCacheSet(address);
     std::vector<AbstractCacheEntry*> &set = m_cache[cacheSet];
+    int free_way = -1;
+    // Only policies that are safe on candidate subsets (e.g. LRU; tree-
+    // based policies index by full associativity) can pick among free
+    // slots.  Otherwise fall back to first-free-way.
+    const bool subset_safe =
+        dynamic_cast<replacement_policy::LRU*>(m_replacementPolicy_ptr);
+    if (subset_safe) {
+        std::vector<ReplaceableEntry*> free_candidates;
+        // Temporary entry views for NULL (deallocated) slots; their
+        // replacement data persists across deallocation.
+        std::vector<std::unique_ptr<ReplaceableEntry>> tmp_entries;
+        for (int i = 0; i < m_cache_assoc; i++) {
+            if (!set[i]) {
+                auto te = std::make_unique<ReplaceableEntry>();
+                te->setPosition(cacheSet, i);
+                te->replacementData = replacement_data[cacheSet][i];
+                free_candidates.push_back(te.get());
+                tmp_entries.push_back(std::move(te));
+            } else if (set[i]->m_Permission == AccessPermission_NotPresent) {
+                free_candidates.push_back(
+                    static_cast<ReplaceableEntry*>(set[i]));
+            }
+        }
+        if (!free_candidates.empty() && m_ddio_way_part > 0) {
+            for (int offset = 0; offset < m_cache_assoc; ++offset) {
+                const int candidate =
+                    (m_next_invalid_way[cacheSet] + offset) % m_cache_assoc;
+                if (!set[candidate] || set[candidate]->m_Permission ==
+                        AccessPermission_NotPresent) {
+                    free_way = candidate;
+                    break;
+                }
+            }
+        } else if (!free_candidates.empty()) {
+            free_way = m_replacementPolicy_ptr->
+                getVictim(free_candidates)->getWay();
+        }
+    }
     for (int i = 0; i < m_cache_assoc; i++) {
+        if (subset_safe && i != free_way) continue;
         if (!set[i] || set[i]->m_Permission == AccessPermission_NotPresent) {
+            if (set[i] && set[i]->m_Address != address) {
+                auto old = m_tag_index.find(set[i]->m_Address);
+                if (old != m_tag_index.end() && old->second == i) {
+                    m_tag_index.erase(old);
+                }
+            }
             if (set[i] && (set[i] != entry)) {
                 warn_once("This protocol contains a cache entry handling bug: "
                     "Entries in the cache should never be NotPresent! If\n"
@@ -325,6 +556,10 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
             // Call reset function here to set initial value for different
             // replacement policies.
             m_replacementPolicy_ptr->reset(entry->replacementData);
+            if (m_ddio_way_part > 0) {
+                m_next_invalid_way[cacheSet] =
+                    (i + 1) % m_cache_assoc;
+            }
 
             return entry;
         }
@@ -572,8 +807,34 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(m_prefetch_misses, "Number of cache prefetch misses"),
       ADD_STAT(m_prefetch_accesses, "Number of cache prefetch accesses",
                m_prefetch_hits + m_prefetch_misses),
-      ADD_STAT(m_accessModeType, "")
+      ADD_STAT(m_accessModeType, ""),
+      ADD_STAT(rxPayloadRequests,
+               "Number of NIC RX data DMA write line transactions"),
+      ADD_STAT(rxPayloadHits,
+               "Number of NIC RX data DMA writes hitting a present line"),
+      ADD_STAT(rxPayloadMisses,
+               "Number of NIC RX data DMA writes missing at acceptance"),
+      ADD_STAT(rxPayloadHitRate, "NIC RX data DMA write hit rate",
+               rxPayloadHits / (rxPayloadHits + rxPayloadMisses)),
+      ADD_STAT(rxPayloadHitWays, "Way histogram of RX data hits"),
+      ADD_STAT(rxPayloadAllocWays, "Way histogram of RX payload allocations"),
+      ADD_STAT(ddioAllocWays, "Way histogram of all NIC DDIO allocations"),
+      ADD_STAT(rxHeaderRequests, "Number of NIC RX header DMA write line transactions"),
+      ADD_STAT(rxHeaderHits, "Number of NIC RX header DMA writes hitting a present line"),
+      ADD_STAT(rxHeaderMisses, "Number of NIC RX header DMA writes missing at acceptance"),
+      ADD_STAT(rxHeaderHitRate, "NIC RX header DMA write hit rate",
+               rxHeaderHits / (rxHeaderHits + rxHeaderMisses)),
+      ADD_STAT(txPayloadRequests,
+               "Number of NIC TX payload DMA read line transactions"),
+      ADD_STAT(txPayloadHits,
+               "Number of NIC TX payload DMA reads hitting a present line"),
+      ADD_STAT(txPayloadMisses,
+               "Number of NIC TX payload DMA reads missing"),
+      ADD_STAT(txPayloadHitRate, "NIC TX payload DMA read hit rate",
+               txPayloadHits / (txPayloadHits + txPayloadMisses))
 {
+    rxPayloadHitRate.flags(statistics::nonan);
+    txPayloadHitRate.flags(statistics::nonan);
     numDataArrayReads
         .flags(statistics::nozero);
 
@@ -637,6 +898,19 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
             .flags(statistics::nozero)
             ;
     }
+
+    // NOTE: the way-histogram vectors are sized in CacheMemory::init(),
+    // since m_cache_assoc is not yet set when this constructor runs.
+    rxPayloadRequests.flags(statistics::nozero);
+    rxPayloadHits.flags(statistics::nozero);
+    rxPayloadMisses.flags(statistics::nozero);
+    rxHeaderHitRate.flags(statistics::nonan);
+    rxHeaderRequests.flags(statistics::nozero);
+    rxHeaderHits.flags(statistics::nozero);
+    rxHeaderMisses.flags(statistics::nozero);
+    txPayloadRequests.flags(statistics::nozero);
+    txPayloadHits.flags(statistics::nozero);
+    txPayloadMisses.flags(statistics::nozero);
 }
 
 // assumption: SLICC generated files will only call this function
@@ -805,6 +1079,43 @@ void
 CacheMemory::profileDemandMiss()
 {
     cacheMemoryStats.m_demand_misses++;
+}
+
+void
+CacheMemory::profileRxPayload(Addr address)
+{
+    cacheMemoryStats.rxPayloadRequests++;
+    int64_t cacheSet = addressToCacheSet(address);
+    int loc = findTagInSet(cacheSet, address);
+    if (loc >= 0) {
+        cacheMemoryStats.rxPayloadHits++;
+        cacheMemoryStats.rxPayloadHitWays[loc]++;
+    } else {
+        cacheMemoryStats.rxPayloadMisses++;
+    }
+}
+
+void
+CacheMemory::profileRxHeader(Addr address)
+{
+    cacheMemoryStats.rxHeaderRequests++;
+    const int64_t cacheSet = addressToCacheSet(address);
+    if (findTagInSet(cacheSet, address) >= 0) {
+        cacheMemoryStats.rxHeaderHits++;
+    } else {
+        cacheMemoryStats.rxHeaderMisses++;
+    }
+}
+
+void
+CacheMemory::profileTxPayload(Addr address)
+{
+    cacheMemoryStats.txPayloadRequests++;
+    if (isTagPresent(address)) {
+        cacheMemoryStats.txPayloadHits++;
+    } else {
+        cacheMemoryStats.txPayloadMisses++;
+    }
 }
 
 void

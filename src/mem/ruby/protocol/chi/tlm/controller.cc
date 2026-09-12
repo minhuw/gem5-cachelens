@@ -49,8 +49,39 @@ namespace tlm::chi {
 
 using namespace ruby::CHI;
 
+namespace
+{
+
+Request::FlagsType
+nicDmaCategory(const CacheController::Params &p)
+{
+    const std::string category = p.test_nic_dma_category;
+    if (category.empty()) {
+        return p.test_nic_rx_payload_write ?
+            Request::NIC_RX_PAYLOAD_WRITE : Request::FlagsType{0};
+    }
+    if (category == "rx_payload")
+        return Request::NIC_RX_PAYLOAD_WRITE;
+    if (category == "rx_header")
+        return Request::NIC_RX_HEADER_WRITE;
+    if (category == "rx_desc_read")
+        return Request::NIC_RX_DESC_READ;
+    if (category == "rx_desc_writeback")
+        return Request::NIC_RX_DESC_WRITEBACK;
+    if (category == "tx_payload_read")
+        return Request::NIC_TX_PAYLOAD_READ;
+    if (category == "tx_desc_read")
+        return Request::NIC_TX_DESC_READ;
+    if (category == "tx_desc_writeback")
+        return Request::NIC_TX_DESC_WRITEBACK;
+    fatal("Unknown synthetic NIC DMA category '%s'", category);
+}
+
+} // anonymous namespace
+
 CacheController::CacheController(const Params &p)
-  : CHIGenericController(p)
+  : CHIGenericController(p),
+    testNicDmaCategory(nicDmaCategory(p))
 {
 }
 
@@ -167,7 +198,7 @@ CacheController::ReadTransaction::handle(const CHIDataMsg *msg)
     }
 
     if (dataMsgCnt == controller->dataMsgsPerLine) {
-        if (phase.exp_comp_ack == false) {
+        if (!phase.exp_comp_ack) {
             // The client is not sending a CompAck but ruby is
             // expecting it so we send it anyway
             controller->sendCompAck(*payload, phase);
@@ -274,6 +305,8 @@ CacheController::reqAddr(ARM::CHI::Payload &payload,
 {
     switch (phase.req_opcode) {
       case ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_PTL:
+      case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL:
+        assert(payload.byte_enable != 0);
         return ruby::makeLineAddress(payload.address, cacheLineBits) +
             ctz64(payload.byte_enable);
       default:
@@ -287,8 +320,18 @@ CacheController::reqSize(ARM::CHI::Payload &payload,
 {
     switch (phase.req_opcode) {
       case ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_PTL:
-        assert(transactionSize(payload.size) >= popCount(payload.byte_enable));
-        return popCount(payload.byte_enable);
+      case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL: {
+        assert(payload.byte_enable != 0);
+        const unsigned first = ctz64(payload.byte_enable);
+        unsigned last = first;
+        for (unsigned bit = first + 1; bit < cacheLineSize; ++bit) {
+            if (bits(payload.byte_enable, bit))
+                last = bit;
+        }
+        const Addr extent = last - first + 1;
+        assert(transactionSize(payload.size) >= extent);
+        return extent;
+      }
       default:
         return transactionSize(payload.size);
     }
@@ -304,11 +347,26 @@ CacheController::sendRequestMsg(ARM::CHI::Payload &payload,
     req_msg->m_addr = ruby::makeLineAddress(payload.address, cacheLineBits);
     req_msg->m_accAddr = reqAddr(payload, phase);
     req_msg->m_accSize = reqSize(payload, phase);
+    if (phase.req_opcode == ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_PTL ||
+        phase.req_opcode == ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL) {
+        std::vector<bool> byte_enabled(cacheLineSize, false);
+        for (unsigned bit = 0; bit < cacheLineSize; ++bit)
+            byte_enabled[bit] = bits(payload.byte_enable, bit);
+        req_msg->m_accessMask =
+            ruby::WriteMask(byte_enabled.size(), byte_enabled);
+    }
     req_msg->m_requestor = getMachineID();
     req_msg->m_fwdRequestor = getMachineID();
     req_msg->m_dataToFwdRequestor = false;
     req_msg->m_type = tlm_to_ruby::reqOpcode(phase.req_opcode);
-    req_msg->m_isSeqReqValid = false;
+    if (testNicDmaCategory) {
+        req_msg->m_seqReq = std::make_shared<Request>(
+            req_msg->m_accAddr, req_msg->m_accSize,
+            testNicDmaCategory, Request::invldRequestorId);
+        req_msg->m_isSeqReqValid = true;
+    } else {
+        req_msg->m_isSeqReqValid = false;
+    }
     req_msg->m_is_local_pf = false;
     req_msg->m_is_remote_pf = false;
     req_msg->m_allowRetry = phase.allow_retry;
@@ -399,6 +457,7 @@ CacheController::Transaction::gen(CacheController *controller,
       case ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_PTL:
       case ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_FULL:
       case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_ZERO:
+      case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL:
       case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_FULL:
       case ARM::CHI::REQ_OPCODE_WRITE_BACK_FULL:
       // This is a write transaction for now. Will

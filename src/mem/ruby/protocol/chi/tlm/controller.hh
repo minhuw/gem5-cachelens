@@ -46,6 +46,7 @@
 #include "mem/ruby/protocol/CHI/CHIResponseType.hh"
 #include "mem/ruby/protocol/RequestStatus.hh"
 #include "mem/ruby/protocol/WriteMask.hh"
+#include "mem/request.hh"
 #include "params/TlmController.hh"
 
 namespace gem5 {
@@ -115,6 +116,8 @@ class CacheController : public ruby::CHIGenericController
     Addr reqSize(ARM::CHI::Payload &payload, ARM::CHI::Phase &phase) const;
 
     void pCreditGrant(const CHIResponseMsg *msg);
+
+    const Request::FlagsType testNicDmaCategory;
 
     struct Transaction
     {
