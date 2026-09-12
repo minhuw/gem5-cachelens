@@ -259,7 +259,30 @@ class Request : public Extensible<Request>
         /** TLBI_EXT_SYNC_COMP seems to be the largest value
             of FlagsType, so HAS_NO_ADDR's value is that << 1 */
         HAS_NO_ADDR                = 0x0001000000000000,
+
+        /**
+         * NIC DMA categories for the RX-ring DDIO cache experiment.
+         * Set by the NIC device model so the memory subsystem can
+         * distinguish payload DMA from descriptor DMA.
+         */
+        NIC_RX_DESC_READ            = 0x0100000000000000,
+        NIC_RX_PAYLOAD_WRITE        = 0x0200000000000000,
+        NIC_RX_DESC_WRITEBACK       = 0x0400000000000000,
+        NIC_TX_DESC_READ            = 0x0800000000000000,
+        NIC_TX_PAYLOAD_READ         = 0x1000000000000000,
+        NIC_TX_DESC_WRITEBACK       = 0x2000000000000000,
+        NIC_RX_HEADER_WRITE         = 0x4000000000000000,
     };
+    static const FlagsType NIC_DMA_CATEGORY_MASK =
+        NIC_RX_DESC_READ | NIC_RX_PAYLOAD_WRITE |
+        NIC_RX_DESC_WRITEBACK | NIC_TX_DESC_READ |
+        NIC_TX_PAYLOAD_READ | NIC_TX_DESC_WRITEBACK |
+        NIC_RX_HEADER_WRITE;
+    static const FlagsType NIC_DMA_READ_CATEGORY_MASK =
+        NIC_RX_DESC_READ | NIC_TX_DESC_READ | NIC_TX_PAYLOAD_READ;
+    static const FlagsType NIC_DMA_WRITE_CATEGORY_MASK =
+        NIC_RX_PAYLOAD_WRITE | NIC_RX_DESC_WRITEBACK |
+        NIC_TX_DESC_WRITEBACK | NIC_RX_HEADER_WRITE;
     static const FlagsType STORE_NO_DATA = CACHE_BLOCK_ZERO |
         CLEAN | INVALIDATE;
 
@@ -1038,6 +1061,59 @@ class Request : public Extensible<Request>
         return _flags.isSet(LOCKED_RMW | READ_MODIFY_WRITE);
     }
     bool isSecure() const { return _flags.isSet(SECURE); }
+    bool isNicRxDescRead() const { return _flags.isSet(NIC_RX_DESC_READ); }
+    bool isNicRxPayloadWrite() const {
+        return _flags.isSet(NIC_RX_PAYLOAD_WRITE);
+    }
+    bool isNicRxDescWriteback() const {
+        return _flags.isSet(NIC_RX_DESC_WRITEBACK);
+    }
+    bool isNicTxDescRead() const { return _flags.isSet(NIC_TX_DESC_READ); }
+    bool isNicTxPayloadRead() const {
+        return _flags.isSet(NIC_TX_PAYLOAD_READ);
+    }
+    bool isNicTxDescWriteback() const {
+        return _flags.isSet(NIC_TX_DESC_WRITEBACK);
+    }
+    bool isNicRxHeaderWrite() const {
+        return _flags.isSet(NIC_RX_HEADER_WRITE);
+    }
+    bool isNicDescDma() const {
+        return _flags.isSet(NIC_RX_DESC_READ | NIC_RX_DESC_WRITEBACK |
+                            NIC_TX_DESC_READ | NIC_TX_DESC_WRITEBACK);
+    }
+    bool isNicPayloadDma() const {
+        return _flags.isSet(NIC_RX_PAYLOAD_WRITE | NIC_TX_PAYLOAD_READ |
+                            NIC_RX_HEADER_WRITE);
+    }
+    /** True for any NIC-originated write, including descriptor writebacks. */
+    bool isNicDmaWrite() const {
+        return _flags.isSet(NIC_DMA_WRITE_CATEGORY_MASK);
+    }
+    /** True for any NIC-originated read. */
+    bool isNicDmaRead() const {
+        return _flags.isSet(NIC_DMA_READ_CATEGORY_MASK);
+    }
+    static bool
+    hasOneNicDmaCategory(Flags flags)
+    {
+        const FlagsType category = flags & NIC_DMA_CATEGORY_MASK;
+        return category && !(category & (category - 1));
+    }
+    static bool
+    isValidNicDmaReadFlags(Flags flags)
+    {
+        const FlagsType category = flags & NIC_DMA_CATEGORY_MASK;
+        return hasOneNicDmaCategory(flags) &&
+            (category & NIC_DMA_READ_CATEGORY_MASK);
+    }
+    static bool
+    isValidNicDmaWriteFlags(Flags flags)
+    {
+        const FlagsType category = flags & NIC_DMA_CATEGORY_MASK;
+        return hasOneNicDmaCategory(flags) &&
+            (category & NIC_DMA_WRITE_CATEGORY_MASK);
+    }
     bool isPTWalk() const { return _flags.isSet(PT_WALK); }
     bool isRelease() const { return _flags.isSet(RELEASE); }
     bool isKernel() const { return _flags.isSet(KERNEL); }

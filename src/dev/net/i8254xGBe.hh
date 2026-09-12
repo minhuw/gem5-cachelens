@@ -48,6 +48,7 @@
 #include "dev/net/i8254xGBe_defs.hh"
 #include "dev/net/pktfifo.hh"
 #include "dev/pci/device.hh"
+#include "mem/request.hh"
 #include "params/IGbE.hh"
 #include "sim/eventq.hh"
 #include "sim/serialize.hh"
@@ -92,6 +93,48 @@ class IGbE : public EtherDevice
     Tick fetchDelay, wbDelay;
     Tick fetchCompDelay, wbCompDelay;
     Tick rxWriteDelay, txReadDelay;
+
+    void
+    dmaWriteCategorized(Addr addr, int size, Event *event, uint8_t *data,
+                        Tick delay, Request::Flags category)
+    {
+        assert(Request::isValidNicDmaWriteFlags(category));
+        dmaPort.dmaAction(MemCmd::WriteReq, addr, size, event, data, delay,
+                          category);
+    }
+
+    void
+    dmaReadCategorized(Addr addr, int size, Event *event, uint8_t *data,
+                       Tick delay, Request::Flags category)
+    {
+        assert(Request::isValidNicDmaReadFlags(category));
+        dmaPort.dmaAction(MemCmd::ReadReq, addr, size, event, data, delay,
+                          category);
+    }
+
+    void
+    rxPayloadWrite(Addr addr, int size, Event *event, uint8_t *data,
+                   Tick delay=0)
+    {
+        dmaWriteCategorized(addr, size, event, data, delay,
+                            Request::NIC_RX_PAYLOAD_WRITE);
+    }
+
+    void
+    rxHeaderWrite(Addr addr, int size, Event *event, uint8_t *data,
+                  Tick delay=0)
+    {
+        dmaWriteCategorized(addr, size, event, data, delay,
+                            Request::NIC_RX_HEADER_WRITE);
+    }
+
+    void
+    txPayloadRead(Addr addr, int size, Event *event, uint8_t *data,
+                  Tick delay=0)
+    {
+        dmaReadCategorized(addr, size, event, data, delay,
+                           Request::NIC_TX_PAYLOAD_READ);
+    }
 
     // Event and function to deal with RDTR timer expiring
     void rdtrProcess() {
@@ -189,6 +232,10 @@ class IGbE : public EtherDevice
         virtual void enableSm() = 0;
         virtual void actionAfterWb() {}
         virtual void fetchAfterWb() = 0;
+
+        /** NIC DMA categories for descriptor fetches and writebacks. */
+        virtual Request::Flags descFetchCategory() const { return 0; }
+        virtual Request::Flags descWritebackCategory() const { return 0; }
 
         typedef std::deque<T *> CacheType;
         CacheType usedCache;
@@ -328,6 +375,15 @@ class IGbE : public EtherDevice
       public:
         RxDescCache(IGbE *i, std::string n, int s);
 
+        Request::Flags descFetchCategory() const override
+        {
+            return Request::NIC_RX_DESC_READ;
+        }
+        Request::Flags descWritebackCategory() const override
+        {
+            return Request::NIC_RX_DESC_WRITEBACK;
+        }
+
         /** Write the given packet into the buffer(s) pointed to by the
          * descriptor and update the book keeping. Should only be called when
          * there are no dma's pending.
@@ -370,6 +426,14 @@ class IGbE : public EtherDevice
         long descHead() const override { return igbe->regs.tdh(); }
         long descTail() const override { return igbe->regs.tdt(); }
         long descLen() const override { return igbe->regs.tdlen() >> 4; }
+        Request::Flags descFetchCategory() const override
+        {
+            return Request::NIC_TX_DESC_READ;
+        }
+        Request::Flags descWritebackCategory() const override
+        {
+            return Request::NIC_TX_DESC_WRITEBACK;
+        }
         void updateHead(long h) override { igbe->regs.tdh(h); }
         void enableSm() override;
         void actionAfterWb() override;
