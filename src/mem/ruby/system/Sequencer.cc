@@ -939,6 +939,10 @@ Sequencer::empty() const
 RequestStatus
 Sequencer::makeRequest(PacketPtr pkt)
 {
+    // This path issues contiguous writes; byte enables are not propagated.
+    fatal_if(pkt->isMaskedWrite(),
+             "RubySequencer does not support masked writes");
+
     // HTM abort signals must be allowed to reach the Sequencer
     // the same cycle they are issued. They cannot be retried.
     if ((m_outstanding_count >= m_max_outstanding_requests) &&

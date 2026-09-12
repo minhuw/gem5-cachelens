@@ -25,6 +25,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
+import math
+
 from m5.objects import (
     DMASequencer,
     RubyPortProxy,
@@ -72,6 +74,8 @@ class MESIThreeLevelCacheHierarchy(
         l3_size: str,
         l3_assoc: str,
         num_l3_banks: int,
+        ddio_way_part: int = -1,
+        l3_addr_hash: bool = False,
     ):
         AbstractRubyCacheHierarchy.__init__(self=self)
         AbstractThreeLevelCacheHierarchy.__init__(
@@ -86,7 +90,19 @@ class MESIThreeLevelCacheHierarchy(
             l3_assoc=l3_assoc,
         )
 
+        if num_l3_banks <= 0 or num_l3_banks & (num_l3_banks - 1):
+            raise ValueError("num_l3_banks must be a positive power of two.")
+        if ddio_way_part != -1 and not 1 <= ddio_way_part <= int(l3_assoc):
+            raise ValueError(
+                "ddio_way_part must be -1 or between 1 and l3_assoc."
+            )
+        if not isinstance(l3_addr_hash, bool):
+            raise TypeError("l3_addr_hash must be a bool.")
+
         self._num_l3_banks = num_l3_banks
+        self._ddio_way_part = ddio_way_part
+        self._l3_addr_hash = l3_addr_hash
+        self._l3_select_num_bits = int(math.log2(num_l3_banks))
 
     @overrides(AbstractCacheHierarchy)
     def get_coherence_protocol(self):
@@ -96,13 +112,15 @@ class MESIThreeLevelCacheHierarchy(
         super().incorporate_cache(board)
         cache_line_size = board.get_cache_line_size()
 
-        self.ruby_system = RubySystem()
+        self.ruby_system = self._create_ruby_system()
 
         # MESI_Three_Level needs 3 virtual networks
         self.ruby_system.number_of_virtual_networks = 3
 
-        self.ruby_system.network = SimplePt2Pt(self.ruby_system)
+        self.ruby_system.network = self._create_network()
         self.ruby_system.network.number_of_virtual_networks = 3
+
+        core_clock_domain = self._get_core_clock_domain(board)
 
         self._l1_controllers = []
         self._l2_controllers = []
@@ -118,7 +136,7 @@ class MESIThreeLevelCacheHierarchy(
                 core=core,
                 cache_line_size=cache_line_size,
                 target_isa=board.processor.get_isa(),
-                clk_domain=board.get_clock_domain(),
+                clk_domain=core_clock_domain,
             )
 
             l1_cache.sequencer = RubySequencer(
@@ -162,7 +180,7 @@ class MESIThreeLevelCacheHierarchy(
                 cache_line_size=cache_line_size,
                 cluster_id=0,
                 target_isa=board.processor.get_isa(),
-                clk_domain=board.get_clock_domain(),
+                clk_domain=core_clock_domain,
             )
 
             l2_cache.ruby_system = self.ruby_system
@@ -180,6 +198,8 @@ class MESIThreeLevelCacheHierarchy(
                 network=self.ruby_system.network,
                 num_l3Caches=self._num_l3_banks,
                 cache_line_size=cache_line_size,
+                ddio_way_part=self._ddio_way_part,
+                addr_hash=self._l3_addr_hash,
                 cluster_id=0,  # cluster_id is ignored in point-to-point topology
             )
             l3_cache.ruby_system = self.ruby_system
@@ -207,9 +227,11 @@ class MESIThreeLevelCacheHierarchy(
                     DMASequencer(
                         version=i,
                         in_ports=port,
+                        supports_masked_writes=True,
                         ruby_system=self.ruby_system,
                     ),
                     self.ruby_system,
+                    l2_select_num_bits=self._l3_select_num_bits,
                 )
                 self._dma_controllers.append(ctrl)
 
@@ -240,6 +262,16 @@ class MESIThreeLevelCacheHierarchy(
             ruby_system=self.ruby_system
         )
         board.connect_system_port(self.ruby_system.sys_port_proxy.in_ports)
+
+    def _create_ruby_system(self) -> RubySystem:
+        """Create Ruby with stock checkpoint cache-trace replay semantics."""
+        return RubySystem()
+
+    def _create_network(self) -> SimplePt2Pt:
+        return SimplePt2Pt(self.ruby_system)
+
+    def _get_core_clock_domain(self, board: AbstractBoard):
+        return board.get_clock_domain()
 
     @overrides(AbstractRubyCacheHierarchy)
     def _reset_version_numbers(self):

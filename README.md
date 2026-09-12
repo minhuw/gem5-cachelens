@@ -10,6 +10,12 @@ system software changes, and compile-time and run-time system optimizations.
 
 The main website can be found at <http://www.gem5.org>.
 
+## CacheLens profiles
+
+See [CacheLens architecture profiles](CACHELENS_PROFILES.md) for the x86
+three-level MESI and ARM CHI configurations, build commands, I/O allocation
+policies, and validation boundaries.
+
 ## Testing status
 
 **Note**: These regard tests run on the develop branch of gem5:

@@ -27,9 +27,11 @@
 import math
 
 from m5.objects import (
+    LRURP,
     MESI_Three_Level_L2Cache_Controller,
     MessageBuffer,
     RubyCache,
+    TreePLRURP,
 )
 
 
@@ -51,14 +53,28 @@ class L3Cache(MESI_Three_Level_L2Cache_Controller):
         num_l3Caches,
         cache_line_size,
         cluster_id,
+        ddio_way_part=-1,
+        addr_hash=False,
     ):
         super().__init__()
+
+        if num_l3Caches <= 0 or num_l3Caches & (num_l3Caches - 1):
+            raise ValueError("num_l3Caches must be a positive power of two.")
+        if ddio_way_part != -1 and not 1 <= ddio_way_part <= int(l3_assoc):
+            raise ValueError(
+                "ddio_way_part must be -1 or between 1 and l3_assoc."
+            )
 
         # This is the cache memory object that stores the cache data and tags
         self.L2cache = RubyCache(
             size=l3_size,
             assoc=l3_assoc,
             start_index_bit=self.getIndexBit(num_l3Caches, cache_line_size),
+            ddio_way_part=ddio_way_part,
+            addr_hash=addr_hash,
+            replacement_policy=(
+                LRURP() if ddio_way_part > 0 else TreePLRURP()
+            ),
         )
 
         self.transitions_per_cycle = 4

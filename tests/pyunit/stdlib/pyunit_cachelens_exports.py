@@ -20,6 +20,9 @@ class CacheLensExportTestSuite(unittest.TestCase):
         supported = get_supported_protocols()
         hierarchy_protocols = {
             "CacheLensCHIHierarchy": CoherenceProtocol.CHI,
+            "CacheLensMESIThreeLevelHierarchy": (
+                CoherenceProtocol.MESI_THREE_LEVEL
+            ),
             "CacheLensMESITwoLevelHierarchy": (
                 CoherenceProtocol.MESI_TWO_LEVEL
             ),

@@ -8,6 +8,11 @@ import unittest
 from m5.objects import RubySystem
 
 from gem5.coherence_protocol import CoherenceProtocol
+from gem5.runtime import get_supported_protocols
+
+if CoherenceProtocol.MESI_TWO_LEVEL not in get_supported_protocols():
+    raise unittest.SkipTest("Requires a MESI_Two_Level build")
+
 from gem5.components.cachehierarchies.ruby.mesi_two_level_cache_hierarchy import (
     MESITwoLevelCacheHierarchy,
 )

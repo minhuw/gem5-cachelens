@@ -7,6 +7,12 @@ import unittest
 
 from m5.objects import RubySystem
 
+from gem5.coherence_protocol import CoherenceProtocol
+from gem5.runtime import get_supported_protocols
+
+if CoherenceProtocol.CHI not in get_supported_protocols():
+    raise unittest.SkipTest("Requires a CHI build")
+
 from gem5.isas import ISA
 from gem5.prebuilt import cachelens
 from gem5.prebuilt.cachelens.cache_hierarchy import CacheLensCHIHierarchy
@@ -96,6 +102,29 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
                 model_profile=profile
             ).get_configuration()
             self.assertFalse(configuration["nic_read_no_allocate"])
+
+    def test_arm_profile_contract(self) -> None:
+        for profile, ddio in (("arm-generic", None), ("abstract", 2)):
+            for inclusion in ("noninclusive", "inclusive"):
+                with self.subTest(profile=profile, inclusion=inclusion):
+                    hierarchy = CacheLensCHIHierarchy(
+                        model_profile=profile,
+                        ddio_way_part=ddio,
+                        hnf_inclusion=inclusion,
+                    )
+                    hierarchy.validate_architecture(ISA.ARM)
+                    configuration = hierarchy.get_configuration()
+                    self.assertEqual(profile, configuration["model_profile"])
+                    self.assertEqual(inclusion, configuration["hnf_inclusion"])
+                    self.assertEqual(
+                        -1 if ddio is None else ddio,
+                        configuration["ddio_way_part"],
+                    )
+                    self.assertFalse(configuration["nic_read_no_allocate"])
+                    self.assertEqual(
+                        "protocol-default" if ddio is None else "LRU",
+                        configuration["llc_replacement_policy"],
+                    )
 
     def test_hnf_partition_selects_exactly_one_node(self) -> None:
         hierarchy = CacheLensCHIHierarchy(num_hnfs=4)

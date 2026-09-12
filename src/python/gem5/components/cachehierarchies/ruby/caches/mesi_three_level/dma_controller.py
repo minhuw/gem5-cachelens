@@ -38,11 +38,12 @@ class DMAController(MESI_Three_Level_DMA_Controller):
         cls._version += 1
         return cls._version - 1
 
-    def __init__(self, dma_sequencer, ruby_system):
+    def __init__(self, dma_sequencer, ruby_system, l2_select_num_bits=0):
         super().__init__(
             version=self._get_version(),
             dma_sequencer=dma_sequencer,
             ruby_system=ruby_system,
+            l2_select_num_bits=l2_select_num_bits,
         )
         self.connectQueues(self.ruby_system.network)
 

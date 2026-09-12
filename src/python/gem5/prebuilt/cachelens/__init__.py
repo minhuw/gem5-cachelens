@@ -22,6 +22,10 @@ _HIERARCHY_MODULES = {
         CoherenceProtocol.CHI,
         ".cache_hierarchy",
     ),
+    "CacheLensMESIThreeLevelHierarchy": (
+        CoherenceProtocol.MESI_THREE_LEVEL,
+        ".mesi_three_level_cache_hierarchy",
+    ),
     "CacheLensMESITwoLevelHierarchy": (
         CoherenceProtocol.MESI_TWO_LEVEL,
         ".mesi_two_level_cache_hierarchy",
@@ -61,6 +65,12 @@ def __getattr__(name):
             from .cache_hierarchy import CacheLensCHIHierarchy
 
             component = CacheLensCHIHierarchy
+        elif module_name == ".mesi_three_level_cache_hierarchy":
+            from .mesi_three_level_cache_hierarchy import (
+                CacheLensMESIThreeLevelHierarchy,
+            )
+
+            component = CacheLensMESIThreeLevelHierarchy
         else:
             from .mesi_two_level_cache_hierarchy import (
                 CacheLensMESITwoLevelHierarchy,

@@ -308,6 +308,8 @@ PySource('gem5.prebuilt.cachelens',
 PySource('gem5.prebuilt.cachelens',
     'gem5/prebuilt/cachelens/mesi_two_level_cache_hierarchy.py')
 PySource('gem5.prebuilt.cachelens',
+    'gem5/prebuilt/cachelens/mesi_three_level_cache_hierarchy.py')
+PySource('gem5.prebuilt.cachelens',
     'gem5/prebuilt/cachelens/_model.py')
 PySource('gem5.prebuilt.cachelens',
     'gem5/prebuilt/cachelens/network.py')

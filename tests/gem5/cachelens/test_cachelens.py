@@ -20,26 +20,25 @@ resource_directory = (
 
 
 class CacheLensExactProtocolFixture(Gem5Fixture):
-    """Build a CacheLens binary from one exact X86 protocol defconfig."""
+    """Build a CacheLens binary from one exact ISA/protocol defconfig."""
 
     _protocol_defconfigs = {
-        "CHI": "X86_CHI",
-        "MESI_Two_Level": "X86_MESI_Two_Level",
+        ("X86", "CHI"): "X86_CHI",
+        ("X86", "MESI_Two_Level"): "X86_MESI_Two_Level",
+        ("ARM", "CHI"): "ARM_CHI",
     }
 
     def __new__(cls, isa, variant, protocol):
-        if isa.upper() != constants.x86_tag:
-            raise ValueError("Exact CacheLens protocol fixtures are X86-only.")
-        if protocol not in cls._protocol_defconfigs:
+        if (isa.upper(), protocol) not in cls._protocol_defconfigs:
             raise ValueError(f"Unsupported CacheLens protocol: {protocol}")
         return super().__new__(cls, isa, variant, protocol=protocol)
 
     def _init(self, isa, variant, protocol):
         self._exact_protocol = protocol
-        super()._init("x86", variant)
+        super()._init(isa, variant)
 
     def _get_defconfig(self):
-        return self._protocol_defconfigs[self._exact_protocol]
+        return self._protocol_defconfigs[(self.isa.upper(), self._exact_protocol)]
 
 
 def cachelens_board_test(
@@ -74,6 +73,94 @@ def cachelens_board_test(
         valid_isas=(constants.all_compiled_tag,),
         valid_hosts=constants.supported_hosts,
         length=constants.quick_tag,
+    )
+
+
+def cachelens_arm_chi_profile_test(profile, inclusion="noninclusive"):
+    marker = (
+        "CACHELENS_ARM_CHI_REJECT_OK"
+        if profile == "intel-ddio"
+        else "CACHELENS_ARM_CHI_GRAPH_OK"
+    )
+    gem5_verify_config(
+        name=f"cachelens-arm-chi-{profile}-{inclusion}-graph",
+        fixtures=(),
+        verifiers=(
+            verifier.MatchRegex(re.compile(f"{marker} profile={profile}")),
+        ),
+        config=joinpath(
+            absdirpath(__file__), "configs", "arm_chi_profile_probe.py"
+        ),
+        config_args=["--model-profile", profile, "--hnf-inclusion", inclusion],
+        valid_isas=(constants.arm_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+        protocol="CHI",
+        gem5_fixture_factory=CacheLensExactProtocolFixture,
+    )
+
+
+def cachelens_chi_dma_test(scenario):
+    # Protocol/data-value coverage only: no guest execution or external TLM.
+    gem5_verify_config(
+        name=f"cachelens-arm-chi-dma-{scenario}",
+        fixtures=(),
+        verifiers=(
+            verifier.MatchRegex(re.compile(
+                f"CACHELENS_CHI_DMA_OK scenario={scenario}"
+            )),
+        ),
+        config=joinpath(
+            absdirpath(__file__), "configs", "chi_dma_directed.py"
+        ),
+        config_args=["--scenario", scenario],
+        valid_isas=(constants.arm_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+        protocol="CHI",
+        gem5_fixture_factory=CacheLensExactProtocolFixture,
+    )
+
+
+def cachelens_chi_dma_mask_rejection_test(host):
+    def run_rejection(params):
+        tempdir = Path(params.fixtures[constants.tempdir_fixture_name].path)
+        gem5 = params.fixtures[constants.gem5_binary_fixture_name].path
+        probe = joinpath(
+            absdirpath(__file__), "configs", "chi_dma_directed.py"
+        )
+        for scenario in ("zero_mask", "sparse_mask"):
+            result = subprocess.run(
+                [
+                    gem5,
+                    "-d",
+                    (tempdir / scenario).as_posix(),
+                    probe,
+                    "--scenario",
+                    scenario,
+                ],
+                cwd=config.base_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=120,
+            )
+            print(result.stdout)
+            assert result.returncode != 0, f"{scenario} unexpectedly succeeded"
+            assert re.search(
+                r"fatal:.*RubySequencer does not support masked writes",
+                result.stdout,
+            ), f"{scenario} did not report the unsupported-mask diagnostic"
+
+    name = f"cachelens-arm-chi-dma-mask-rejection-{host}-opt"
+    TestSuite(
+        name=name,
+        fixtures=[
+            CacheLensExactProtocolFixture("arm", "opt", "CHI"),
+            TempdirFixture(),
+        ],
+        tags=["ARM", "opt", constants.quick_tag, host],
+        tests=[TestFunction(run_rejection, name=name)],
     )
 
 
@@ -504,6 +591,19 @@ def run_pcap_replay_tests(params):
         stderr=sys.stderr,
     )
 
+
+for scenario in ("cold_full_write", "partial_dirty_owner", "pvrdma_provenance"):
+    cachelens_chi_dma_test(scenario)
+
+
+for host in constants.supported_hosts:
+    cachelens_chi_dma_mask_rejection_test(host)
+
+
+for profile in ("arm-generic", "abstract"):
+    for inclusion in ("noninclusive", "inclusive"):
+        cachelens_arm_chi_profile_test(profile, inclusion)
+cachelens_arm_chi_profile_test("intel-ddio")
 
 for num_nics in range(4):
     cachelens_board_test(isa="arm", num_nics=num_nics)

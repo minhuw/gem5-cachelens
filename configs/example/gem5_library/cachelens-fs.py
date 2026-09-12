@@ -5,8 +5,9 @@
 
 """Run CacheLens ARM or x86 full-system experiments with the gem5 stdlib.
 
-Build CHI runs with ``build/ARM/gem5.opt`` or ``build/X86_CHI/gem5.opt`` and
-MESI runs with ``build/X86_MESI_Two_Level/gem5.opt``. The x86 8 GiB layout
+Build CHI runs with ``build/ARM_CHI/gem5.opt`` or ``build/X86_CHI/gem5.opt``.
+Build MESI runs with ``build/X86_MESI_Two_Level/gem5.opt`` or
+``build/X86_MESI_Three_Level/gem5.opt``. The x86 8 GiB layout
 contains 3 GiB below the PCI hole and 5 GiB beginning at 4 GiB; the memory
 component packs both ranges behind the original dual-channel DDR. Timing and
 O3 CacheLens restores are explicitly cold-cache restores, not cache-continuous
@@ -43,7 +44,7 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--isa", choices=("arm", "x86"), required=True)
     parser.add_argument(
         "--coherence-protocol",
-        choices=("chi", "mesi-two-level"),
+        choices=("chi", "mesi-two-level", "mesi-three-level"),
         default="chi",
         help=(
             "Timing/O3 hierarchy to build. Atomic checkpoint preparation "
@@ -166,8 +167,8 @@ def _create_parser() -> argparse.ArgumentParser:
         choices=("noninclusive", "inclusive"),
         default=None,
         help=(
-            "CHI HNF policy (default: noninclusive). MESI_Two_Level is "
-            "inclusive by protocol and only accepts an explicit inclusive."
+            "CHI HNF policy (default: noninclusive). Both MESI protocols are "
+            "inclusive by protocol and only accept an explicit inclusive."
         ),
     )
     parser.add_argument(
@@ -206,11 +207,11 @@ def _create_parser() -> argparse.ArgumentParser:
 
 
 def _selected_protocol(args) -> CoherenceProtocol:
-    return (
-        CoherenceProtocol.CHI
-        if args.coherence_protocol == "chi"
-        else CoherenceProtocol.MESI_TWO_LEVEL
-    )
+    return {
+        "chi": CoherenceProtocol.CHI,
+        "mesi-two-level": CoherenceProtocol.MESI_TWO_LEVEL,
+        "mesi-three-level": CoherenceProtocol.MESI_THREE_LEVEL,
+    }[args.coherence_protocol]
 
 
 def _require_selected_protocol(parser, args) -> None:
@@ -220,11 +221,7 @@ def _require_selected_protocol(parser, args) -> None:
         return
 
     available = ", ".join(sorted(protocol.value for protocol in supported))
-    target = (
-        "build/X86_CHI/gem5.opt"
-        if required == CoherenceProtocol.CHI
-        else "build/X86_MESI_Two_Level/gem5.opt"
-    )
+    target = f"build/{args.isa.upper()}_{required.value}/gem5.opt"
     parser.error(
         f"--coherence-protocol {args.coherence_protocol} requires the "
         f"compiled Ruby protocol {required.value}, but this binary provides "
@@ -246,10 +243,10 @@ def _validate_args(parser, args) -> None:
     elif args.bootloader is not None:
         parser.error("--bootloader is not valid for x86.")
 
-    if args.coherence_protocol == "mesi-two-level" and args.isa != "x86":
+    if args.coherence_protocol != "chi" and args.isa != "x86":
         parser.error(
-            "--coherence-protocol mesi-two-level is currently supported "
-            "only for x86 CacheLens runs."
+            f"--coherence-protocol {args.coherence_protocol} is currently "
+            "supported only for x86 CacheLens runs."
         )
     if args.model_profile == "intel-ddio" and args.isa == "arm":
         parser.error("--model-profile intel-ddio is only valid for x86.")
@@ -291,17 +288,18 @@ def _validate_args(parser, args) -> None:
             parser.error("--addr-hash conflicts with --indexing-policy.")
         args.indexing_policy = compatibility_policy
 
-    if args.coherence_protocol == "mesi-two-level":
+    if args.coherence_protocol != "chi":
         if args.hnf_inclusion not in (None, "inclusive"):
             parser.error(
-                "MESI_Two_Level is inclusive by protocol; "
+                f"{_selected_protocol(args).value} is inclusive by protocol; "
                 "--hnf-inclusion noninclusive is invalid."
             )
         if args.dealloc_on_unique:
             parser.error(
                 "--dealloc-on-unique is CHI-only and cannot be enabled for "
-                "MESI_Two_Level."
+                f"{_selected_protocol(args).value}."
             )
+    if args.coherence_protocol == "mesi-two-level":
         if args.l1d_size != "64KiB" or args.l1d_assoc != 2:
             parser.error(
                 "MESI_Two_Level has no separate CacheLens L1D/private-L2 "
@@ -413,6 +411,21 @@ def _create_cache_hierarchy(args, isa: ISA):
             "cachelens-chi",
         )
 
+    if args.coherence_protocol == "mesi-three-level":
+        from gem5.prebuilt.cachelens.mesi_three_level_cache_hierarchy import (
+            CacheLensMESIThreeLevelHierarchy,
+        )
+
+        return (
+            CacheLensMESIThreeLevelHierarchy(
+                l1d_size=args.l1d_size,
+                l1d_assoc=args.l1d_assoc,
+                indexing_policy=args.indexing_policy,
+                **common,
+            ),
+            "cachelens-mesi-three-level",
+        )
+
     from gem5.prebuilt.cachelens.mesi_two_level_cache_hierarchy import (
         CacheLensMESITwoLevelHierarchy,
     )
@@ -432,6 +445,13 @@ def _checkpoint_prep_configuration(args):
             "inactive during NoCache checkpoint preparation; timing restore "
             "will map l2_* to private MESI data cache and hnf_* to inclusive "
             "shared L2"
+        )
+        hnf_inclusion = "deferred-to-inclusive-timing-restore"
+    elif _selected_protocol(args) == CoherenceProtocol.MESI_THREE_LEVEL:
+        private_mapping = (
+            "inactive during NoCache checkpoint preparation; timing restore "
+            "will map l1d_* to private MESI L1D, l2_* to private MESI L2, and "
+            "hnf_* to inclusive shared L3"
         )
         hnf_inclusion = "deferred-to-inclusive-timing-restore"
     else:
@@ -485,7 +505,11 @@ def _format_configuration_banner(
     topology = hierarchy_config.get(
         "topology",
         (
-            "chi-private-l1-private-l2-shared-hnf"
+            {
+                "chi": "chi-private-l1-private-l2-shared-hnf",
+                "mesi-two-level": "mesi-private-l1-shared-l2",
+                "mesi-three-level": "mesi-private-l1-private-l2-shared-l3",
+            }[args.coherence_protocol]
             if args.cpu_type != "atomic"
             else "uncached-checkpoint-preparation"
         ),
@@ -493,16 +517,28 @@ def _format_configuration_banner(
     private_mapping = hierarchy_config.get(
         "private_data_mapping",
         (
-            "CacheLens l2_size/l2_assoc -> MESI_Two_Level L1D"
-            if _selected_protocol(args) == CoherenceProtocol.MESI_TWO_LEVEL
-            else "native CHI private L1D and L2"
+            {
+                "chi": "native CHI private L1D and L2",
+                "mesi-two-level": (
+                    "CacheLens l2_size/l2_assoc -> MESI_Two_Level L1D"
+                ),
+                "mesi-three-level": (
+                    "CacheLens l1d_* -> MESI L1D, l2_* -> private MESI L2, "
+                    "hnf_* -> inclusive shared L3"
+                ),
+            }[args.coherence_protocol]
         ),
     )
     hnf_inclusion = hierarchy_config.get(
         "hnf_inclusion",
-        "n/a" if args.cpu_type == "atomic" else "noninclusive",
+        (args.hnf_inclusion or "noninclusive")
+        if args.coherence_protocol == "chi"
+        else "inclusive",
     )
-    inclusion_source = hierarchy_config.get("llc_inclusion_source", "option")
+    inclusion_source = hierarchy_config.get(
+        "llc_inclusion_source",
+        "option" if args.coherence_protocol == "chi" else "protocol",
+    )
     return (
         "CacheLens FS: "
         f"isa={args.isa} cpu={args.cpu_type} cores={args.num_cores} "
@@ -537,8 +573,8 @@ def _format_configuration_banner(
 def main() -> None:
     parser = _create_parser()
     args = parser.parse_args()
-    _require_selected_protocol(parser, args)
     _validate_args(parser, args)
+    _require_selected_protocol(parser, args)
 
     isa = ISA.ARM if args.isa == "arm" else ISA.X86
     requires(
