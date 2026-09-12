@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Partial writes preserve cross-flit and sparse CHI byte enables."""
 
+from m5.stats.gem5stats import get_simstat
 from m5.tlm_chi import ReqOpcode, Size
 
-from chi_tlm_test_utils import schedule_read, schedule_write
+from chi_tlm_test_utils import (
+    find_stat,
+    schedule_read,
+    schedule_write,
+    vector_values,
+)
 
 
 BASE = 0x80000000
@@ -75,4 +81,19 @@ def test_generators(generators):
 
 
 def check(system):
+    stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
+    requests = vector_values(find_stat(stats, "nicDmaRequests"))
+    requested_bytes = vector_values(
+        find_stat(stats, "nicDmaRequestedBytes")
+    )
+    merge_reads = vector_values(find_stat(stats, "nicDmaMergeReads"))
+    merge_read_bytes = vector_values(
+        find_stat(stats, "nicDmaMergeReadBytes")
+    )
+    assert requests[8] == 2, requests
+    assert requested_bytes[8] == 20, requested_bytes
+    # The first partial write fetches memory; the second merges against the
+    # authoritative HNF line already produced by the first.
+    assert merge_reads[8] == 1, merge_reads
+    assert merge_read_bytes[8] == 64, merge_read_bytes
     print("Cross-flit and sparse partial-write masks passed")

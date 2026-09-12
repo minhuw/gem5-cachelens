@@ -1006,6 +1006,55 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(rdmaTxPayloadHitRate, "PVRDMA TX payload read hit rate",
                rdmaTxPayloadHits /
                    (rdmaTxPayloadHits + rdmaTxPayloadMisses)),
+      ADD_STAT(nicDmaRequests,
+               "NIC DMA requests by semantic source and operation "
+               "(CHI HNF only; unsupported in MESI)"),
+      ADD_STAT(nicDmaHits,
+               "NIC DMA hits by semantic source and operation"),
+      ADD_STAT(nicDmaMisses,
+               "NIC DMA misses by semantic source and operation"),
+      ADD_STAT(nicDmaRequestedBytes,
+               statistics::units::Byte::get(),
+               "NIC DMA requested bytes by semantic source and operation"),
+      ADD_STAT(nicDmaMergeReads,
+               "NIC DMA partial-write merge reads by semantic source and "
+               "operation"),
+      ADD_STAT(nicDmaMergeReadBytes,
+               statistics::units::Byte::get(),
+               "NIC DMA partial-write merge-read bytes by semantic source "
+               "and operation"),
+      ADD_STAT(nicDmaReadRequests,
+               "Number of NIC DMA read line transactions"),
+      ADD_STAT(nicDmaReadHits,
+               "Number of NIC DMA reads hitting a present line"),
+      ADD_STAT(nicDmaReadMisses,
+               "Number of NIC DMA reads missing at acceptance"),
+      ADD_STAT(nicDmaReadHitRate, "NIC DMA read hit rate",
+               nicDmaReadHits / (nicDmaReadHits + nicDmaReadMisses)),
+      ADD_STAT(nicDmaWriteRequests,
+               "Number of NIC DMA write line transactions"),
+      ADD_STAT(nicDmaWriteHits,
+               "Number of NIC DMA writes hitting a present line"),
+      ADD_STAT(nicDmaWriteMisses,
+               "Number of NIC DMA writes missing at acceptance"),
+      ADD_STAT(nicDmaWriteHitRate, "NIC DMA write hit rate",
+               nicDmaWriteHits / (nicDmaWriteHits + nicDmaWriteMisses)),
+      ADD_STAT(nicDescReadRequests,
+               "Number of NIC descriptor DMA read line transactions"),
+      ADD_STAT(nicDescReadHits,
+               "Number of NIC descriptor DMA reads hitting a present line"),
+      ADD_STAT(nicDescReadMisses,
+               "Number of NIC descriptor DMA reads missing at acceptance"),
+      ADD_STAT(nicDescReadHitRate, "NIC descriptor DMA read hit rate",
+               nicDescReadHits / (nicDescReadHits + nicDescReadMisses)),
+      ADD_STAT(nicDescWriteRequests,
+               "Number of NIC descriptor DMA write line transactions"),
+      ADD_STAT(nicDescWriteHits,
+               "Number of NIC descriptor DMA writes hitting a present line"),
+      ADD_STAT(nicDescWriteMisses,
+               "Number of NIC descriptor DMA writes missing at acceptance"),
+      ADD_STAT(nicDescWriteHitRate, "NIC descriptor DMA write hit rate",
+               nicDescWriteHits / (nicDescWriteHits + nicDescWriteMisses)),
       ADD_STAT(ddioWayAccess,
                "Accesses per way by requester class (src x way)"),
       ADD_STAT(ddioWayFill,
@@ -1033,8 +1082,54 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(rdmaTxPayloadUniqueLines,
                "Unique PVRDMA TX payload line addresses")
 {
+    static constexpr const char *SourceNames[] = {
+        "rx_payload", "rx_header", "rx_descriptor", "tx_payload",
+        "tx_descriptor"
+    };
+    static constexpr const char *OperationNames[] = {
+        "read", "write_full", "write_partial"
+    };
+    constexpr int NumSources =
+        static_cast<int>(NicDmaSource::NumSources);
+    constexpr int NumOperations =
+        static_cast<int>(NicDmaOperation::NumOperations);
+    static_assert(sizeof(SourceNames) / sizeof(SourceNames[0]) == NumSources);
+    static_assert(sizeof(OperationNames) / sizeof(OperationNames[0]) ==
+                  NumOperations);
+
+    constexpr int NumNicDmaStats = NumSources * NumOperations;
+    nicDmaRequests.init(NumNicDmaStats).flags(
+        statistics::nozero | statistics::total);
+    nicDmaHits.init(NumNicDmaStats).flags(
+        statistics::nozero | statistics::total);
+    nicDmaMisses.init(NumNicDmaStats).flags(
+        statistics::nozero | statistics::total);
+    nicDmaRequestedBytes.init(NumNicDmaStats).flags(
+        statistics::nozero | statistics::total);
+    nicDmaMergeReads.init(NumNicDmaStats).flags(
+        statistics::nozero | statistics::total);
+    nicDmaMergeReadBytes.init(NumNicDmaStats).flags(
+        statistics::nozero | statistics::total);
+    for (int source = 0; source < NumSources; ++source) {
+        for (int operation = 0; operation < NumOperations; ++operation) {
+            const int index = source * NumOperations + operation;
+            const std::string subname = csprintf(
+                "%s_%s", SourceNames[source], OperationNames[operation]);
+            nicDmaRequests.subname(index, subname);
+            nicDmaHits.subname(index, subname);
+            nicDmaMisses.subname(index, subname);
+            nicDmaRequestedBytes.subname(index, subname);
+            nicDmaMergeReads.subname(index, subname);
+            nicDmaMergeReadBytes.subname(index, subname);
+        }
+    }
+
     rxPayloadHitRate.flags(statistics::nonan);
     txPayloadHitRate.flags(statistics::nonan);
+    nicDmaReadHitRate.flags(statistics::nonan);
+    nicDmaWriteHitRate.flags(statistics::nonan);
+    nicDescReadHitRate.flags(statistics::nonan);
+    nicDescWriteHitRate.flags(statistics::nonan);
     rdmaRxPayloadHitRate.flags(statistics::nonan);
     rdmaTxPayloadHitRate.flags(statistics::nonan);
     numDataArrayReads
@@ -1273,6 +1368,153 @@ void
 CacheMemory::profileDemandMiss()
 {
     cacheMemoryStats.m_demand_misses++;
+}
+
+int
+CacheMemory::getNicDmaRequestSize(const RequestPtr &req) const
+{
+    classifyNicDmaSource(req);
+    panic_if(!req->hasSize(), "NIC DMA request must carry a valid size");
+    return req->getSize();
+}
+
+CacheMemory::NicDmaSource
+CacheMemory::classifyNicDmaSource(const RequestPtr &req)
+{
+    panic_if(!req, "Cannot classify a null NIC DMA request");
+    panic_if(!Request::hasOneNicDmaCategory(req->getFlags()),
+             "NIC DMA request must carry exactly one category flag");
+
+    if (req->isNicRxPayloadWrite())
+        return NicDmaSource::RxPayload;
+    if (req->isNicRxHeaderWrite())
+        return NicDmaSource::RxHeader;
+    if (req->isNicRxDescRead() || req->isNicRxDescWriteback())
+        return NicDmaSource::RxDescriptor;
+    if (req->isNicTxPayloadRead())
+        return NicDmaSource::TxPayload;
+    if (req->isNicTxDescRead() || req->isNicTxDescWriteback())
+        return NicDmaSource::TxDescriptor;
+
+    panic("Unsupported NIC DMA category");
+}
+
+CacheMemory::NicDmaOperation
+CacheMemory::classifyNicDmaOperation(const RequestPtr &req,
+                                     bool write_partial)
+{
+    const NicDmaSource source = classifyNicDmaSource(req);
+    const bool is_read = req->isNicDmaRead();
+    const bool is_write = req->isNicDmaWrite();
+    panic_if(is_read == is_write,
+             "NIC DMA category must be exclusively read or write");
+
+    if (is_read) {
+        panic_if(write_partial,
+                 "NIC DMA read cannot be classified as a partial write");
+        panic_if(source == NicDmaSource::RxPayload ||
+                     source == NicDmaSource::RxHeader,
+                 "RX payload/header categories only support writes");
+        return NicDmaOperation::Read;
+    }
+
+    panic_if(source == NicDmaSource::TxPayload,
+             "TX payload category only supports reads");
+    return write_partial ? NicDmaOperation::WritePartial
+                         : NicDmaOperation::WriteFull;
+}
+
+void
+CacheMemory::profileNicDma(Addr address, const RequestPtr &req,
+                           bool write_partial, int bytes)
+{
+    if (!req || (!req->isNicDmaRead() && !req->isNicDmaWrite()))
+        return;
+
+    const NicDmaSource source = classifyNicDmaSource(req);
+    const NicDmaOperation operation =
+        classifyNicDmaOperation(req, write_partial);
+    panic_if(bytes < 1 || bytes > m_block_size,
+             "NIC DMA requested bytes must be in [1, %d], got %d",
+             m_block_size, bytes);
+    panic_if(operation == NicDmaOperation::WriteFull &&
+                 bytes != m_block_size,
+             "Full NIC DMA write must request one block (%d bytes), got %d",
+             m_block_size, bytes);
+
+    const int index = nicDmaStatIndex(source, operation);
+    const bool hit = isTagPresent(address);
+    cacheMemoryStats.nicDmaRequests[index]++;
+    cacheMemoryStats.nicDmaRequestedBytes[index] += bytes;
+    if (hit) {
+        cacheMemoryStats.nicDmaHits[index]++;
+    } else {
+        cacheMemoryStats.nicDmaMisses[index]++;
+    }
+
+    // Preserve the compatibility direction and descriptor projections at the
+    // same acceptance-time tag state as before.
+    const bool is_read = operation == NicDmaOperation::Read;
+    const bool is_desc = source == NicDmaSource::RxDescriptor ||
+                         source == NicDmaSource::TxDescriptor;
+    if (is_read) {
+        cacheMemoryStats.nicDmaReadRequests++;
+        if (hit) {
+            cacheMemoryStats.nicDmaReadHits++;
+        } else {
+            cacheMemoryStats.nicDmaReadMisses++;
+        }
+        if (is_desc) {
+            cacheMemoryStats.nicDescReadRequests++;
+            if (hit) {
+                cacheMemoryStats.nicDescReadHits++;
+            } else {
+                cacheMemoryStats.nicDescReadMisses++;
+            }
+        }
+    } else {
+        cacheMemoryStats.nicDmaWriteRequests++;
+        if (hit) {
+            cacheMemoryStats.nicDmaWriteHits++;
+        } else {
+            cacheMemoryStats.nicDmaWriteMisses++;
+        }
+        if (is_desc) {
+            cacheMemoryStats.nicDescWriteRequests++;
+            if (hit) {
+                cacheMemoryStats.nicDescWriteHits++;
+            } else {
+                cacheMemoryStats.nicDescWriteMisses++;
+            }
+        }
+    }
+
+    // Preserve existing category-specific payload/header telemetry.
+    if (source == NicDmaSource::RxPayload) {
+        profileRxPayload(address);
+        if (req->isNicPvrdma())
+            profileRdmaRxPayload(address);
+    } else if (source == NicDmaSource::RxHeader) {
+        profileRxHeader(address);
+    } else if (source == NicDmaSource::TxPayload) {
+        profileTxPayload(address);
+        if (req->isNicPvrdma())
+            profileRdmaTxPayload(address);
+    }
+}
+
+void
+CacheMemory::profileNicDmaMergeRead(const RequestPtr &req)
+{
+    const NicDmaSource source = classifyNicDmaSource(req);
+    const NicDmaOperation operation =
+        classifyNicDmaOperation(req, true);
+    panic_if(operation != NicDmaOperation::WritePartial,
+             "NIC DMA merge read requires a partial write");
+
+    const int index = nicDmaStatIndex(source, operation);
+    cacheMemoryStats.nicDmaMergeReads[index]++;
+    cacheMemoryStats.nicDmaMergeReadBytes[index] += m_block_size;
 }
 
 void

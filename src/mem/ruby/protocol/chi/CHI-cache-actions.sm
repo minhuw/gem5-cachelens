@@ -1256,6 +1256,11 @@ action(Prepare_DDIOWrite, desc="") {
   bool needs_read := cache.ddioWriteNeedsRead(
       tbe.reqType == CHIRequestType:WriteUniquePtl, tbe.dataValid);
   if (needs_read) {
+    assert(tbe.is_ddio_write);
+    assert(tbe.isSeqReqValid);
+    assert(tbe.nic_merge_read_profiled == false);
+    cache.profileNicDmaMergeRead(tbe.seqReq);
+    tbe.nic_merge_read_profiled := true;
     tbe.dataUnique := false;
     tbe.actions.pushFront(Event:SendReadNoSnp);
   } else {

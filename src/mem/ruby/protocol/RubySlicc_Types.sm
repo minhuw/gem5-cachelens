@@ -224,6 +224,10 @@ structure (CacheMemory, external = "yes") {
   Addr cacheProbeInWays(Addr, int);
   AbstractCacheEntry allocateInWays(Addr, AbstractCacheEntry, int);
   int getDDIOWayPart();
+  // Generic source/extent metrics are CHI-only (unsupported in MESI).
+  void profileNicDma(Addr, RequestPtr, bool, int);
+  void profileNicDmaMergeRead(RequestPtr);
+  int getNicDmaRequestSize(RequestPtr);
   void profileRxPayload(Addr);
   void profileRdmaRxPayload(Addr);
   void profileRxHeader(Addr);

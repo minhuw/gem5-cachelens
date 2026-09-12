@@ -58,6 +58,19 @@ def test_generators(generators):
 def check(system):
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
     allocations = vector_values(find_stat(stats, "ddioAllocWays"))
+    requests = vector_values(find_stat(stats, "nicDmaRequests"))
+    requested_bytes = vector_values(
+        find_stat(stats, "nicDmaRequestedBytes")
+    )
+    merge_reads = vector_values(find_stat(stats, "nicDmaMergeReads"))
+    merge_read_bytes = vector_values(
+        find_stat(stats, "nicDmaMergeReadBytes")
+    )
+    # Source 2 (RX descriptor), operation 2 (write_partial): 2 * 3 + 2.
+    assert requests[8] == 1, requests
+    assert requested_bytes[8] == 16, requested_bytes
+    assert merge_reads[8] == 1, merge_reads
+    assert merge_read_bytes[8] == 64, merge_read_bytes
     assert sum(allocations) == 1, allocations
     assert all(
         value == 0 for value in allocations[ddio_way_part:]

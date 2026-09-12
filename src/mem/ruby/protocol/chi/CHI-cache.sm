@@ -695,6 +695,8 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     bool is_nic_desc,       default="false",   desc="NIC descriptor DMA";
     bool is_nic_read,       default="false",   desc="NIC DMA read subject to the profile allocation policy";
     bool ddio_access_profiled, default="false", desc="DDIO way access already recorded";
+    bool nic_merge_read_profiled, default="false",
+         desc="Partial NIC write merge read already recorded";
     bool stale_wb_path,     default="false",   desc="Writeback handled via stale-copyback path";
 
     // Transaction state information

@@ -106,6 +106,19 @@ def test_generators(generators):
 def check(system):
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
     allocations = vector_values(find_stat(stats, "ddioAllocWays"))
+    requests = vector_values(find_stat(stats, "nicDmaRequests"))
+    requested_bytes = vector_values(
+        find_stat(stats, "nicDmaRequestedBytes")
+    )
+    merge_reads = vector_values(find_stat(stats, "nicDmaMergeReads"))
+    merge_read_bytes = vector_values(
+        find_stat(stats, "nicDmaMergeReadBytes")
+    )
+    assert requests[8] == 1, requests
+    assert requested_bytes[8] == 16, requested_bytes
+    # Dirty owner data is authoritative, so no memory merge read is issued.
+    assert merge_reads[8] == 0, merge_reads
+    assert merge_read_bytes[8] == 0, merge_read_bytes
     assert sum(allocations) == 1, allocations
     assert all(
         value == 0 for value in allocations[ddio_way_part:]

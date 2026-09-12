@@ -417,6 +417,7 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.delayNextAction := intToTick(0);
 
   tbe.is_stale := false;
+  tbe.nic_merge_read_profiled := false;
 }
 
 TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes" {
@@ -470,20 +471,40 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
       cache.isNicDescDmaReq(in_msg.seqReq);
   tbe.is_nic_read := is_HN && in_msg.isSeqReqValid &&
       cache.isNicDdioReadReq(in_msg.seqReq);
-  // Profile at request acceptance, before any protocol action can change the
-  // tag state. This counts both hit and miss paths exactly once.
-  if (tbe.is_ddio_payload) {
-    cache.profileRxPayload(addr);
-    if (tbe.is_pvrdma) {
-      cache.profileRdmaRxPayload(addr);
+  // Profile NIC DMA at request acceptance, before protocol actions can change
+  // tag state. Source comes only from Request flags. Sparse TLM writes use the
+  // exact access-mask population; contiguous requests use the original gem5
+  // Request size preserved in seqReq: RNI forwarding expands CHI accSize to
+  // a block without replacing seqReq. Rejected requests never allocate a TBE;
+  // downstream retries reuse this TBE and do not repeat profiling.
+  if (is_HN && in_msg.isSeqReqValid &&
+      (tbe.is_ddio_write || tbe.is_nic_read)) {
+    int nic_dma_bytes := cache.getNicDmaRequestSize(in_msg.seqReq);
+    if (!in_msg.accessMask.isEmpty()) {
+      nic_dma_bytes := in_msg.accessMask.count();
     }
-  } else if (tbe.is_ddio_header) {
-    cache.profileRxHeader(addr);
-  } else if (tbe.is_tx_payload) {
-    cache.profileTxPayload(addr);
-    if (tbe.is_pvrdma) {
-      cache.profileRdmaTxPayload(addr);
+    assert((nic_dma_bytes > 0) && (nic_dma_bytes <= blockSize));
+
+    bool write_partial := false;
+    if (tbe.is_ddio_write) {
+      // NIC device writes must state their extent explicitly. In particular,
+      // a classified WriteUniqueZero is malformed and must not be projected
+      // into either write class.
+      assert(tbe.is_nic_read == false);
+      assert((in_msg.type == CHIRequestType:WriteUniquePtl) ||
+             (in_msg.type == CHIRequestType:WriteUniqueFull));
+      write_partial := in_msg.type == CHIRequestType:WriteUniquePtl;
+      if (write_partial == false) {
+        assert(nic_dma_bytes == blockSize);
+      }
+    } else {
+      assert(tbe.is_nic_read);
+      assert((in_msg.type != CHIRequestType:WriteUniquePtl) &&
+             (in_msg.type != CHIRequestType:WriteUniqueFull) &&
+             (in_msg.type != CHIRequestType:WriteUniqueZero));
     }
+    cache.profileNicDma(
+        addr, in_msg.seqReq, write_partial, nic_dma_bytes);
   }
   tbe.ddio_access_profiled := false;
   tbe.stale_wb_path := false;

@@ -113,17 +113,22 @@ def schedule_read(
     address,
     expected,
     txn_id,
+    size=Size.SIZE_64,
+    data_beats=2,
     opcode=ReqOpcode.READ_ONCE,
 ):
-    read_payload = payload(address)
+    if data_beats not in (1, 2):
+        raise ValueError("data_beats must be one or two")
+    read_payload = payload(address, size=size)
     transaction = generator.injectAt(
         when,
         read_payload,
         phase(opcode, txn_id, exp_comp_ack=True),
     )
     transaction.ASSERT("read first data", is_comp_data)
-    transaction.DO_WAIT(wait)
-    transaction.ASSERT("read second data", is_comp_data)
+    if data_beats == 2:
+        transaction.DO_WAIT(wait)
+        transaction.ASSERT("read second data", is_comp_data)
     transaction.ASSERT(
         "read merged line",
         lambda unused: bytes(read_payload.data) == bytes(expected),

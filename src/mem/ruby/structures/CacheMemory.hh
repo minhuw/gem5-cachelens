@@ -42,6 +42,7 @@
 #ifndef __MEM_RUBY_STRUCTURES_CACHEMEMORY_HH__
 #define __MEM_RUBY_STRUCTURES_CACHEMEMORY_HH__
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -75,6 +76,34 @@ class CacheMemory : public SimObject
   public:
     typedef RubyCacheParams Params;
     typedef std::shared_ptr<replacement_policy::ReplacementData> ReplData;
+    /** Semantic NIC DMA source, independent of transfer operation. */
+    enum class NicDmaSource : uint8_t
+    {
+        RxPayload = 0,
+        RxHeader,
+        RxDescriptor,
+        TxPayload,
+        TxDescriptor,
+        NumSources
+    };
+
+    /** NIC DMA operation classified from the accepted CHI request type. */
+    enum class NicDmaOperation : uint8_t
+    {
+        Read = 0,
+        WriteFull,
+        WritePartial,
+        NumOperations
+    };
+
+    static constexpr int
+    nicDmaStatIndex(NicDmaSource source, NicDmaOperation operation)
+    {
+        return static_cast<int>(source) *
+                   static_cast<int>(NicDmaOperation::NumOperations) +
+               static_cast<int>(operation);
+    }
+
     CacheMemory(const Params &p);
     ~CacheMemory();
 
@@ -330,6 +359,42 @@ class CacheMemory : public SimObject
           statistics::Scalar rdmaTxPayloadMisses;
           statistics::Formula rdmaTxPayloadHitRate;
 
+          // CHI HNF only; unsupported in MESI (zero is not a measurement).
+          // Generic NIC DMA accounting has orthogonal semantic-source and
+          // operation axes. The flattened index is source * 3 + operation,
+          // with sources RX payload, RX header, RX descriptor, TX payload,
+          // TX descriptor and operations read, write_full, write_partial.
+          // Subnames are <source>_<operation>. Hits/misses observe tag
+          // presence at HNF acceptance; requested bytes are exact enabled
+          // bytes in that line transaction. Merge reads count only memory
+          // ReadNoSnp operations needed to complete partial NIC writes.
+          statistics::Vector nicDmaRequests;
+          statistics::Vector nicDmaHits;
+          statistics::Vector nicDmaMisses;
+          statistics::Vector nicDmaRequestedBytes;
+          statistics::Vector nicDmaMergeReads;
+          statistics::Vector nicDmaMergeReadBytes;
+
+          // Compatibility NIC DMA counters retain their original names and
+          // semantics. Descriptor-only counters are subsets of the
+          // corresponding total read/write counters.
+          statistics::Scalar nicDmaReadRequests;
+          statistics::Scalar nicDmaReadHits;
+          statistics::Scalar nicDmaReadMisses;
+          statistics::Formula nicDmaReadHitRate;
+          statistics::Scalar nicDmaWriteRequests;
+          statistics::Scalar nicDmaWriteHits;
+          statistics::Scalar nicDmaWriteMisses;
+          statistics::Formula nicDmaWriteHitRate;
+          statistics::Scalar nicDescReadRequests;
+          statistics::Scalar nicDescReadHits;
+          statistics::Scalar nicDescReadMisses;
+          statistics::Formula nicDescReadHitRate;
+          statistics::Scalar nicDescWriteRequests;
+          statistics::Scalar nicDescWriteHits;
+          statistics::Scalar nicDescWriteMisses;
+          statistics::Formula nicDescWriteHitRate;
+
           // Per-way, per-source accounting to understand eviction
           // pressure on the DDIO ways.  Source classes:
           //   0 = NIC RX payload write, 1 = NIC TX payload read,
@@ -402,9 +467,18 @@ class CacheMemory : public SimObject
       }
 
       // DDIO accounting hooks (called from the CHI home node).
-      // profileRxPayload/profileRxHeader count one line transaction and record
-      // whether the line was present at acceptance. Allocation ways are
-      // recorded by profileDdioWayFill().
+      // profileNicDma classifies and counts one line transaction at request
+      // acceptance. Source comes only from Request flags; write extent and
+      // exact requested bytes come from the accepted CHI transaction.
+      // Compatibility payload/header/direction counters are updated at the
+      // same point. Allocation ways are recorded by profileDdioWayFill().
+      void profileNicDma(Addr address, const RequestPtr &req,
+                         bool write_partial, int bytes);
+      void profileNicDmaMergeRead(const RequestPtr &req);
+      int getNicDmaRequestSize(const RequestPtr &req) const;
+      static NicDmaSource classifyNicDmaSource(const RequestPtr &req);
+      static NicDmaOperation classifyNicDmaOperation(
+          const RequestPtr &req, bool write_partial);
       void profileRxPayload(Addr address);
       void profileRdmaRxPayload(Addr address);
       void profileRxHeader(Addr address);
