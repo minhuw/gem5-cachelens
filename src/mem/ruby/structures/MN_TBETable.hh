@@ -59,9 +59,11 @@ namespace CHI
 class MN_TBETable : public TBETable<MiscNode_TBE>
 {
   public:
-    MN_TBETable(int number_of_TBEs)
+    MN_TBETable(int number_of_TBEs, int block_size)
       : TBETable(number_of_TBEs)
-    {}
+    {
+        setBlockSize(block_size);
+    }
 
     MiscNode_TBE* chooseNewDistributor();
 };

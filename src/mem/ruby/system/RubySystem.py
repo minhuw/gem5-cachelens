@@ -56,6 +56,12 @@ class RubySystem(ClockedObject):
         "Use phys_mem as the functional \
         store and only use ruby for timing.",
     )
+    cache_trace_warmup = Param.Bool(
+        True,
+        "Replay the checkpoint cache trace to warm Ruby caches on restore. "
+        "Disable this to restore with empty caches after validating the "
+        "trace; checkpoint backing memory must then be authoritative.",
+    )
 
     # Profiler related configuration variables
     hot_lines = Param.Bool(False, "")

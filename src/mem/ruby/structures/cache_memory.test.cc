@@ -33,11 +33,21 @@
 
 #include "mem/cache/replacement_policies/lru_rp.hh"
 #include "mem/ruby/structures/CacheMemory.hh"
+#include "mem/ruby/system/RubyPort.hh"
 #include "params/LRURP.hh"
 #include "params/RubyCache.hh"
 
 namespace gem5::ruby
 {
+
+// CacheRecorder is linked because CacheMemory exposes checkpoint recording,
+// but these unit tests never instantiate a RubyPort or exercise its functional
+// write path.
+bool
+RubyPort::functionalWriteToRubySystem(Packet *)
+{
+    return false;
+}
 
 class TestEntry : public AbstractCacheEntry
 {

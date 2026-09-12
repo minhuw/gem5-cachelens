@@ -346,8 +346,9 @@ class System : public SimObject, public PCEventScope
     Addr memSize() const;
 
     /**
-     * Check if a physical address is within a range of a memory that
-     * is part of the global address map.
+     * Check if a physical address is within a configured RAM-only range. If
+     * no explicit ranges are configured, fall back to memories in the global
+     * address map.
      *
      * @param addr A physical address
      * @return Whether the address corresponds to a memory

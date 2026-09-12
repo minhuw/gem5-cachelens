@@ -726,7 +726,7 @@ GicV2::writeCpu(ContextID ctx, Addr daddr, uint32_t data)
             uint32_t int_num = 1 << (iar.ack_id - SGI_MAX);
             if (!(cpuPpiActive[ctx] & int_num))
                 warn("CPU %d Done handling a PPI interrupt "
-                      "that isn't active?\n", ctx);
+                      "that isn't active? ack_id=%d\n", ctx, iar.ack_id);
             cpuPpiActive[ctx] &= ~int_num;
         } else {
             uint32_t int_num = 1 << intNumToBit(iar.ack_id);

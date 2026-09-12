@@ -53,6 +53,7 @@
 #include "debug/AddrRanges.hh"
 #include "debug/Drain.hh"
 #include "debug/XBar.hh"
+#include "mem/xbar_timing.hh"
 
 namespace gem5
 {
@@ -105,41 +106,26 @@ BaseXBar::getPort(const std::string &if_name, PortID idx)
 }
 
 void
-BaseXBar::calcPacketTiming(PacketPtr pkt, Tick header_delay)
+BaseXBar::calcPacketTiming(PacketPtr pkt, Tick header_delay,
+                           bool timing_transparent)
 {
-    // the crossbar will be called at a time that is not necessarily
-    // coinciding with its own clock, so start by determining how long
-    // until the next clock edge (could be zero)
+    // The crossbar will be called at a time that is not necessarily
+    // coinciding with its own clock, so determine how long until the next
+    // edge. Transparent routing deliberately ignores this offset.
     Tick offset = clockEdge() - curTick();
+    XBarTiming::annotatePacket(pkt, offset, header_delay, clockPeriod(), width,
+                              timing_transparent);
 
-    // the header delay depends on the path through the crossbar, and
-    // we therefore rely on the caller to provide the actual
-    // value
-    pkt->headerDelay += offset + header_delay;
-
-    // note that we add the header delay to the existing value, and
-    // align it to the crossbar clock
-
-    // do a quick sanity check to ensure the timings are not being
-    // ignored, note that this specific value may cause problems for
-    // slower interconnects
-    panic_if(pkt->headerDelay > sim_clock::as_int::us,
-             "Encountered header delay exceeding 1 us\n");
-
-    if (pkt->hasData()) {
-        // the payloadDelay takes into account the relative time to
-        // deliver the payload of the packet, after the header delay,
-        // we take the maximum since the payload delay could already
-        // be longer than what this parcitular crossbar enforces.
-        pkt->payloadDelay = std::max<Tick>(pkt->payloadDelay,
-                                           divCeil(pkt->getSize(), width) *
-                                           clockPeriod());
+    // Do a quick sanity check to ensure the timings are not being ignored.
+    // Transparent routing leaves any existing packet delay untouched.
+    if (!timing_transparent) {
+        panic_if(pkt->headerDelay > sim_clock::as_int::us,
+                 "Encountered header delay exceeding 1 us\n");
     }
 
-    // the payload delay is not paying for the clock offset as that is
-    // already done using the header delay, and the payload delay is
-    // also used to determine how long the crossbar layer is busy and
-    // thus regulates throughput
+    // The payload delay is not paying for the clock offset as that is already
+    // done using the header delay. It also determines how long a normal
+    // crossbar layer is busy and thus regulates throughput.
 }
 
 template <typename SrcType, typename DstType>
@@ -300,8 +286,9 @@ BaseXBar::Layer<SrcType, DstType>::retryWaiting()
         // have done our bit and sent the retry
         state = BUSY;
 
-        // occupy the crossbar layer until the next clock edge
-        occupyLayer(xbar.clockEdge());
+        // Occupy the layer briefly before another retry. A transparent
+        // subclass may use one simulator tick rather than a clock edge.
+        occupyLayer(xbar.retryLayerReleaseTick());
     }
 }
 

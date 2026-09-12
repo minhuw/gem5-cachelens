@@ -3,12 +3,13 @@
 #include "base/random.hh"
 #include "base/trace.hh"
 #include "debug/HMCController.hh"
+#include "mem/hmc_controller_params.hh"
 
 namespace gem5
 {
 
 HMCController::HMCController(const HMCControllerParams &p) :
-    NoncoherentXBar(p),
+    NoncoherentXBar(HMCControllerParamsValidator::validate(p)),
     numMemSidePorts(p.port_mem_side_ports_connection_count),
     rr_counter(0)
 {

@@ -189,6 +189,11 @@ class ArmBoard(ArmSystem, AbstractBoard, KernelDiskWorkload):
 
         if success:
             memory.set_memory_range(self.mem_ranges)
+            # NoCache creates the DMA bridge before the platform memory
+            # ranges are calculated. Update the bridge now so device DMA is
+            # routed to RAM instead of receiving bad-address responses.
+            if hasattr(self, "dmabridge"):
+                self.dmabridge.ranges = self.mem_ranges
         else:
             raise ValueError("Memory size too big for platform capabilities")
 

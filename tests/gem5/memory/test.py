@@ -32,6 +32,33 @@ TODO: Add stats checking
 from testlib import *
 
 gem5_verify_config(
+    name="channeled_memory_transparent_routing",
+    verifiers=(),
+    config=joinpath(getcwd(), "channeled-memory-routing-run.py"),
+    config_args=[],
+    valid_isas=(constants.x86_tag,),
+    length=constants.quick_tag,
+)
+
+gem5_verify_config(
+    name="channeled_memory_split_atomic",
+    verifiers=(),
+    config=joinpath(getcwd(), "channeled-memory-x86-run.py"),
+    config_args=[],
+    valid_isas=(constants.x86_tag,),
+    length=constants.quick_tag,
+)
+
+gem5_verify_config(
+    name="channeled_memory_split_timing",
+    verifiers=(),
+    config=joinpath(getcwd(), "channeled-memory-x86-run.py"),
+    config_args=["--timing"],
+    valid_isas=(constants.x86_tag,),
+    length=constants.quick_tag,
+)
+
+gem5_verify_config(
     name="simple_mem_default",
     verifiers=(),  # No need for verfiers this will return non-zero on fail
     config=joinpath(getcwd(), "simple-run.py"),

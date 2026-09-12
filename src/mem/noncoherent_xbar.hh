@@ -70,6 +70,9 @@ class NoncoherentXBar : public BaseXBar
 
   protected:
 
+    /** Route packets without adding timing or clocked serialization. */
+    const bool timingTransparent;
+
     /**
      * Declare the layers of this crossbar, one vector for requests
      * and one for responses.
@@ -138,6 +141,16 @@ class NoncoherentXBar : public BaseXBar
         {
             return xbar.getAddrRanges();
         }
+
+        void
+        recvRespRetry() override
+        {
+            if (xbar.timingTransparent) {
+                xbar.recvRespRetry(id);
+            } else {
+                QueuedResponsePort::recvRespRetry();
+            }
+        }
     };
 
     /**
@@ -183,6 +196,15 @@ class NoncoherentXBar : public BaseXBar
     virtual bool recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id);
     virtual bool recvTimingResp(PacketPtr pkt, PortID mem_side_port_id);
     void recvReqRetry(PortID mem_side_port_id);
+    void recvRespRetry(PortID cpu_side_port_id);
+
+    /**
+     * Return the layer release time for a packet or failed forwarding
+     * attempt. Transparent routing uses the minimum non-zero simulator
+     * duration, independent of the crossbar clock.
+     */
+    Tick layerReleaseTick(Tick packet_finish_time) const;
+    Tick retryLayerReleaseTick() const override;
     Tick recvAtomicBackdoor(PacketPtr pkt, PortID cpu_side_port_id,
                             MemBackdoorPtr *backdoor=nullptr);
     void recvFunctional(PacketPtr pkt, PortID cpu_side_port_id);

@@ -106,6 +106,11 @@ class NoncoherentXBar(BaseXBar):
     cxx_header = "mem/noncoherent_xbar.hh"
     cxx_class = "gem5::NoncoherentXBar"
 
+    timing_transparent = Param.Bool(
+        False,
+        "Route timing traffic without adding delays or clocked bandwidth",
+    )
+
 
 class CoherentXBar(BaseXBar):
     type = "CoherentXBar"

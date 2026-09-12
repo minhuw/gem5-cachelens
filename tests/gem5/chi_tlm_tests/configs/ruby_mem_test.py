@@ -95,15 +95,21 @@ class TLM_RNF(CHI_Node):
 
 def rnf_gen(options, ruby_system, cpus):
     classify_ddio = getattr(suite, "classify_ddio", False)
-    nic_dma_category = getattr(suite, "nic_dma_category", "")
+    default_category = getattr(suite, "nic_dma_category", "")
+    categories = getattr(suite, "nic_dma_categories", None)
+    if categories is not None and len(categories) != len(system.cpu):
+        raise ValueError("nic_dma_categories must match --num-cpus")
     return [
         TLM_RNF(
             ruby_system,
             cpu,
             classify_ddio=classify_ddio,
-            nic_dma_category=nic_dma_category,
+            nic_dma_category=(
+                categories[index] if categories is not None
+                else default_category
+            ),
         )
-        for cpu in system.cpu
+        for index, cpu in enumerate(system.cpu)
     ]
 
 
@@ -181,6 +187,11 @@ parser.add_argument(
     type=str,
     help="Path to the suite file",
 )
+parser.add_argument(
+    "--hnf-comp-wu",
+    action="store_true",
+    help="Use separate DBIDResp and Comp responses for HNF WriteUnique",
+)
 Options.addNoISAOptions(parser)
 
 #
@@ -204,8 +215,11 @@ suite = suite_importer(args.suite)
 if hasattr(suite, "ddio_way_part"):
     args.ddio_way_part = suite.ddio_way_part
 
-for cpu in cpus:
-    suite.test_all(cpu)
+if hasattr(suite, "test_generators"):
+    suite.test_generators(cpus)
+else:
+    for cpu in cpus:
+        suite.test_all(cpu)
 
 system = System(
     cpu=cpus,
@@ -220,9 +234,17 @@ system._mn_gen = mn_gen
 
 create_system(args, system)
 
+for hnf in system.ruby.hnf:
+    hnf._cntrl.comp_wu = args.hnf_comp_wu
 if hasattr(suite, "hnf_alloc_on_writeback"):
     for hnf in system.ruby.hnf:
         hnf._cntrl.alloc_on_writeback = suite.hnf_alloc_on_writeback
+if hasattr(suite, "nic_read_no_allocate"):
+    for hnf in system.ruby.hnf:
+        hnf._cntrl.nic_read_no_allocate = suite.nic_read_no_allocate
+if hasattr(suite, "hnf_enable_dmt"):
+    for hnf in system.ruby.hnf:
+        hnf._cntrl.enable_DMT = suite.hnf_enable_dmt
 
 # Create a top-level voltage domain and clock domain
 system.voltage_domain = VoltageDomain(voltage=args.sys_voltage)

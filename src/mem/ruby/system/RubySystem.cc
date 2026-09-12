@@ -41,13 +41,18 @@
 #include "mem/ruby/system/RubySystem.hh"
 
 #include <fcntl.h>
+#include <unistd.h>
 #include <zlib.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
+#include <limits>
 #include <list>
 
 #include "base/compiler.hh"
 #include "base/intmath.hh"
+#include "base/logging.hh"
 #include "base/statistics.hh"
 #include "debug/RubyCacheTrace.hh"
 #include "debug/RubySystem.hh"
@@ -71,7 +76,7 @@ namespace ruby
 
 RubySystem::RubySystem(const Params &p)
     : ClockedObject(p), m_access_backing_store(p.access_backing_store),
-      m_cache_recorder(NULL)
+      m_cache_trace_warmup(p.cache_trace_warmup), m_cache_recorder(NULL)
 {
     m_randomization = p.randomization;
 
@@ -368,42 +373,89 @@ RubySystem::drainResume()
     }
 }
 
-void
-RubySystem::readCompressedTrace(std::string filename, uint8_t *&raw_data,
-                                uint64_t &uncompressed_trace_size)
+namespace
 {
-    // Read the trace file
-    gzFile compressedTrace;
 
-    // trace file
+constexpr size_t TraceValidationBufferSize = 64 * 1024;
+
+// Read exactly the size recorded in the checkpoint and require the gzip stream
+// to end there. This detects truncated, corrupt, and size-mismatched traces
+// before Ruby either replays or deliberately ignores their records.
+void
+readExactCompressedTrace(const std::string &filename, uint8_t *raw_data,
+                         uint64_t uncompressed_trace_size)
+{
     int fd = open(filename.c_str(), O_RDONLY);
     if (fd < 0) {
         perror("open");
         fatal("Unable to open trace file %s", filename);
     }
 
-    compressedTrace = gzdopen(fd, "rb");
-    if (compressedTrace == NULL) {
+    gzFile compressed_trace = gzdopen(fd, "rb");
+    if (compressed_trace == nullptr) {
+        close(fd);
         fatal("Insufficient memory to allocate compression state for %s\n",
               filename);
     }
 
-    raw_data = new uint8_t[uncompressed_trace_size];
-    if (gzread(compressedTrace, raw_data, uncompressed_trace_size) <
-            uncompressed_trace_size) {
-        fatal("Unable to read complete trace from file %s\n", filename);
+    std::array<uint8_t, TraceValidationBufferSize> validation_buffer;
+    uint64_t bytes_read = 0;
+    while (bytes_read < uncompressed_trace_size) {
+        const auto bytes_remaining = uncompressed_trace_size - bytes_read;
+        const unsigned int chunk_size = std::min<uint64_t>(
+            bytes_remaining, TraceValidationBufferSize);
+        uint8_t *destination = raw_data ? raw_data + bytes_read :
+            validation_buffer.data();
+        const int chunk_read = gzread(
+            compressed_trace, destination, chunk_size);
+        if (chunk_read <= 0) {
+            int error_number = Z_OK;
+            const char *error = gzerror(compressed_trace, &error_number);
+            fatal("Unable to read complete cache trace '%s' after %llu of "
+                  "%llu bytes: %s\n", filename,
+                  static_cast<unsigned long long>(bytes_read),
+                  static_cast<unsigned long long>(uncompressed_trace_size),
+                  error ? error : "unexpected end of file");
+        }
+        bytes_read += chunk_read;
     }
 
-    if (gzclose(compressedTrace)) {
-        fatal("Failed to close cache trace file '%s'\n", filename);
+    uint8_t extra_byte = 0;
+    const int extra_bytes = gzread(compressed_trace, &extra_byte, 1);
+    if (extra_bytes < 0) {
+        int error_number = Z_OK;
+        const char *error = gzerror(compressed_trace, &error_number);
+        fatal("Unable to validate cache trace '%s': %s\n", filename,
+              error ? error : "gzip read error");
     }
+    fatal_if(extra_bytes != 0,
+             "Cache trace '%s' contains more data than its checkpoint "
+             "metadata declares (%llu bytes)", filename,
+             static_cast<unsigned long long>(uncompressed_trace_size));
+
+    if (gzclose(compressed_trace)) {
+        fatal("Unable to validate cache trace '%s': gzip close failed\n",
+              filename);
+    }
+}
+
+} // anonymous namespace
+
+void
+RubySystem::readCompressedTrace(std::string filename, uint8_t *&raw_data,
+                                uint64_t &uncompressed_trace_size)
+{
+    fatal_if(uncompressed_trace_size > std::numeric_limits<size_t>::max(),
+             "Cache trace '%s' is too large for this host (%llu bytes)",
+             filename,
+             static_cast<unsigned long long>(uncompressed_trace_size));
+    raw_data = new uint8_t[uncompressed_trace_size];
+    readExactCompressedTrace(filename, raw_data, uncompressed_trace_size);
 }
 
 void
 RubySystem::unserialize(CheckpointIn &cp)
 {
-    uint8_t *uncompressed_trace = NULL;
-
     // This value should be set to the checkpoint-system's block-size.
     // Optional, as checkpoints without it can be run if the
     // checkpoint-system's block-size == current block-size.
@@ -415,8 +467,38 @@ RubySystem::unserialize(CheckpointIn &cp)
 
     UNSERIALIZE_SCALAR(cache_trace_file);
     UNSERIALIZE_SCALAR(cache_trace_size);
-    cache_trace_file = cp.getCptDir() + "/" + cache_trace_file;
 
+    fatal_if(block_size_bytes == 0 || !isPowerOf2(block_size_bytes),
+             "Invalid Ruby checkpoint cache-block size %llu",
+             static_cast<unsigned long long>(block_size_bytes));
+    fatal_if(cache_trace_file.empty() ||
+             cache_trace_file.find('/') != std::string::npos ||
+             cache_trace_file.find('\\') != std::string::npos,
+             "Invalid Ruby checkpoint cache-trace filename '%s'",
+             cache_trace_file);
+    fatal_if(block_size_bytes >
+             std::numeric_limits<uint64_t>::max() - sizeof(TraceRecord),
+             "Ruby checkpoint cache-block size is too large");
+    const uint64_t trace_record_size =
+        sizeof(TraceRecord) + block_size_bytes;
+    fatal_if(cache_trace_size % trace_record_size != 0,
+             "Ruby checkpoint cache-trace size %llu is not a multiple of "
+             "the %llu-byte record size",
+             static_cast<unsigned long long>(cache_trace_size),
+             static_cast<unsigned long long>(trace_record_size));
+
+    cache_trace_file = cp.getCptDir() + "/" + cache_trace_file;
+    if (!m_cache_trace_warmup) {
+        readExactCompressedTrace(cache_trace_file, nullptr, cache_trace_size);
+        DPRINTF(RubyCacheTrace,
+                "Validated %llu-byte cache trace; cache replay disabled\n",
+                static_cast<unsigned long long>(cache_trace_size));
+        inform("%s: Ruby cache-trace replay is disabled; restoring with "
+               "empty caches from authoritative backing memory.\n", name());
+        return;
+    }
+
+    uint8_t *uncompressed_trace = nullptr;
     readCompressedTrace(cache_trace_file, uncompressed_trace,
                         cache_trace_size);
     m_warmup_enabled = true;

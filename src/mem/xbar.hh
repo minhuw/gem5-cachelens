@@ -316,6 +316,13 @@ class BaseXBar : public ClockedObject
     /** the width of the xbar in bytes */
     const uint32_t width;
 
+    /**
+     * Return when a layer should be released if a retried source does not
+     * immediately resend its packet. Subclasses may use a clock-independent
+     * bookkeeping interval.
+     */
+    virtual Tick retryLayerReleaseTick() const { return clockEdge(); }
+
     AddrRangeMap<PortID, 3> portMap;
 
     /**
@@ -370,8 +377,10 @@ class BaseXBar : public ClockedObject
      *
      * @param pkt Packet to populate with timings
      * @param header_delay Header delay to be added
+     * @param timing_transparent Leave packet timing unchanged
      */
-    void calcPacketTiming(PacketPtr pkt, Tick header_delay);
+    void calcPacketTiming(PacketPtr pkt, Tick header_delay,
+                          bool timing_transparent = false);
 
     /**
      * Remember for each of the memory-side ports of the crossbar if we got

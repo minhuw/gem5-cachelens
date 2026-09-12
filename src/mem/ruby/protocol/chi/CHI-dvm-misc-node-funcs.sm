@@ -233,7 +233,9 @@ void initializeTBE(TBE tbe, Addr txnId, int storSlot) {
   // The MN uses the list of "upstream destinations"
   // as targets for snoops
   tbe.notSentTargets := allUpstreamDest();
+  tbe.pendingTargets := tbe.notSentTargets;
   tbe.pendingTargets.clear();
+  tbe.receivedTargets := tbe.notSentTargets;
   tbe.receivedTargets.clear();
 }
 

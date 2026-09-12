@@ -29,6 +29,8 @@
 
 #include "mem/ruby/system/CacheRecorder.hh"
 
+#include <unordered_set>
+
 #include "debug/RubyCacheTrace.hh"
 #include "mem/packet.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -84,29 +86,46 @@ CacheRecorder::~CacheRecorder()
 void
 CacheRecorder::enqueueNextFlushRequest()
 {
-    if (m_records_flushed < m_records.size()) {
+    // A protocol-level FlushReq is only implemented by a subset of Ruby
+    // protocols.  Checkpointing, however, only needs backing memory to hold
+    // every authoritative cache block before the memory image is serialized.
+    // Publish the newest valid record for each address through Ruby's
+    // functional path. This includes protocol states such as CHI Shared Dirty,
+    // which are exposed as read-only permissions even though memory is stale.
+    // Stable coherent copies contain identical data, so one record per address
+    // updates backing memory and all resident copies without protocol-specific
+    // flush transitions.
+    std::sort(m_records.begin(), m_records.end(), compareTraceRecords);
+    std::unordered_set<Addr> written_addresses;
+
+    while (m_records_flushed < m_records.size()) {
         TraceRecord* rec = m_records[m_records_flushed];
         m_records_flushed++;
+
+        if (!written_addresses.insert(rec->m_data_address).second) {
+            continue;
+        }
+
         auto req = std::make_shared<Request>(rec->m_data_address,
                                              m_block_size_bytes, 0,
                                              Request::funcRequestorId);
-        MemCmd::Command requestType = MemCmd::FlushReq;
-        Packet *pkt = new Packet(req, requestType);
-        pkt->req->setReqInstSeqNum(m_records_flushed);
+        Packet pkt(req, MemCmd::WriteReq);
+        pkt.dataStatic(rec->m_data);
+        pkt.req->setReqInstSeqNum(m_records_flushed);
 
-
-        RubyPort* m_ruby_port_ptr = m_ruby_port_map[rec->m_cntrl_id];
-        assert(m_ruby_port_ptr != NULL);
-        m_ruby_port_ptr->makeRequest(pkt);
-
-        DPRINTF(RubyCacheTrace, "Flushing %s\n", *rec);
-
-    } else {
-        if (m_records_flushed > 0) {
-            exitSimLoop("Finished Drain", 0);
-        }
-        DPRINTF(RubyCacheTrace, "Flushed all %d records\n", m_records_flushed);
+        RubyPort* ruby_port = m_ruby_port_map[rec->m_cntrl_id];
+        assert(ruby_port != nullptr);
+        panic_if(!ruby_port->functionalWriteToRubySystem(&pkt),
+                 "Ruby functional write failed while checkpointing %#x",
+                 rec->m_data_address);
+        DPRINTF(RubyCacheTrace, "Publishing dirty %s\n", *rec);
     }
+
+    if (m_records_flushed > 0) {
+        exitSimLoop("Finished Drain", 0);
+    }
+    DPRINTF(RubyCacheTrace, "Published %d cache records\n",
+            m_records_flushed);
 }
 
 void

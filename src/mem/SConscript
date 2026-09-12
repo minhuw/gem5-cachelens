@@ -110,6 +110,8 @@ GTest('backdoor_manager.test', 'backdoor_manager.test.cc',
       'backdoor_manager.cc', with_tag('gem5_trace'))
 GTest('translation_gen.test', 'translation_gen.test.cc')
 GTest('request.test', 'request.test.cc', '../sim/cur_tick.cc')
+GTest('xbar_timing.test', 'xbar_timing.test.cc', 'packet.cc',
+      '../sim/bufval.cc', '../sim/cur_tick.cc')
 
 Source('translating_port_proxy.cc')
 Source('se_translating_port_proxy.cc')
