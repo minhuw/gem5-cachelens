@@ -12,6 +12,80 @@
 namespace gem5
 {
 
+Pvrdma::TransportStats::TransportStats(Pvrdma &parent)
+    : statistics::Group(&parent, "transport"), device(parent),
+      ADD_STAT(txDataFramesAccepted, statistics::units::Count::get(),
+               "DATA frames accepted by the downstream Ethernet peer"),
+      ADD_STAT(txDataEncodedBytesAccepted, statistics::units::Byte::get(),
+               "Encoded DATA bytes accepted for Ethernet serialization"),
+      ADD_STAT(txDataPayloadBytesAccepted, statistics::units::Byte::get(),
+               "DATA payload bytes accepted, including retries"),
+      ADD_STAT(txNewDataSegmentsAccepted, statistics::units::Count::get(),
+               "First accepted transmissions of logical DATA segments"),
+      ADD_STAT(txNewDataPayloadBytesAccepted,
+               statistics::units::Byte::get(),
+               "Payload bytes in first accepted DATA transmissions"),
+      ADD_STAT(txRetransmittedSegmentsAccepted,
+               statistics::units::Count::get(),
+               "Accepted retransmissions of logical DATA segments"),
+      ADD_STAT(txRetransmittedPayloadBytesAccepted,
+               statistics::units::Byte::get(),
+               "Payload bytes in accepted retransmissions"),
+      ADD_STAT(txControlFramesAccepted, statistics::units::Count::get(),
+               "ACK, NAK, and RNR frames accepted downstream"),
+      ADD_STAT(txControlEncodedBytesAccepted,
+               statistics::units::Byte::get(),
+               "Encoded control bytes accepted for serialization"),
+      ADD_STAT(txDataSerializationTicks, statistics::units::Tick::get(),
+               "Observed downstream DATA serialization busy ticks"),
+      ADD_STAT(txControlSerializationTicks, statistics::units::Tick::get(),
+               "Observed downstream control serialization busy ticks"),
+      ADD_STAT(txSegmentsInFlight, statistics::units::Count::get(),
+               "Live unique sent DATA segments not cumulatively retired"),
+      ADD_STAT(txSegmentsInFlightAtReset, statistics::units::Count::get(),
+               "Live sent DATA segments at statistics reset"),
+      ADD_STAT(txSegmentsAcknowledged, statistics::units::Count::get(),
+               "Unique DATA segments cumulatively acknowledged"),
+      ADD_STAT(txSegmentsAbandoned, statistics::units::Count::get(),
+               "Unique in-flight DATA segments abandoned by terminal error"),
+      ADD_STAT(txMaxSegmentsInFlight, statistics::units::Count::get(),
+               "Maximum live unique DATA segments after reset"),
+      ADD_STAT(rxDataFramesReceived, statistics::units::Count::get(),
+               "Routed decoded DATA frames accepted by the device"),
+      ADD_STAT(rxDataEncodedBytesReceived, statistics::units::Byte::get(),
+               "Encoded bytes in accepted routed DATA frames"),
+      ADD_STAT(rxDataPayloadBytesReceived, statistics::units::Byte::get(),
+               "Payload bytes in accepted routed DATA frames"),
+      ADD_STAT(rxNewDataSegmentsCommitted, statistics::units::Count::get(),
+               "Unique in-order DATA segments committed by payload DMA"),
+      ADD_STAT(rxNewDataPayloadBytesCommitted,
+               statistics::units::Byte::get(),
+               "Unique in-order payload bytes committed by DMA"),
+      ADD_STAT(rxDuplicateDataFrames, statistics::units::Count::get(),
+               "Accepted DATA frames classified as duplicate or replay"),
+      ADD_STAT(rxOutOfOrderDataFrames, statistics::units::Count::get(),
+               "Accepted DATA frames classified as future sequence"),
+      ADD_STAT(rxQueuedSegments, statistics::units::Count::get(),
+               "Live DATA frames in the bounded receive backlog"),
+      ADD_STAT(rxQueuedSegmentsAtReset, statistics::units::Count::get(),
+               "Receive backlog at statistics reset"),
+      ADD_STAT(rxSegmentsEnqueued, statistics::units::Count::get(),
+               "DATA frames admitted to the receive backlog"),
+      ADD_STAT(rxSegmentsDequeued, statistics::units::Count::get(),
+               "DATA frames removed from the receive backlog"),
+      ADD_STAT(rxSegmentsDiscarded, statistics::units::Count::get(),
+               "Queued DATA frames discarded by reset or cleanup"),
+      ADD_STAT(rxMaxQueuedSegments, statistics::units::Count::get(),
+               "Maximum live receive backlog after reset")
+{}
+
+void
+Pvrdma::TransportStats::preDumpStats()
+{
+    statistics::Group::preDumpStats();
+    device.sampleTransportSerialization();
+}
+
 Pvrdma::QueueStats::QueueStats(Pvrdma &parent)
     : statistics::Group(&parent, "queues"), device(parent),
       ADD_STAT(sqDepth, statistics::units::Count::get(),
@@ -98,7 +172,8 @@ Pvrdma::Pvrdma(const Params &p)
     : PciDevice(p), interface(name() + ".interface", *this),
       companionMacWordSwap(p.companion_mac_word_swap),
       controlCompletionLatency(p.control_completion_latency),
-      queueStats(*this),
+      transportWindowSegments(p.transport_window_segments),
+      transportStats(*this), queueStats(*this),
       dsrReadEvent([this] { dsrReadDone(); }, name() + ".dsrRead"),
       capsWriteEvent([this] { capsWriteDone(); }, name() + ".capsWrite"),
       commandReadEvent([this] { commandReadDone(); }, name() + ".commandRead"),
@@ -119,11 +194,16 @@ Pvrdma::Pvrdma(const Params &p)
                   completionDmaDone();
           }, name() + ".completionDma"),
       transportEvent([this] { runTransport(); }, name() + ".transport"),
+      sendEvent([this] { runSend(); }, name() + ".send"),
       transportDmaEvent([this] { transportDmaDone(); },
                         name() + ".transportDma"),
       transportTimerEvent([this] { transportTimerExpired(); },
                           name() + ".transportTimer")
 {
+    fatal_if(!transportWindowSegments ||
+                 transportWindowSegments >= pvrdma::PsnHalfRange,
+             "PVRDMA transport_window_segments must be in [1, %u]",
+             pvrdma::PsnHalfRange - 1);
     const auto *mac = p.hardware_address.bytes();
     regs.macLow = static_cast<uint32_t>(mac[0]) |
                   (static_cast<uint32_t>(mac[1]) << 8) |
@@ -134,7 +214,11 @@ Pvrdma::Pvrdma(const Params &p)
     regs.reset();
     capabilities = pvrdma::makeCapabilities(regs.macLow, regs.macHigh);
     queueStatsReset();
-    statistics::registerResetCallback([this] { queueStatsReset(); });
+    transportStatsReset();
+    statistics::registerResetCallback([this] {
+        queueStatsReset();
+        transportStatsReset();
+    });
 }
 
 Port &
@@ -150,6 +234,7 @@ Pvrdma::startup()
 {
     PciDevice::startup();
     queueStatsReset();
+    transportStatsReset();
 }
 
 Tick
@@ -611,6 +696,89 @@ Pvrdma::queueStatsReset()
     sampleCurrentQueueOccupancy();
 }
 
+uint64_t
+Pvrdma::sendSegmentsInFlight() const
+{
+    uint64_t count = 0;
+    for (const auto &send : sendWqes)
+        count += send.sentSegments - send.ackedSegments;
+    if (transportWindowSegments == 1 &&
+        transport.kind == pvrdma::QueueKind::Sq &&
+        (transport.stage == TransportState::Stage::WaitResponse ||
+         transport.stage == TransportState::Stage::RetryWait ||
+         (transport.stage == TransportState::Stage::TryData &&
+          transport.retryPending)))
+        ++count;
+    return count;
+}
+
+size_t
+Pvrdma::receiveBacklog() const
+{
+    return (pendingRxPacket ? 1 : 0) + pendingRxPackets.size();
+}
+
+void
+Pvrdma::sampleTransportSerialization()
+{
+    if (txBusyClass == TxFrameClass::None)
+        return;
+    const Tick now = curTick();
+    const Tick elapsed = now - txBusyStart;
+    if (txBusyClass == TxFrameClass::Data)
+        transportStats.txDataSerializationTicks += elapsed;
+    else
+        transportStats.txControlSerializationTicks += elapsed;
+    txBusyStart = now;
+}
+
+void
+Pvrdma::transportStatsReset()
+{
+    const uint64_t in_flight = sendSegmentsInFlight();
+    const size_t backlog = receiveBacklog();
+    transportStats.txSegmentsInFlight = in_flight;
+    transportStats.txSegmentsInFlightAtReset = in_flight;
+    transportStats.txMaxSegmentsInFlight = in_flight;
+    transportStats.rxQueuedSegments = backlog;
+    transportStats.rxQueuedSegmentsAtReset = backlog;
+    transportStats.rxMaxQueuedSegments = backlog;
+    if (txBusyClass != TxFrameClass::None)
+        txBusyStart = curTick();
+}
+
+bool
+Pvrdma::queueReceivePacket(EthPacketPtr packet)
+{
+    if (!packet || receiveBacklog() >= transportWindowSegments)
+        return false;
+    if (!pendingRxPacket)
+        pendingRxPacket = std::move(packet);
+    else
+        pendingRxPackets.push_back(std::move(packet));
+    transportStats.rxSegmentsEnqueued++;
+    const uint64_t queued = receiveBacklog();
+    transportStats.rxQueuedSegments = queued;
+    if (queued > transportStats.rxMaxQueuedSegments.value())
+        transportStats.rxMaxQueuedSegments = queued;
+    return true;
+}
+
+EthPacketPtr
+Pvrdma::popReceivePacket()
+{
+    if (!pendingRxPacket)
+        return {};
+    EthPacketPtr packet = std::move(pendingRxPacket);
+    if (!pendingRxPackets.empty()) {
+        pendingRxPacket = std::move(pendingRxPackets.front());
+        pendingRxPackets.pop_front();
+    }
+    transportStats.rxSegmentsDequeued++;
+    transportStats.rxQueuedSegments = receiveBacklog();
+    return packet;
+}
+
 void
 Pvrdma::checkQueueConservation()
 {
@@ -818,8 +986,10 @@ bool
 Pvrdma::transportActive() const
 {
     return transport.active() || transportEvent.scheduled() ||
-        transportTimerEvent.scheduled() || transport.dmaBusy ||
-        pendingRxPacket || pendingErrorPacket;
+        sendEvent.scheduled() || transportTimerEvent.scheduled() ||
+        transport.dmaBusy || !sendWqes.empty() || sendPacket ||
+        txBusyClass != TxFrameClass::None || pendingRxPacket ||
+        !pendingRxPackets.empty() || pendingErrorPacket;
 }
 
 bool
@@ -839,7 +1009,8 @@ Pvrdma::terminalCompletionBackpressured() const
          transport.kind == pvrdma::QueueKind::Sq) &&
         transport.terminalQpError && transport.stage == stage &&
         transport.completionBackpressured && !completionBusy() &&
-        !transportDmaBusy() && !dmaPending();
+        !transportDmaBusy() && !dmaPending() &&
+        txBusyClass == TxFrameClass::None && !sendEvent.scheduled();
 }
 
 bool
@@ -955,12 +1126,174 @@ Pvrdma::receiveSegmentMatches(const pvrdma::rocev2::Packet &frame,
 }
 
 bool
+Pvrdma::handleSendResponse(const pvrdma::rocev2::Packet &frame,
+                           pvrdma::QueuePair &qp)
+{
+    using pvrdma::rocev2::Syndrome;
+    if (sendWqes.empty() || qp.qpHandle != sendQpHandle ||
+        !revalidateSendWqe(sendWqes.front()))
+        return true;
+    const uint64_t in_flight = sendSegmentsInFlight();
+    if (!in_flight)
+        return true;
+    const uint32_t distance = pvrdma::psnDistance(
+        qp.attributes.sendPsn, frame.psn);
+    if (distance >= pvrdma::PsnHalfRange)
+        return true;
+
+    const auto acknowledge = [&](uint64_t count) {
+        panic_if(count > sendSegmentsInFlight(),
+                 "PVRDMA acknowledged unsent pipeline segments");
+        uint64_t remaining = count;
+        for (auto &send : sendWqes) {
+            const uint64_t available = send.sentSegments -
+                send.ackedSegments;
+            const uint64_t accepted = std::min(remaining, available);
+            send.ackedSegments += accepted;
+            if (accepted)
+                send.lastAckMsn = frame.msn;
+            remaining -= accepted;
+            if (!remaining)
+                break;
+        }
+        qp.attributes.sendPsn = (qp.attributes.sendPsn + count) &
+            pvrdma::rocev2::Field24Mask;
+        transport.livePsn = qp.attributes.sendPsn;
+        transportStats.txSegmentsAcknowledged += count;
+        transportStats.txSegmentsInFlight = sendSegmentsInFlight();
+        if (sendRetryActive) {
+            const uint32_t retry_distance = pvrdma::psnDistance(
+                qp.attributes.sendPsn, sendRetryPsn);
+            if (retry_distance >= pvrdma::PsnHalfRange)
+                sendRetryPsn = qp.attributes.sendPsn;
+            if (!sendSegmentsInFlight())
+                sendRetryActive = false;
+        }
+    };
+    const auto begin_retry = [&](bool rnr, uint8_t timer) {
+        size_t wqe_index = 0;
+        uint16_t segment_index = 0;
+        if (!findSendSegment(qp.attributes.sendPsn, wqe_index,
+                             segment_index)) {
+            failSendPipeline(0,
+                pvrdma::CompletionStatus::GeneralError);
+            return;
+        }
+        auto &send = sendWqes[wqe_index];
+        uint8_t &remaining = rnr ? send.rnrRetryRemaining :
+                                  send.retryRemaining;
+        if (!pvrdma::useRetry(remaining)) {
+            failSendPipeline(wqe_index, rnr ?
+                pvrdma::CompletionStatus::RnrRetryExceededError :
+                pvrdma::CompletionStatus::RetryExceededError);
+            return;
+        }
+        cancelTransportTimer();
+        sendRetryPsn = qp.attributes.sendPsn;
+        sendRetryEndPsn = (qp.attributes.sendPsn +
+            sendSegmentsInFlight()) & pvrdma::rocev2::Field24Mask;
+        sendRetryActive = !rnr;
+        sendRnrWait = rnr;
+        if (rnr)
+            armTransportTimer(TransportTimerKind::Rnr, rnrDelay(timer));
+        else
+            scheduleSend();
+    };
+
+    // Continuations already on the wire can NAK after their first segment
+    // selected RNR backoff.  Only suppress responses for that same WQE;
+    // errors for a later WQE must remain actionable.
+    bool stale_rnr_response = false;
+    if (sendRnrWait &&
+        (frame.syndrome == Syndrome::Rnr ||
+         frame.syndrome == Syndrome::SequenceNak ||
+         frame.syndrome == Syndrome::InvalidRequestNak)) {
+        size_t retry_wqe = 0;
+        size_t response_wqe = 0;
+        uint16_t retry_segment = 0;
+        uint16_t response_segment = 0;
+        stale_rnr_response =
+            findSendSegment(sendRetryPsn, retry_wqe, retry_segment) &&
+            findSendSegment(frame.psn, response_wqe, response_segment) &&
+            retry_wqe == response_wqe;
+    }
+    if (stale_rnr_response)
+        return true;
+
+    if (frame.syndrome == Syndrome::Ack) {
+        if (distance >= in_flight) {
+            armSendAckTimer();
+            return true;
+        }
+        cancelTransportTimer();
+        sendRnrWait = false;
+        acknowledge(distance + 1);
+        if (sendSegmentsInFlight())
+            armSendAckTimer();
+    } else if (frame.syndrome == Syndrome::SequenceNak) {
+        cancelTransportTimer();
+        sendRnrWait = false;
+        if (distance > in_flight) {
+            // The deque front may already own a success retirement snapshot.
+            // Fail the first unacknowledged WQE, not that completed prefix.
+            size_t wqe_index = 0;
+            uint16_t segment_index = 0;
+            panic_if(!findSendSegment(qp.attributes.sendPsn, wqe_index,
+                                     segment_index),
+                     "PVRDMA live SEND PSN has no pipeline WQE");
+            failSendPipeline(wqe_index,
+                pvrdma::CompletionStatus::GeneralError);
+            return true;
+        }
+        if (distance)
+            acknowledge(distance);
+        if (distance < in_flight)
+            begin_retry(false, 0);
+    } else if (frame.syndrome == Syndrome::Rnr) {
+        if (distance >= in_flight) {
+            armSendAckTimer();
+            return true;
+        }
+        cancelTransportTimer();
+        if (distance)
+            acknowledge(distance);
+        begin_retry(true, frame.rnrTimer);
+    } else {
+        if (distance >= in_flight) {
+            armSendAckTimer();
+            return true;
+        }
+        cancelTransportTimer();
+        sendRnrWait = false;
+        if (distance)
+            acknowledge(distance);
+        size_t wqe_index = 0;
+        uint16_t segment_index = 0;
+        if (!findSendSegment(qp.attributes.sendPsn, wqe_index,
+                             segment_index)) {
+            failSendPipeline(0,
+                pvrdma::CompletionStatus::GeneralError);
+            return true;
+        }
+        const auto status = frame.syndrome == Syndrome::InvalidRequestNak ?
+            pvrdma::CompletionStatus::RemoteInvalidRequestError :
+            frame.syndrome == Syndrome::RemoteAccessNak ?
+                pvrdma::CompletionStatus::RemoteAccessError :
+                pvrdma::CompletionStatus::RemoteOperationError;
+        failSendPipeline(wqe_index, status);
+    }
+    scheduleTransport();
+    scheduleSend();
+    return true;
+}
+
+bool
 Pvrdma::recvTransportPacket(EthPacketPtr packet)
 {
     using namespace pvrdma::rocev2;
     if (!packet)
         return false;
-    if (packet->length > packet->bufLength || pendingRxPacket)
+    if (packet->length > packet->bufLength)
         return true;
     const auto decoded = decode({packet->data, packet->bufLength},
                                 packet->length);
@@ -991,17 +1324,9 @@ Pvrdma::recvTransportPacket(EthPacketPtr packet)
         return true;
     }
 
-    const bool receive_owns_state = transport.active() &&
-        transport.kind == pvrdma::QueueKind::Rq &&
-        transport.stage != TransportState::Stage::WaitReceiveData;
-    if (receive_owns_state) {
-        if (receiveSegmentMatches(frame, false) ||
-            receiveSegmentMatches(frame, true))
-            return true;
-        if (!pendingRxPacket)
-            pendingRxPacket = std::move(packet);
-        return true;
-    }
+    if (frame.opcode == Opcode::Acknowledge &&
+        transportWindowSegments > 1 && sendQpHandle == qp->qpHandle)
+        return handleSendResponse(frame, *qp);
 
     if (frame.opcode == Opcode::Acknowledge) {
         if (!transport.active() || transport.kind != pvrdma::QueueKind::Sq ||
@@ -1025,6 +1350,8 @@ Pvrdma::recvTransportPacket(EthPacketPtr packet)
         transport.retryPending = false;
         transport.packet.reset();
         const auto accept_current = [&] {
+            transportStats.txSegmentsAcknowledged++;
+            transportStats.txSegmentsInFlight = 0;
             qp->attributes.sendPsn = pvrdma::advancePsn(
                 qp->attributes.sendPsn);
             transport.livePsn = qp->attributes.sendPsn;
@@ -1085,18 +1412,45 @@ Pvrdma::recvTransportPacket(EthPacketPtr packet)
         return true;
     }
 
-    if (transport.active() && transport.kind == pvrdma::QueueKind::Rq)
+    const size_t encoded_length = packet->simLength;
+    const auto record_data = [&] {
+        transportStats.rxDataFramesReceived++;
+        transportStats.rxDataEncodedBytesReceived += encoded_length;
+        transportStats.rxDataPayloadBytesReceived += frame.payload.size;
+    };
+    if (transport.active() && transport.kind == pvrdma::QueueKind::Rq &&
+        transport.stage == TransportState::Stage::WaitReceiveData) {
+        record_data();
         return handleInboundContinuation(frame);
+    }
+    if (transport.active() && transport.kind == pvrdma::QueueKind::Rq) {
+        if (receiveSegmentMatches(frame, false) ||
+            receiveSegmentMatches(frame, true)) {
+            record_data();
+            transportStats.rxDuplicateDataFrames++;
+            return true;
+        }
+        if (!queueReceivePacket(std::move(packet)))
+            return false;
+        record_data();
+        scheduleTransport();
+        return true;
+    }
     if (transport.active()) {
+        record_data();
         queueReverseError(frame, Syndrome::InvalidRequestNak, frame.psn);
         scheduleTransport();
         return true;
     }
     if (replayFinal(frame)) {
+        record_data();
+        transportStats.rxDuplicateDataFrames++;
         scheduleTransport();
         return true;
     }
-    pendingRxPacket = std::move(packet);
+    if (!queueReceivePacket(std::move(packet)))
+        return false;
+    record_data();
     scheduleTransport();
     return true;
 }
@@ -1115,9 +1469,12 @@ Pvrdma::handleInboundContinuation(const pvrdma::rocev2::Packet &frame)
         return true;
     }
     if (transport.stage == TransportState::Stage::WriteRqPayload &&
-        receiveSegmentMatches(frame, false))
+        receiveSegmentMatches(frame, false)) {
+        transportStats.rxDuplicateDataFrames++;
         return true;
+    }
     if (receiveSegmentMatches(frame, true)) {
+        transportStats.rxDuplicateDataFrames++;
         if (transport.stage == TransportState::Stage::WaitReceiveData) {
             transport.responseMsn = queuePairs.entries[
                 transport.qpHandle].responderMsn;
@@ -1129,12 +1486,14 @@ Pvrdma::handleInboundContinuation(const pvrdma::rocev2::Packet &frame)
     if (frame.psn != transport.livePsn) {
         const uint32_t distance = pvrdma::psnDistance(
             transport.livePsn, frame.psn);
-        if (distance < (uint32_t{1} << 23)) {
+        if (distance < pvrdma::PsnHalfRange) {
+            transportStats.rxOutOfOrderDataFrames++;
             transport.keepAfterControl = true;
             prepareControl(Syndrome::SequenceNak, transport.livePsn);
         } else {
-            failReceive(pvrdma::CompletionStatus::LocalQpOperationError,
-                        true, Syndrome::InvalidRequestNak);
+            transportStats.rxDuplicateDataFrames++;
+            transport.keepAfterControl = true;
+            prepareControl(Syndrome::SequenceNak, transport.livePsn);
         }
         return true;
     }
@@ -1210,9 +1569,225 @@ Pvrdma::replayFinal(const pvrdma::rocev2::Packet &frame)
     return true;
 }
 
+bool
+Pvrdma::sendAccepted(EthPacketPtr packet, TxFrameClass frame_class,
+                     size_t payload_bytes, bool retry)
+{
+    if (!packet || txBusyClass != TxFrameClass::None)
+        return false;
+    txBusyClass = frame_class;
+    txBusyStart = curTick();
+    if (!interface.sendPacket(packet)) {
+        txBusyClass = TxFrameClass::None;
+        return false;
+    }
+    if (frame_class == TxFrameClass::Data) {
+        transportStats.txDataFramesAccepted++;
+        transportStats.txDataEncodedBytesAccepted += packet->simLength;
+        transportStats.txDataPayloadBytesAccepted += payload_bytes;
+        if (retry) {
+            transportStats.txRetransmittedSegmentsAccepted++;
+            transportStats.txRetransmittedPayloadBytesAccepted +=
+                payload_bytes;
+        } else {
+            transportStats.txNewDataSegmentsAccepted++;
+            transportStats.txNewDataPayloadBytesAccepted += payload_bytes;
+        }
+    } else {
+        transportStats.txControlFramesAccepted++;
+        transportStats.txControlEncodedBytesAccepted += packet->simLength;
+    }
+    return true;
+}
+
 void
 Pvrdma::transportSendDone()
 {
+    if (txBusyClass != TxFrameClass::None) {
+        sampleTransportSerialization();
+        txBusyClass = TxFrameClass::None;
+    }
+    scheduleSend();
+    scheduleTransport();
+}
+
+bool
+Pvrdma::revalidateSendWqe(const SendWqeState &send) const
+{
+    if (controlState != pvrdma::ControlState::Active ||
+        !send.qpHandle || send.qpHandle >= pvrdma::ObjectTableEntries ||
+        !send.leaseHeld)
+        return false;
+    const auto &qp = queuePairs.entries[send.qpHandle];
+    if (!qp.valid || qp.qpHandle != send.qpHandle ||
+        qp.generation != send.qpGeneration ||
+        qp.state != pvrdma::QpState::ReadyToSend ||
+        qp.qpn != send.localQpn ||
+        qp.attributes.destinationQpNumber != send.remoteQpn ||
+        qp.sendCqHandle != send.cqHandle || storedMac(qp) != send.remoteMac)
+        return false;
+    pvrdma::rocev2::Gid local_gid{}, remote_gid{};
+    if (!routeGids(qp, gids, gidValid, send.localMac,
+                   local_gid, remote_gid) || local_gid != send.localGid ||
+        remote_gid != send.remoteGid)
+        return false;
+    const auto &lease = send.lease;
+    if (!lease.slot || lease.slot >= pvrdma::ObjectTableEntries)
+        return false;
+    const auto &mr = memoryRegions.entries[lease.slot];
+    return mr.valid && mr.generation == lease.generation &&
+        mr.mrHandle == send.wqe.lkey && mr.lkey == send.wqe.lkey &&
+        mr.pdHandle == qp.pdHandle && mr.activeReferences;
+}
+
+bool
+Pvrdma::findSendSegment(uint32_t psn, size_t &wqe_index,
+                        uint16_t &segment_index) const
+{
+    for (size_t i = 0; i < sendWqes.size(); ++i) {
+        const auto &send = sendWqes[i];
+        const uint32_t distance = pvrdma::psnDistance(send.initialPsn, psn);
+        if (distance < send.sentSegments) {
+            wqe_index = i;
+            segment_index = distance;
+            return true;
+        }
+    }
+    return false;
+}
+
+void
+Pvrdma::scheduleSend()
+{
+    if (transportPaused || controlState != pvrdma::ControlState::Active ||
+        txBusyClass != TxFrameClass::None || sendRnrWait ||
+        sendEvent.scheduled() || sendWqes.empty() ||
+        (sendPipelineFailed && !sendRetryActive))
+        return;
+    if (sendPacket || sendRetryActive ||
+        sendSegmentsInFlight() < transportWindowSegments)
+        schedule(sendEvent, nextCycle());
+}
+
+void
+Pvrdma::runSend()
+{
+    using namespace pvrdma::rocev2;
+    if (transportPaused || controlState != pvrdma::ControlState::Active ||
+        txBusyClass != TxFrameClass::None || sendRnrWait ||
+        sendWqes.empty() || (sendPipelineFailed && !sendRetryActive))
+        return;
+
+    if (!sendPacket) {
+        size_t wqe_index = 0;
+        uint16_t segment_index = 0;
+        bool retry = sendRetryActive;
+        if (retry) {
+            if (sendRetryPsn == sendRetryEndPsn) {
+                sendRetryActive = false;
+                armSendAckTimer();
+                retry = false;
+            } else if (!findSendSegment(sendRetryPsn, wqe_index,
+                                        segment_index)) {
+                failSendPipeline(0,
+                    pvrdma::CompletionStatus::GeneralError);
+                return;
+            }
+        }
+        if (!retry) {
+            if (sendSegmentsInFlight() >= transportWindowSegments)
+                return;
+            const auto entry = std::find_if(
+                sendWqes.begin(), sendWqes.end(), [](const auto &send) {
+                    return !send.terminalQpError &&
+                        send.sentSegments < send.segmentCount;
+                });
+            if (entry == sendWqes.end()) {
+                scheduleTransport();
+                return;
+            }
+            wqe_index = std::distance(sendWqes.begin(), entry);
+            segment_index = entry->sentSegments;
+        }
+
+        auto &send = sendWqes[wqe_index];
+        if (!revalidateSendWqe(send)) {
+            failSendPipeline(wqe_index,
+                pvrdma::CompletionStatus::GeneralError);
+            return;
+        }
+        const size_t offset = size_t{segment_index} * pvrdma::FixedMtu;
+        const size_t length = send.wqe.length == 0 ? 0 :
+            std::min<size_t>(pvrdma::FixedMtu,
+                             send.wqe.length - offset);
+        pvrdma::rocev2::Packet frame;
+        frame.destinationMac = send.remoteMac;
+        frame.sourceMac = send.localMac;
+        frame.destinationGid = send.remoteGid;
+        frame.sourceGid = send.localGid;
+        frame.opcode = pvrdma::sendOpcode(segment_index,
+                                           send.segmentCount);
+        frame.ackRequest = true;
+        frame.destinationQpn = send.remoteQpn;
+        frame.psn = (send.initialPsn + segment_index) &
+            pvrdma::rocev2::Field24Mask;
+        const auto &route = queuePairs.entries[
+            send.qpHandle].attributes.addressHandle.globalRoute;
+        frame.trafficClass = route.trafficClass;
+        frame.flowLabel = route.flowLabel;
+        frame.hopLimit = route.hopLimit ? route.hopLimit : 0xff;
+        frame.sourcePort = udpSourcePort(frame.flowLabel, send.localQpn,
+                                         send.remoteQpn);
+        frame.payload = {length ? send.payload.data() + offset : nullptr,
+                         length};
+        const size_t size = encodedSize(frame);
+        sendPacket = std::make_shared<EthPacketData>(size);
+        const auto encoded = encode(
+            frame, {sendPacket->data, sendPacket->bufLength});
+        if (!encoded) {
+            sendPacket.reset();
+            failSendPipeline(wqe_index,
+                pvrdma::CompletionStatus::GeneralError);
+            return;
+        }
+        sendPacket->length = sendPacket->simLength = encoded.size;
+        sendPacketPsn = frame.psn;
+        sendPacketWqeIndex = wqe_index;
+        sendPacketSegmentIndex = segment_index;
+        sendPacketPayloadBytes = length;
+        sendPacketRetry = retry;
+    }
+
+    if (!interface.getPeer()) {
+        sendPacket.reset();
+        failSendPipeline(sendPacketWqeIndex,
+            pvrdma::CompletionStatus::GeneralError);
+        return;
+    }
+    if (!sendAccepted(sendPacket, TxFrameClass::Data,
+                      sendPacketPayloadBytes, sendPacketRetry))
+        return;
+
+    auto &send = sendWqes[sendPacketWqeIndex];
+    const uint64_t before = sendSegmentsInFlight();
+    if (sendPacketRetry) {
+        sendRetryPsn = pvrdma::advancePsn(sendRetryPsn);
+        if (sendRetryPsn == sendRetryEndPsn) {
+            sendRetryActive = false;
+            armSendAckTimer();
+        }
+    } else {
+        panic_if(send.sentSegments != sendPacketSegmentIndex,
+                 "PVRDMA sent a DATA segment out of WQE order");
+        ++send.sentSegments;
+        const uint64_t current = before + 1;
+        transportStats.txSegmentsInFlight = current;
+        if (current > transportStats.txMaxSegmentsInFlight.value())
+            transportStats.txMaxSegmentsInFlight = current;
+        if (!before)
+            armSendAckTimer();
+    }
+    sendPacket.reset();
     scheduleTransport();
 }
 
@@ -1231,10 +1806,267 @@ Pvrdma::scheduleTransport()
 }
 
 bool
+Pvrdma::startSendLoad()
+{
+    if (transportWindowSegments == 1 ||
+        transport.kind != pvrdma::QueueKind::Sq || transport.sendLoading ||
+        sendPipelineFailed || sendWqes.size() >= 2 ||
+        !transport.qpHandle ||
+        transport.qpHandle >= pvrdma::ObjectTableEntries)
+        return false;
+    auto &qp = queuePairs.entries[transport.qpHandle];
+    uint32_t &consumer = sqFetchHead[transport.qpHandle];
+    if (consumer == qp.sqProducerTail)
+        return false;
+
+    SendWqeState send;
+    send.qpHandle = transport.qpHandle;
+    send.qpGeneration = transport.qpGeneration;
+    send.cqHandle = transport.cqHandle;
+    send.cqGeneration = transport.cqGeneration;
+    send.consumer = consumer;
+    send.nextConsumer = pvrdma::ringAdvance(
+        consumer, qp.capabilities.maxSendWr);
+    send.consumerLe = htole(send.nextConsumer);
+    send.localMac = transport.localMac;
+    send.remoteMac = transport.remoteMac;
+    send.localGid = transport.localGid;
+    send.remoteGid = transport.remoteGid;
+    send.localQpn = transport.localQpn;
+    send.remoteQpn = transport.remoteQpn;
+    send.retryRemaining = qp.attributes.retryCount;
+    send.rnrRetryRemaining = qp.attributes.rnrRetry;
+    if (!pvrdma::wqeAddress(qp, pvrdma::QueueKind::Sq, consumer,
+                            send.wqeAddress)) {
+        consumer = send.nextConsumer;
+        sendWqes.push_back(std::move(send));
+        failSendPipeline(sendWqes.size() - 1,
+            pvrdma::CompletionStatus::GeneralError);
+        return true;
+    }
+    consumer = send.nextConsumer;
+    sendWqes.push_back(std::move(send));
+    transport.sendLoading = true;
+    transport.stage = TransportState::Stage::ReadSqWqe;
+    auto &loading = sendWqes.back();
+    startTransportDma(false, loading.wqeAddress, loading.sqSlot.size(),
+                      loading.sqSlot.data());
+    return true;
+}
+
+void
+Pvrdma::finishSendLoad(pvrdma::CompletionStatus status)
+{
+    transport.sendLoading = false;
+    if (status != pvrdma::CompletionStatus::Success) {
+        failSendPipeline(sendWqes.empty() ? 0 : sendWqes.size() - 1,
+                         status);
+        return;
+    }
+    transport.stage = TransportState::Stage::TryData;
+    scheduleSend();
+    scheduleTransport();
+}
+
+void
+Pvrdma::startSendRetirement()
+{
+    if (sendWqes.empty() || !sendWqes.front().readyToRetire())
+        return;
+    auto &send = sendWqes.front();
+    transport.kind = pvrdma::QueueKind::Sq;
+    transport.qpHandle = send.qpHandle;
+    transport.qpGeneration = send.qpGeneration;
+    transport.cqHandle = send.cqHandle;
+    transport.cqGeneration = send.cqGeneration;
+    transport.consumer = send.consumer;
+    transport.nextConsumer = send.nextConsumer;
+    transport.consumerLe = send.consumerLe;
+    transport.wqe = send.wqe;
+    transport.lease = send.lease;
+    transport.leaseHeld = send.leaseHeld;
+    transport.localMac = send.localMac;
+    transport.remoteMac = send.remoteMac;
+    transport.localGid = send.localGid;
+    transport.remoteGid = send.remoteGid;
+    transport.localQpn = send.localQpn;
+    transport.remoteQpn = send.remoteQpn;
+    transport.initialPsn = send.initialPsn;
+    transport.segmentCount = send.segmentCount;
+    transport.segmentIndex = send.ackedSegments;
+    transport.livePsn = queuePairs.entries[
+        send.qpHandle].attributes.sendPsn;
+    transport.retryRemaining = send.retryRemaining;
+    transport.rnrRetryRemaining = send.rnrRetryRemaining;
+    transport.lastAckMsn = send.lastAckMsn;
+    transport.status = send.status;
+    transport.terminalQpError = send.terminalQpError;
+    transport.stage = (send.wqe.signaled || send.terminalQpError) ?
+        TransportState::Stage::WaitSendCq :
+        TransportState::Stage::WriteSqConsumer;
+    if (transport.stage == TransportState::Stage::WaitSendCq)
+        submitTransportCompletion();
+    else
+        publishConsumer(pvrdma::QueueKind::Sq);
+}
+
+void
+Pvrdma::failSendPipeline(size_t wqe_index,
+                         pvrdma::CompletionStatus status)
+{
+    if (sendWqes.empty()) {
+        transport.reset();
+        sendQpHandle = 0;
+        return;
+    }
+    wqe_index = std::min(wqe_index, sendWqes.size() - 1);
+    // A suffix failure does not own the accepted prefix's retry timer.
+    uint64_t prefix_in_flight = 0;
+    for (size_t i = 0; i < wqe_index; ++i)
+        prefix_in_flight += sendWqes[i].sentSegments -
+            sendWqes[i].ackedSegments;
+    if (prefix_in_flight) {
+        const auto &qp = queuePairs.entries[sendQpHandle];
+        sendRetryEndPsn = (qp.attributes.sendPsn + prefix_in_flight) &
+            pvrdma::rocev2::Field24Mask;
+        if (sendRetryActive && pvrdma::psnDistance(
+                qp.attributes.sendPsn, sendRetryPsn) >= prefix_in_flight)
+            sendRetryPsn = qp.attributes.sendPsn;
+        sendRetryActive &= sendRetryPsn != sendRetryEndPsn;
+    } else {
+        cancelTransportTimer();
+        sendRetryActive = false;
+        sendRnrWait = false;
+    }
+    sendPipelineFailed = true;
+    sendPacket.reset();
+    auto &failed = sendWqes[wqe_index];
+    failed.status = status;
+    failed.terminalQpError = true;
+    const bool loading_later = transport.sendLoading &&
+        wqe_index + 1 < sendWqes.size();
+    const bool retiring = !transport.sendLoading && !sendWqes.empty() &&
+        transport.kind == pvrdma::QueueKind::Sq &&
+        transport.consumer == sendWqes.front().consumer &&
+        (transport.stage == TransportState::Stage::WaitSendCq ||
+         transport.stage == TransportState::Stage::WriteSqConsumer);
+    sendAbortLoading |= loading_later;
+    uint64_t abandoned = 0;
+    for (size_t i = wqe_index; i < sendWqes.size(); ++i)
+        abandoned += sendWqes[i].sentSegments -
+            sendWqes[i].ackedSegments;
+    transportStats.txSegmentsAbandoned += abandoned;
+    transportStats.txSegmentsInFlight =
+        sendSegmentsInFlight() - abandoned;
+    failed.sentSegments = failed.ackedSegments;
+    if (!loading_later) {
+        while (sendWqes.size() > wqe_index + 1) {
+            auto &send = sendWqes.back();
+            if (send.leaseHeld) {
+                panic_if(!pvrdma::releaseMr(memoryRegions, send.lease),
+                         "PVRDMA failed pipeline lost a later MR lease");
+            }
+            sendWqes.pop_back();
+        }
+    }
+    // Active loading and retirement callbacks still own transport's DMA
+    // identity and backing storage until their callback completes.
+    if (!transport.sendLoading && !retiring)
+        transport.reset();
+    if (prefix_in_flight && !sendRnrWait && !sendRetryActive &&
+        !transportTimerEvent.scheduled())
+        armSendAckTimer();
+    scheduleTransport();
+}
+
+void
+Pvrdma::armSendAckTimer()
+{
+    if (sendRnrWait || sendRetryActive || !sendSegmentsInFlight() ||
+        !sendQpHandle)
+        return;
+    const auto &qp = queuePairs.entries[sendQpHandle];
+    const Tick delay = ackDelay(qp.attributes.timeout);
+    if (delay)
+        armTransportTimer(TransportTimerKind::Ack, delay);
+}
+
+bool
 Pvrdma::selectSend()
 {
-    // ponytail: one device-wide flight; add per-QP scheduling only when
-    // concurrent transport is required.
+    // ponytail: one device-wide QP flight; the window pipelines WQEs only
+    // within that selected QP.
+    if (transportWindowSegments > 1) {
+        uint32_t handle = sendQpHandle;
+        if (!handle) {
+            const uint32_t first = observationCursor %
+                pvrdma::ObjectTableEntries;
+            for (uint32_t i = 0; i < pvrdma::ObjectTableEntries; ++i) {
+                const uint32_t candidate = (first + i) %
+                    pvrdma::ObjectTableEntries;
+                if (!candidate)
+                    continue;
+                const auto &qp = queuePairs.entries[candidate];
+                if (qp.valid && qp.state == pvrdma::QpState::ReadyToSend &&
+                    qp.sqProducerTail != qp.sqConsumerHead) {
+                    handle = sendQpHandle = candidate;
+                    sqFetchHead[handle] = qp.sqConsumerHead;
+                    sendNextPsn = qp.attributes.sendPsn;
+                    observationCursor = (handle + 1) %
+                        pvrdma::ObjectTableEntries;
+                    break;
+                }
+            }
+        }
+        if (!handle)
+            return false;
+        auto &qp = queuePairs.entries[handle];
+        if (!qp.valid || qp.state != pvrdma::QpState::ReadyToSend ||
+            qp.qpHandle != handle) {
+            if (!sendWqes.empty())
+                failSendPipeline(0,
+                    pvrdma::CompletionStatus::GeneralError);
+            return false;
+        }
+        transport.reset();
+        transport.kind = pvrdma::QueueKind::Sq;
+        transport.qpHandle = handle;
+        transport.qpGeneration = qp.generation;
+        transport.cqHandle = qp.sendCqHandle;
+        transport.cqGeneration = completionQueues.entries[
+            qp.sendCqHandle].generation;
+        transport.localMac = pvrdma::transportMac(
+            regs, companionMacWordSwap);
+        transport.remoteMac = storedMac(qp);
+        transport.localQpn = qp.qpn;
+        transport.remoteQpn = qp.attributes.destinationQpNumber;
+        transport.livePsn = qp.attributes.sendPsn;
+        if (!routeGids(qp, gids, gidValid, transport.localMac,
+                       transport.localGid, transport.remoteGid) ||
+            !pvrdma::validQpn(transport.localQpn) ||
+            !pvrdma::validQpn(transport.remoteQpn)) {
+            SendWqeState failed;
+            failed.qpHandle = handle;
+            failed.qpGeneration = qp.generation;
+            failed.cqHandle = qp.sendCqHandle;
+            failed.cqGeneration = transport.cqGeneration;
+            failed.consumer = sqFetchHead[handle];
+            failed.nextConsumer = pvrdma::ringAdvance(
+                failed.consumer, qp.capabilities.maxSendWr);
+            failed.wqe.kind = pvrdma::QueueKind::Sq;
+            sendWqes.push_back(std::move(failed));
+            sqFetchHead[handle] = sendWqes.back().nextConsumer;
+            transport.reset();
+            failSendPipeline(sendWqes.size() - 1,
+                pvrdma::CompletionStatus::GeneralError);
+            return true;
+        }
+        if (startSendLoad())
+            return true;
+        transport.reset();
+        return false;
+    }
+
     const uint32_t first = observationCursor % pvrdma::ObjectTableEntries;
     for (uint32_t i = 0; i < pvrdma::ObjectTableEntries; ++i) {
         const uint32_t handle = (first + i) % pvrdma::ObjectTableEntries;
@@ -1335,13 +2167,14 @@ Pvrdma::startInbound()
     using namespace pvrdma::rocev2;
     if (!pendingRxPacket || transport.active())
         return;
-    const EthPacketPtr packet = std::move(pendingRxPacket);
+    const EthPacketPtr packet = popReceivePacket();
     const auto decoded = decode({packet->data, packet->bufLength},
                                 packet->length);
     if (!decoded || decoded.packet.opcode == Opcode::Acknowledge)
         return;
     const auto &frame = decoded.packet;
     if (replayFinal(frame)) {
+        transportStats.rxDuplicateDataFrames++;
         scheduleTransport();
         return;
     }
@@ -1365,9 +2198,11 @@ Pvrdma::startInbound()
     if (frame.psn != qp->attributes.receivePsn) {
         const uint32_t distance = pvrdma::psnDistance(
             qp->attributes.receivePsn, frame.psn);
-        queueReverseError(frame, distance < (uint32_t{1} << 23) ?
-                               Syndrome::SequenceNak :
-                               Syndrome::InvalidRequestNak,
+        if (distance < pvrdma::PsnHalfRange)
+            transportStats.rxOutOfOrderDataFrames++;
+        else
+            transportStats.rxDuplicateDataFrames++;
+        queueReverseError(frame, Syndrome::SequenceNak,
                           qp->attributes.receivePsn);
         scheduleTransport();
         return;
@@ -1395,7 +2230,7 @@ Pvrdma::startInbound()
     transport.remoteGid = remote_gid;
     transport.localQpn = qp->qpn;
     transport.remoteQpn = qp->attributes.destinationQpNumber;
-    transport.psn = frame.psn;
+    transport.psn = transport.initialPsn = frame.psn;
     transport.livePsn = qp->attributes.receivePsn;
     transport.opcode = frame.opcode;
     transport.totalLength = frame.payload.size;
@@ -1474,6 +2309,10 @@ Pvrdma::startPayloadDma(bool write)
 void
 Pvrdma::failSend(pvrdma::CompletionStatus status, bool qp_error)
 {
+    if (transportWindowSegments == 1 && sendSegmentsInFlight()) {
+        transportStats.txSegmentsAbandoned++;
+        transportStats.txSegmentsInFlight = 0;
+    }
     cancelTransportTimer();
     transport.status = status;
     transport.packet.reset();
@@ -1636,10 +2475,24 @@ Pvrdma::tryTransportPacket()
         scheduleTransport();
         return false;
     }
-    if (!interface.sendPacket(transport.packet))
+    const size_t payload_bytes = data && transport.totalLength ?
+        std::min<size_t>(pvrdma::FixedMtu,
+            transport.totalLength - size_t{transport.segmentIndex} *
+                pvrdma::FixedMtu) : 0;
+    const bool retry = transport.retryPending;
+    if (!sendAccepted(transport.packet,
+                      data ? TxFrameClass::Data : TxFrameClass::Control,
+                      payload_bytes, retry))
         return false;
     transport.packet.reset();
     if (data) {
+        if (!retry) {
+            transportStats.txSegmentsInFlight++;
+            if (transportStats.txSegmentsInFlight.value() >
+                transportStats.txMaxSegmentsInFlight.value())
+                transportStats.txMaxSegmentsInFlight =
+                    transportStats.txSegmentsInFlight.value();
+        }
         transport.retryPending = false;
         transport.stage = TransportState::Stage::WaitResponse;
         const auto &qp = queuePairs.entries[transport.qpHandle];
@@ -1763,7 +2616,9 @@ Pvrdma::publishConsumer(pvrdma::QueueKind kind)
 void
 Pvrdma::finishTransport(bool release_lease)
 {
-    cancelTransportTimer();
+    if (!(transportWindowSegments > 1 && sendQpHandle &&
+          (sendRnrWait || sendRetryActive || sendSegmentsInFlight())))
+        cancelTransportTimer();
     if (release_lease && transport.leaseHeld) {
         if (!pvrdma::releaseMr(memoryRegions, transport.lease))
             operationError.set(regs.error, pvrdma::CommandError);
@@ -1780,15 +2635,49 @@ Pvrdma::finishTransport(bool release_lease)
 }
 
 void
+Pvrdma::clearSendPipeline(bool count_discarded)
+{
+    if (sendEvent.scheduled())
+        deschedule(sendEvent);
+    if (count_discarded) {
+        const uint64_t abandoned = sendSegmentsInFlight();
+        transportStats.txSegmentsAbandoned += abandoned;
+        transportStats.txSegmentsInFlight = 0;
+    }
+    for (auto &send : sendWqes) {
+        if (send.leaseHeld) {
+            panic_if(!pvrdma::releaseMr(memoryRegions, send.lease),
+                     "PVRDMA cleanup lost an MR lease");
+        }
+    }
+    sendWqes.clear();
+    sqFetchHead = {};
+    sendQpHandle = 0;
+    sendNextPsn = sendRetryPsn = sendRetryEndPsn = 0;
+    sendRetryActive = sendRnrWait = sendPipelineFailed = false;
+    sendAbortLoading = false;
+    sendPacket.reset();
+}
+
+void
 Pvrdma::clearTransport()
 {
     if (transportEvent.scheduled())
         deschedule(transportEvent);
     cancelTransportTimer();
-    panic_if(transport.dmaBusy || transport.leaseHeld,
-             "PVRDMA cleared active transport resources");
+    panic_if(transport.dmaBusy,
+             "PVRDMA cleared an active transport DMA");
+    if (transportWindowSegments > 1)
+        clearSendPipeline();
+    else
+        panic_if(transport.leaseHeld,
+                 "PVRDMA cleared active transport resources");
     transport.reset();
+    const uint64_t discarded = receiveBacklog();
+    transportStats.rxSegmentsDiscarded += discarded;
+    transportStats.rxQueuedSegments = 0;
     pendingRxPacket.reset();
+    pendingRxPackets.clear();
     pendingErrorPacket.reset();
 }
 
@@ -1813,6 +2702,35 @@ Pvrdma::transportTimerExpired()
 {
     const auto kind = transportTimerKind;
     transportTimerKind = TransportTimerKind::None;
+    if (transportWindowSegments > 1 && sendQpHandle) {
+        auto &qp = queuePairs.entries[sendQpHandle];
+        if (kind == TransportTimerKind::Rnr && sendRnrWait) {
+            sendRnrWait = false;
+            sendRetryActive = sendRetryPsn != sendRetryEndPsn;
+            scheduleSend();
+        } else if (kind == TransportTimerKind::Ack &&
+                   sendSegmentsInFlight()) {
+            size_t wqe_index = 0;
+            uint16_t segment_index = 0;
+            if (!findSendSegment(qp.attributes.sendPsn, wqe_index,
+                                 segment_index)) {
+                failSendPipeline(0,
+                    pvrdma::CompletionStatus::GeneralError);
+            } else if (!pvrdma::useRetry(
+                           sendWqes[wqe_index].retryRemaining)) {
+                failSendPipeline(wqe_index,
+                    pvrdma::CompletionStatus::RetryExceededError);
+            } else {
+                sendRetryPsn = qp.attributes.sendPsn;
+                sendRetryEndPsn = (qp.attributes.sendPsn +
+                    sendSegmentsInFlight()) &
+                    pvrdma::rocev2::Field24Mask;
+                sendRetryActive = true;
+                scheduleSend();
+            }
+        }
+        return;
+    }
     if (!transport.active())
         return;
     if (transport.kind == pvrdma::QueueKind::Rq) {
@@ -1857,10 +2775,35 @@ Pvrdma::runTransport()
                     queueDma.active(), completionBusy(), transportActive(),
                     runnableSq(), activeMr()))
                 signalDrainDone();
-        } else if (interface.sendPacket(pendingErrorPacket)) {
+        } else if (sendAccepted(pendingErrorPacket,
+                                TxFrameClass::Control)) {
             pendingErrorPacket.reset();
         }
         return;
+    }
+    if (transportWindowSegments > 1 && sendQpHandle) {
+        const bool retiring = !transport.sendLoading && !sendWqes.empty() &&
+            transport.kind == pvrdma::QueueKind::Sq &&
+            transport.consumer == sendWqes.front().consumer &&
+            (transport.stage == TransportState::Stage::WaitSendCq ||
+             transport.stage == TransportState::Stage::WriteSqConsumer);
+        if (!retiring) {
+            if (!sendWqes.empty() && sendWqes.front().readyToRetire()) {
+                startSendRetirement();
+                return;
+            }
+            scheduleSend();
+            if (!transport.sendLoading && !sendPipelineFailed &&
+                sendWqes.size() < 2 &&
+                (txBusyClass != TxFrameClass::None ||
+                 !sendEvent.scheduled())) {
+                if (transport.kind == pvrdma::QueueKind::Sq)
+                    startSendLoad();
+                else
+                    selectSend();
+            }
+            return;
+        }
     }
     if (!transport.active()) {
         if (pendingRxPacket)
@@ -1871,8 +2814,11 @@ Pvrdma::runTransport()
     }
     if (pendingRxPacket && transport.kind == pvrdma::QueueKind::Rq &&
         transport.stage == TransportState::Stage::WaitReceiveData) {
-        auto packet = std::move(pendingRxPacket);
-        recvTransportPacket(std::move(packet));
+        const auto packet = popReceivePacket();
+        const auto decoded = pvrdma::rocev2::decode(
+            {packet->data, packet->bufLength}, packet->length);
+        if (decoded)
+            handleInboundContinuation(decoded.packet);
         return;
     }
 
@@ -1911,6 +2857,92 @@ Pvrdma::transportDmaDone()
     panic_if(!transport.dmaBusy, "Unexpected PVRDMA transport DMA callback");
     transport.dmaBusy = false;
     using Stage = TransportState::Stage;
+    if (transportWindowSegments > 1 && sendQpHandle &&
+        transport.kind == pvrdma::QueueKind::Sq && transport.sendLoading) {
+        panic_if(sendWqes.empty(),
+                 "PVRDMA pipeline DMA completed without a WQE");
+        auto &send = sendWqes.back();
+        if (sendAbortLoading) {
+            if (send.leaseHeld) {
+                panic_if(!pvrdma::releaseMr(memoryRegions, send.lease),
+                         "PVRDMA aborted load lost its MR lease");
+            }
+            sendWqes.pop_back();
+            sendAbortLoading = false;
+            transport.reset();
+            scheduleTransport();
+            return;
+        }
+        auto &qp = queuePairs.entries[send.qpHandle];
+        if (transport.stage == Stage::ReadSqWqe) {
+            pvrdma::SendWqeHeader header{};
+            std::memcpy(&header, send.sqSlot.data(), sizeof(header));
+            send.wqe.workRequestId = letoh(header.workRequestId);
+            if (!qp.valid || qp.qpHandle != send.qpHandle ||
+                qp.generation != send.qpGeneration ||
+                qp.state != pvrdma::QpState::ReadyToSend ||
+                qp.sendCqHandle != send.cqHandle ||
+                !pvrdma::decodeSqWqe(qp, send.sqSlot, send.wqe) ||
+                !pvrdma::segmentGeometry(send.wqe.length,
+                                         send.segmentCount) ||
+                !pvrdma::acquireLocalMr(
+                    memoryRegions, qp, pvrdma::QueueKind::Sq,
+                    send.wqe.lkey, send.wqe.address, send.wqe.length,
+                    send.lease)) {
+                finishSendLoad(pvrdma::CompletionStatus::GeneralError);
+                return;
+            }
+            send.leaseHeld = true;
+            send.initialPsn = sendNextPsn;
+            sendNextPsn = (sendNextPsn + send.segmentCount) &
+                pvrdma::rocev2::Field24Mask;
+            send.payload.resize(send.wqe.length);
+            if (!send.wqe.length) {
+                finishSendLoad();
+                return;
+            }
+            if (!pvrdma::leaseRange(send.lease, 0, send.wqe.length,
+                                    send.chunkIndex, send.chunkOffset)) {
+                finishSendLoad(pvrdma::CompletionStatus::GeneralError);
+                return;
+            }
+            send.dmaPayloadOffset = 0;
+            send.dmaRemaining = send.wqe.length;
+        } else if (transport.stage == Stage::ReadSqPayload) {
+            if (!revalidateSendWqe(send)) {
+                finishSendLoad(pvrdma::CompletionStatus::GeneralError);
+                return;
+            }
+            send.dmaPayloadOffset += send.dmaChunkLength;
+            send.dmaRemaining -= send.dmaChunkLength;
+            send.chunkOffset += send.dmaChunkLength;
+            if (send.chunkOffset ==
+                send.lease.chunks[send.chunkIndex].length) {
+                ++send.chunkIndex;
+                send.chunkOffset = 0;
+            }
+            if (!send.dmaRemaining) {
+                finishSendLoad();
+                return;
+            }
+        } else {
+            panic("Invalid PVRDMA pipeline DMA stage");
+        }
+        if (!revalidateSendWqe(send) ||
+            send.chunkIndex >= send.lease.chunks.size()) {
+            finishSendLoad(pvrdma::CompletionStatus::GeneralError);
+            return;
+        }
+        const auto &chunk = send.lease.chunks[send.chunkIndex];
+        send.dmaChunkLength = std::min(
+            send.dmaRemaining, chunk.length - send.chunkOffset);
+        transport.stage = Stage::ReadSqPayload;
+        startTransportDma(false, chunk.address + send.chunkOffset,
+                          send.dmaChunkLength,
+                          send.payload.data() + send.dmaPayloadOffset,
+                          pvrdma::payloadDmaFlags(false));
+        return;
+    }
     const auto receive_segment_done = [this] {
         auto &qp = queuePairs.entries[transport.qpHandle];
         qp.attributes.receivePsn = pvrdma::advancePsn(
@@ -1920,6 +2952,9 @@ Pvrdma::transportDmaDone()
         transport.acceptedOpcode = transport.opcode;
         transport.acceptedSegmentLength = transport.totalLength -
             size_t{transport.segmentIndex} * pvrdma::FixedMtu;
+        transportStats.rxNewDataSegmentsCommitted++;
+        transportStats.rxNewDataPayloadBytesCommitted +=
+            transport.acceptedSegmentLength;
         transport.acceptedSegmentIndex = transport.segmentIndex;
         transport.hasAcceptedSegment = true;
         if (pvrdma::finalOpcode(transport.opcode)) {
@@ -2060,7 +3095,24 @@ Pvrdma::transportDmaDone()
         refreshQueueGauges();
         sampleCurrentQueueOccupancy();
         checkQueueConservation();
+        const bool pipeline = transportWindowSegments > 1 &&
+            sendQpHandle == transport.qpHandle && !sendWqes.empty() &&
+            sendWqes.front().nextConsumer == transport.consumer;
+        const bool terminal = transport.terminalQpError;
         finishTransport();
+        if (pipeline) {
+            sendWqes.pop_front();
+            if (terminal) {
+                sendPipelineFailed = false;
+                sendQpHandle = 0;
+            } else if (sendWqes.empty() &&
+                       sqFetchHead[qp.qpHandle] == qp.sqProducerTail) {
+                sendQpHandle = 0;
+                sendNextPsn = qp.attributes.sendPsn;
+            }
+            scheduleSend();
+            scheduleTransport();
+        }
         return;
       }
       case Stage::WriteRqConsumer: {
@@ -2372,6 +3424,9 @@ Pvrdma::writeControl(uint32_t value)
             panic_if(!pvrdma::releaseMr(memoryRegions, transport.lease),
                      "PVRDMA terminal reset lost its MR lease");
             transport.leaseHeld = false;
+            if (transportWindowSegments > 1 && !sendWqes.empty() &&
+                sendWqes.front().consumer == transport.consumer)
+                sendWqes.front().leaseHeld = false;
         }
         resetDevice();
         return;

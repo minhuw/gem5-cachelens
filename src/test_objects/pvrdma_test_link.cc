@@ -74,6 +74,12 @@ PvrdmaTestLink::delayOnce(const FrameId &id, Tick delay)
 }
 
 void
+PvrdmaTestLink::delayCompletionOnce(const FrameId &id, Tick delay)
+{
+    addRule(id, Action::DelayCompletion, delay);
+}
+
+void
 PvrdmaTestLink::holdOnce(const FrameId &id)
 {
     addRule(id, Action::Hold);
@@ -96,6 +102,16 @@ PvrdmaTestLink::releaseAt(const FrameId &id, Tick when)
         return false;
     queueDelivery(std::move(entry->delivery), when);
     held.erase(entry);
+    return true;
+}
+
+bool
+PvrdmaTestLink::inject(Direction direction, EthPacketPtr packet, Tick delay)
+{
+    if (!packet)
+        return false;
+    queueDelivery({direction == Direction::Int0ToInt1 ? 1 : 0, packet},
+                  curTick() + std::max<Tick>(delay, 1));
     return true;
 }
 
@@ -142,13 +158,18 @@ PvrdmaTestLink::receive(int source, EthPacketPtr packet)
             if (action == Action::Duplicate)
                 queueDelivery({1 - source, packet}, when);
         }
+        completions.emplace(curTick() +
+            (action == Action::DelayCompletion ?
+                 std::max<Tick>(delay, 1) : 1), source);
     } else {
         queueDelivery({1 - source, packet}, curTick() + 1);
+        completions.emplace(curTick() + 1, source);
     }
 
-    completions.push_back(source);
     if (!completionEvent.scheduled())
-        schedule(completionEvent, curTick() + 1);
+        schedule(completionEvent, completions.begin()->first);
+    else if (completions.begin()->first < completionEvent.when())
+        reschedule(completionEvent, completions.begin()->first);
     return true;
 }
 
@@ -183,14 +204,13 @@ PvrdmaTestLink::processDeliveries()
 void
 PvrdmaTestLink::processCompletions()
 {
-    const size_t count = completions.size();
-    for (size_t i = 0; i < count; ++i) {
-        const int source = completions.front();
-        completions.pop_front();
-        interfaces[source]->completeSender();
+    while (!completions.empty() && completions.begin()->first <= curTick()) {
+        const auto completion = completions.begin();
+        interfaces[completion->second]->completeSender();
+        completions.erase(completion);
     }
     if (!completions.empty() && !completionEvent.scheduled())
-        schedule(completionEvent, curTick() + 1);
+        schedule(completionEvent, completions.begin()->first);
     checkDrain();
 }
 

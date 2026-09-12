@@ -126,6 +126,11 @@ class PvrdmaTester : public Platform
         SemanticRnrVerify,
         SemanticShortPost,
         SemanticShortVerify,
+        PipelineSample,
+        PipelineVerify,
+        TransportStatsReset,
+        TransportStatsDump,
+        TransportStatsVerify,
         ReliabilityPostSq,
         ReliabilityVerify,
         ReliabilityRnrPostRq,
@@ -158,6 +163,10 @@ class PvrdmaTester : public Platform
         TerminalPartial,
         TerminalBackpressured,
         TerminalVerify,
+        ReviewWait,
+        ReviewInject,
+        ReviewRnrStale,
+        ReviewVerify,
     };
 
     TestPort port;
@@ -180,6 +189,10 @@ class PvrdmaTester : public Platform
     size_t reliabilityCase = 0;
     uint64_t reliabilityRxDmasBefore = 0;
     uint32_t busyPolls = 0;
+    Tick pipelineStart = 0;
+    Tick transportStatsResetTick = 0;
+    bool sawMultipleWqes = false;
+    bool sawCrossWqeFlight = false;
     bool sawCqPublishPollRace = false;
     std::unique_ptr<ProbeListenerArgFunc<probing::PacketInfo>>
         senderDmaListener;
@@ -250,11 +263,19 @@ class PvrdmaTester : public Platform
                            uint32_t send_psn, uint32_t receive_psn);
     void setupPair();
     void setupReliabilityPair();
+    bool sendAwaitingAck(uint16_t acknowledged, uint16_t segments,
+                         uint8_t retries) const;
+    void holdContinuation(uint32_t initial_psn);
+    void releaseContinuation(uint32_t initial_psn);
     void postReliabilityReceive(uint32_t length);
     void postReliabilitySend(uint32_t length);
+    void postReviewPair(uint32_t secondLength, uint32_t secondLkey = 1);
+    void postPipelineWorkload(uint32_t messages, uint32_t length);
     void testInboundFrames();
     void runPair();
     void runSemanticPair();
+    void runPipelinePair();
+    void runTransportStatsBoundaryPair();
     void runRequestObservationPair();
     void observeDmaRequest(const probing::PacketInfo &packet, bool receiver);
     void runReliabilityPair();
@@ -268,6 +289,9 @@ class PvrdmaTester : public Platform
     void runReliabilityPrecommitAbortPair();
     void runReliabilityCommitPair();
     void runReliabilityCommitBoundaryPair();
+    void runTransportReviewInterleaving();
+    void runTransportReviewPrefix();
+    void runTransportReviewRnr();
     void runTerminalBackpressurePair();
     void testCheckpointTerminalDrainRestore();
     void runSqTerminalBackpressure();

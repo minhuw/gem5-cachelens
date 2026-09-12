@@ -68,6 +68,66 @@ for mode in ("semantic-pair", "timing-semantic-pair"):
     )
 
 
+for name, window in (("reference", 1), ("window64", 64)):
+    gem5_verify_config(
+        name=f"pvrdma-pipeline-throughput-{name}",
+        fixtures=(),
+        verifiers=(
+            verifier.MatchRegex(re.compile("PVRDMA_PIPELINE_THROUGHPUT_OK")),
+        ),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=(
+            "--mode",
+            "pipeline-throughput-pair",
+            "--transport-window-segments",
+            str(window),
+        ),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
+
+
+for name, mode, marker in (
+    ("transport-window64", "transport-pair", "PVRDMA_TRANSPORT_PAIR_OK"),
+    (
+        "timing-transport-window64",
+        "timing-transport-pair",
+        "PVRDMA_TRANSPORT_PAIR_OK",
+    ),
+    ("semantic-window64", "semantic-pair", "PVRDMA_SEMANTIC_PAIR_OK"),
+    (
+        "timing-semantic-window64",
+        "timing-semantic-pair",
+        "PVRDMA_SEMANTIC_PAIR_OK",
+    ),
+    (
+        "stats-boundary-window64",
+        "transport-stats-boundary-pair",
+        "PVRDMA_TRANSPORT_STATS_BOUNDARY_OK",
+    ),
+):
+    gem5_verify_config(
+        name=f"pvrdma-{name}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(marker)),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=(
+            "--mode",
+            mode,
+            "--transport-window-segments",
+            "64",
+        ),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
+
+
 gem5_verify_config(
     name="pvrdma-request-observation-pair",
     fixtures=(),
@@ -129,18 +189,53 @@ for name, marker in (
 ):
     for prefix in ("", "timing-"):
         mode = f"{prefix}{name}"
-        gem5_verify_config(
-            name=f"pvrdma-{mode}",
-            fixtures=(),
-            verifiers=(verifier.MatchRegex(re.compile(marker)),),
-            config=joinpath(
-                absdirpath(__file__), "configs", "pvrdma_runtime.py"
-            ),
-            config_args=("--mode", mode),
-            valid_isas=(constants.x86_tag,),
-            valid_hosts=constants.supported_hosts,
-            length=constants.quick_tag,
-        )
+        for window in (1, 64):
+            suffix = "" if window == 1 else "-window64"
+            gem5_verify_config(
+                name=f"pvrdma-{mode}{suffix}",
+                fixtures=(),
+                verifiers=(verifier.MatchRegex(re.compile(marker)),),
+                config=joinpath(
+                    absdirpath(__file__), "configs", "pvrdma_runtime.py"
+                ),
+                config_args=(
+                    "--mode", mode, "--transport-window-segments", str(window)
+                ),
+                valid_isas=(constants.x86_tag,),
+                valid_hosts=constants.supported_hosts,
+                length=constants.quick_tag,
+            )
+
+
+for mode in (
+    "timing-transport-review-load-sequence-pair",
+    "timing-transport-review-load-rnr-pair",
+    "timing-transport-review-load-terminal-pair",
+    "timing-transport-review-retire-sequence-pair",
+    "timing-transport-review-retire-future-cq-pair",
+    "timing-transport-review-retire-future-consumer-pair",
+    "timing-transport-review-retire-rnr-pair",
+    "timing-transport-review-retire-terminal-pair",
+    "timing-transport-review-prefix-invalid-lkey-pair",
+    "timing-transport-review-rnr-delayed-pair",
+    "timing-transport-review-rnr-zero-pair",
+):
+    gem5_verify_config(
+        name=f"pvrdma-{mode}-window64",
+        fixtures=(),
+        verifiers=(
+            verifier.MatchRegex(re.compile("PVRDMA_TRANSPORT_REVIEW_OK")),
+        ),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=(
+            "--mode", mode, "--transport-window-segments", "64"
+        ),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
 
 
 for action, mode in (
@@ -263,6 +358,8 @@ def pvrdma_checkpoint_test(host):
                     else f"checkpoint-{phase}",
                     "--checkpoint",
                     checkpoint.as_posix(),
+                    "--transport-window-segments",
+                    "64",
                 ],
                 cwd=config.base_dir,
                 stdout=subprocess.PIPE,
@@ -304,6 +401,8 @@ def pvrdma_observation_checkpoint_test(host):
                     f"checkpoint-observation-{phase}",
                     "--checkpoint",
                     checkpoint.as_posix(),
+                    "--transport-window-segments",
+                    "64",
                 ],
                 cwd=config.base_dir,
                 stdout=subprocess.PIPE,
@@ -422,6 +521,43 @@ def pvrdma_terminal_drain_checkpoint_test(host, queue=""):
     )
 
 
+def pvrdma_transport_window_bounds_test(host):
+    def run_test(params):
+        tempdir = Path(params.fixtures[constants.tempdir_fixture_name].path)
+        gem5 = params.fixtures[constants.gem5_binary_fixture_name].path
+        config_path = joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        )
+        for value in (0, 1 << 23):
+            result = subprocess.run(
+                [
+                    gem5,
+                    "-d",
+                    (tempdir / f"window-{value}").as_posix(),
+                    config_path,
+                    "--mode",
+                    "stats-reset",
+                    "--transport-window-segments",
+                    str(value),
+                ],
+                cwd=config.base_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            print(result.stdout)
+            assert result.returncode != 0
+            assert "transport_window_segments must be in" in result.stdout
+
+    name = f"pvrdma-transport-window-bounds-{host}-opt"
+    TestSuite(
+        name=name,
+        fixtures=[Gem5Fixture("x86", "opt"), TempdirFixture()],
+        tags=["X86", "opt", constants.quick_tag, host],
+        tests=[TestFunction(run_test, name=name)],
+    )
+
+
 def pvrdma_polling_only_source_test(_):
     root = Path(config.base_dir)
     implementation = "\n".join(
@@ -452,6 +588,7 @@ for host in constants.supported_hosts:
         tags=["ALL", constants.quick_tag, host],
         tests=[TestFunction(pvrdma_polling_only_source_test, name=name)],
     )
+    pvrdma_transport_window_bounds_test(host)
     pvrdma_checkpoint_test(host)
     pvrdma_observation_checkpoint_test(host)
     pvrdma_completion_checkpoint_test(host)

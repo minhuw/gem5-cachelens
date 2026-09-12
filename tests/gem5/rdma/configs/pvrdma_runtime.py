@@ -34,6 +34,8 @@ parser.add_argument(
         "semantic-pair",
         "timing-semantic-pair",
         "request-observation-pair",
+        "pipeline-throughput-pair",
+        "transport-stats-boundary-pair",
         "reliability-pair",
         "timing-reliability-pair",
         "reliability-rnr-pair",
@@ -53,6 +55,17 @@ parser.add_argument(
         "timing-reliability-precommit-abort-pair",
         "timing-reliability-commit-pair",
         "timing-reliability-commit-boundary-pair",
+        "timing-transport-review-load-sequence-pair",
+        "timing-transport-review-load-rnr-pair",
+        "timing-transport-review-load-terminal-pair",
+        "timing-transport-review-retire-sequence-pair",
+        "timing-transport-review-retire-future-cq-pair",
+        "timing-transport-review-retire-future-consumer-pair",
+        "timing-transport-review-retire-rnr-pair",
+        "timing-transport-review-retire-terminal-pair",
+        "timing-transport-review-prefix-invalid-lkey-pair",
+        "timing-transport-review-rnr-delayed-pair",
+        "timing-transport-review-rnr-zero-pair",
         "terminal-reset-timeout-pair",
         "timing-terminal-reset-timeout-pair",
         "terminal-reset-overflow-pair",
@@ -80,6 +93,7 @@ parser.add_argument(
     required=True,
 )
 parser.add_argument("--checkpoint", type=Path)
+parser.add_argument("--transport-window-segments", type=int, default=1)
 args = parser.parse_args()
 if args.mode.startswith("checkpoint-") and args.checkpoint is None:
     parser.error("checkpoint modes require --checkpoint")
@@ -109,12 +123,19 @@ system.rdma = Pvrdma(
     InterruptLine=18,
     InterruptPin=2,
     hardware_address="02:00:00:00:00:01",
+    transport_window_segments=args.transport_window_segments,
 )
 if (
     args.mode.endswith("transport-pair")
     or args.mode.endswith("semantic-pair")
-    or args.mode == "request-observation-pair"
+    or args.mode
+    in (
+        "request-observation-pair",
+        "pipeline-throughput-pair",
+        "transport-stats-boundary-pair",
+    )
     or "reliability" in args.mode
+    or "transport-review-" in args.mode
     or ("terminal-" in args.mode and "sq-terminal" not in args.mode)
 ):
     system.peer_rdma = Pvrdma(
@@ -125,11 +146,22 @@ if (
         InterruptLine=19,
         InterruptPin=2,
         hardware_address="02:00:00:00:00:02",
+        transport_window_segments=args.transport_window_segments,
     )
     system.rdma_link = (
         PvrdmaTestLink()
-        if "reliability" in args.mode
-        else EtherLink(speed="10Gbps", delay="10ns", delay_var="0ns")
+        if "reliability" in args.mode or "transport-review-" in args.mode
+        else EtherLink(
+            speed="1Gbps"
+            if args.mode
+            in ("pipeline-throughput-pair", "transport-stats-boundary-pair")
+            else "10Gbps",
+            delay="200us"
+            if args.mode
+            in ("pipeline-throughput-pair", "transport-stats-boundary-pair")
+            else "10ns",
+            delay_var="0ns",
+        )
     )
     system.rdma.interface = system.rdma_link.int0
     system.peer_rdma.interface = system.rdma_link.int1
@@ -172,6 +204,14 @@ elif args.mode in ("semantic-pair", "timing-semantic-pair"):
 elif args.mode == "request-observation-pair":
     assert exit_event.getCause() == "PVRDMA request observation test passed"
     print("PVRDMA_REQUEST_OBSERVATION_OK")
+elif args.mode == "pipeline-throughput-pair":
+    assert exit_event.getCause() == "PVRDMA pipeline throughput test passed"
+    print("PVRDMA_PIPELINE_THROUGHPUT_OK")
+elif args.mode == "transport-stats-boundary-pair":
+    assert exit_event.getCause() == (
+        "PVRDMA transport stats boundary test passed"
+    )
+    print("PVRDMA_TRANSPORT_STATS_BOUNDARY_OK")
 elif args.mode in ("reliability-pair", "timing-reliability-pair"):
     assert exit_event.getCause() == "PVRDMA reliability pair test passed"
     print("PVRDMA_RELIABILITY_PAIR_OK")
@@ -236,6 +276,9 @@ elif args.mode == "timing-reliability-commit-boundary-pair":
         "PVRDMA reliability receive commit-boundary test passed"
     )
     print("PVRDMA_RELIABILITY_COMMIT_BOUNDARY_PAIR_OK")
+elif "transport-review-" in args.mode:
+    assert exit_event.getCause() == "PVRDMA transport review test passed"
+    print("PVRDMA_TRANSPORT_REVIEW_OK")
 elif args.mode == "sq-terminal-reset-no-peer":
     assert exit_event.getCause() == "PVRDMA SQ terminal reset test passed"
     print("PVRDMA_SQ_TERMINAL_RESET_OK")

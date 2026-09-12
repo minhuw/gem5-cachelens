@@ -37,3 +37,6 @@ class Pvrdma(PciDevice):
     control_completion_latency = Param.Latency(
         "10us", "Conservative DSR and command PIO completion latency"
     )
+    transport_window_segments = Param.Unsigned(
+        64, "Maximum unacknowledged SEND segments"
+    )

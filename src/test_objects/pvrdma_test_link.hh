@@ -4,7 +4,6 @@
 #define __TEST_OBJECTS_PVRDMA_TEST_LINK_HH__
 
 #include <cstdint>
-#include <deque>
 #include <list>
 #include <map>
 
@@ -44,9 +43,11 @@ class PvrdmaTestLink : public SimObject
     void dropOnce(const FrameId &id);
     void duplicateOnce(const FrameId &id);
     void delayOnce(const FrameId &id, Tick delay);
+    void delayCompletionOnce(const FrameId &id, Tick delay);
     void holdOnce(const FrameId &id);
     bool release(const FrameId &id);
     bool releaseAt(const FrameId &id, Tick when);
+    bool inject(Direction direction, EthPacketPtr packet, Tick delay = 1);
 
     size_t heldPackets() const { return held.size(); }
     size_t pendingRules() const { return rules.size(); }
@@ -76,6 +77,7 @@ class PvrdmaTestLink : public SimObject
         Drop,
         Duplicate,
         Delay,
+        DelayCompletion,
         Hold,
     };
 
@@ -104,7 +106,7 @@ class PvrdmaTestLink : public SimObject
     // split it per direction only if high-volume fault scripts need it.
     std::list<Held> held;
     std::multimap<Tick, Delivery> deliveries;
-    std::deque<int> completions;
+    std::multimap<Tick, int> completions;
     EventFunctionWrapper deliveryEvent;
     EventFunctionWrapper completionEvent;
 

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <vector>
@@ -53,6 +54,7 @@ inline constexpr uint32_t FixedMtu = 1024;
 inline constexpr uint32_t MaxMessageSegments =
     std::numeric_limits<uint16_t>::max();
 inline constexpr uint32_t MaxMessageSize = MaxMessageSegments * FixedMtu;
+inline constexpr uint32_t PsnHalfRange = uint32_t{1} << 23;
 inline constexpr std::array<uint32_t, 32> RnrTimerMicros = {
     655360, 10, 20, 30, 40, 60, 80, 120,
     160, 240, 320, 480, 640, 960, 1280, 1920,
@@ -2870,6 +2872,7 @@ class Pvrdma : public PciDevice
         bool keepAfterControl = false;
         bool terminalQpError = false;
         bool retryPending = false;
+        bool sendLoading = false;
         bool rqWqeSelected = false;
         bool hasAcceptedSegment = false;
         size_t chunkIndex = 0;
@@ -2912,7 +2915,78 @@ class Pvrdma : public PciDevice
         void reset() { *this = {}; }
     } transport;
 
+    struct SendWqeState
+    {
+        uint32_t qpHandle = 0;
+        uint32_t qpGeneration = 0;
+        uint32_t cqHandle = 0;
+        uint32_t cqGeneration = 0;
+        uint32_t consumer = 0;
+        uint32_t nextConsumer = 0;
+        uint32_t consumerLe = 0;
+        uint64_t wqeAddress = 0;
+        std::array<uint8_t, pvrdma::SqStride> sqSlot{};
+        pvrdma::PreparedWqe wqe{};
+        pvrdma::MemoryRegionLease lease{};
+        bool leaseHeld = false;
+        size_t chunkIndex = 0;
+        size_t chunkOffset = 0;
+        size_t dmaPayloadOffset = 0;
+        size_t dmaRemaining = 0;
+        size_t dmaChunkLength = 0;
+        std::vector<uint8_t> payload;
+        pvrdma::rocev2::MacAddress localMac{};
+        pvrdma::rocev2::MacAddress remoteMac{};
+        pvrdma::rocev2::Gid localGid{};
+        pvrdma::rocev2::Gid remoteGid{};
+        uint32_t localQpn = 0;
+        uint32_t remoteQpn = 0;
+        uint32_t initialPsn = 0;
+        uint16_t segmentCount = 0;
+        uint16_t sentSegments = 0;
+        uint16_t ackedSegments = 0;
+        uint8_t retryRemaining = 0;
+        uint8_t rnrRetryRemaining = 0;
+        uint32_t lastAckMsn = 0;
+        pvrdma::CompletionStatus status =
+            pvrdma::CompletionStatus::Success;
+        bool terminalQpError = false;
+
+        bool readyToRetire() const
+        {
+            return terminalQpError ||
+                (segmentCount && ackedSegments == segmentCount);
+        }
+    };
+
+    std::deque<SendWqeState> sendWqes;
+    std::array<uint32_t, pvrdma::ObjectTableEntries> sqFetchHead{};
+    uint32_t sendQpHandle = 0;
+    uint32_t sendNextPsn = 0;
+    uint32_t sendRetryPsn = 0;
+    uint32_t sendRetryEndPsn = 0;
+    bool sendRetryActive = false;
+    bool sendRnrWait = false;
+    bool sendPipelineFailed = false;
+    bool sendAbortLoading = false;
+    EthPacketPtr sendPacket;
+    uint32_t sendPacketPsn = 0;
+    size_t sendPacketWqeIndex = 0;
+    uint16_t sendPacketSegmentIndex = 0;
+    size_t sendPacketPayloadBytes = 0;
+    bool sendPacketRetry = false;
+
+    enum class TxFrameClass : uint8_t
+    {
+        None,
+        Data,
+        Control,
+    };
+    TxFrameClass txBusyClass = TxFrameClass::None;
+    Tick txBusyStart = 0;
+
     EthPacketPtr pendingRxPacket;
+    std::deque<EthPacketPtr> pendingRxPackets;
     EthPacketPtr pendingErrorPacket;
     bool transportPaused = false;
     uint64_t receivePayloadDmaStarts = 0;
@@ -2924,6 +2998,45 @@ class Pvrdma : public PciDevice
         ReceiveIdle,
     };
     TransportTimerKind transportTimerKind = TransportTimerKind::None;
+
+    const uint32_t transportWindowSegments;
+
+    struct TransportStats : public statistics::Group
+    {
+        TransportStats(Pvrdma &parent);
+        void preDumpStats() override;
+
+        Pvrdma &device;
+        statistics::Scalar txDataFramesAccepted;
+        statistics::Scalar txDataEncodedBytesAccepted;
+        statistics::Scalar txDataPayloadBytesAccepted;
+        statistics::Scalar txNewDataSegmentsAccepted;
+        statistics::Scalar txNewDataPayloadBytesAccepted;
+        statistics::Scalar txRetransmittedSegmentsAccepted;
+        statistics::Scalar txRetransmittedPayloadBytesAccepted;
+        statistics::Scalar txControlFramesAccepted;
+        statistics::Scalar txControlEncodedBytesAccepted;
+        statistics::Scalar txDataSerializationTicks;
+        statistics::Scalar txControlSerializationTicks;
+        statistics::Scalar txSegmentsInFlight;
+        statistics::Scalar txSegmentsInFlightAtReset;
+        statistics::Scalar txSegmentsAcknowledged;
+        statistics::Scalar txSegmentsAbandoned;
+        statistics::Scalar txMaxSegmentsInFlight;
+        statistics::Scalar rxDataFramesReceived;
+        statistics::Scalar rxDataEncodedBytesReceived;
+        statistics::Scalar rxDataPayloadBytesReceived;
+        statistics::Scalar rxNewDataSegmentsCommitted;
+        statistics::Scalar rxNewDataPayloadBytesCommitted;
+        statistics::Scalar rxDuplicateDataFrames;
+        statistics::Scalar rxOutOfOrderDataFrames;
+        statistics::Scalar rxQueuedSegments;
+        statistics::Scalar rxQueuedSegmentsAtReset;
+        statistics::Scalar rxSegmentsEnqueued;
+        statistics::Scalar rxSegmentsDequeued;
+        statistics::Scalar rxSegmentsDiscarded;
+        statistics::Scalar rxMaxQueuedSegments;
+    } transportStats;
 
     struct QueueStats : public statistics::Group
     {
@@ -2982,6 +3095,7 @@ class Pvrdma : public PciDevice
     EventFunctionWrapper queueDmaEvent;
     EventFunctionWrapper completionDmaEvent;
     EventFunctionWrapper transportEvent;
+    EventFunctionWrapper sendEvent;
     EventFunctionWrapper transportDmaEvent;
     EventFunctionWrapper transportTimerEvent;
 
@@ -3005,6 +3119,27 @@ class Pvrdma : public PciDevice
 
     bool transportActive() const;
     bool transportDmaBusy() const;
+    uint64_t sendSegmentsInFlight() const;
+    size_t receiveBacklog() const;
+    void sampleTransportSerialization();
+    void transportStatsReset();
+    bool queueReceivePacket(EthPacketPtr packet);
+    EthPacketPtr popReceivePacket();
+    bool revalidateSendWqe(const SendWqeState &send) const;
+    bool findSendSegment(uint32_t psn, size_t &wqe_index,
+                         uint16_t &segment_index) const;
+    void scheduleSend();
+    void runSend();
+    bool startSendLoad();
+    void finishSendLoad(pvrdma::CompletionStatus status =
+                            pvrdma::CompletionStatus::Success);
+    void startSendRetirement();
+    void failSendPipeline(size_t wqeIndex, pvrdma::CompletionStatus status);
+    void armSendAckTimer();
+    bool handleSendResponse(const pvrdma::rocev2::Packet &frame,
+                            pvrdma::QueuePair &qp);
+    bool sendAccepted(EthPacketPtr packet, TxFrameClass frameClass,
+                      size_t payloadBytes = 0, bool retry = false);
     bool terminalCompletionBackpressured() const;
     bool runnableSq() const;
     bool activeMr() const;
@@ -3042,6 +3177,7 @@ class Pvrdma : public PciDevice
     void publishConsumer(pvrdma::QueueKind kind);
     void finishTransport(bool releaseLease = true);
     void clearTransport();
+    void clearSendPipeline(bool countDiscarded = true);
     void armTransportTimer(TransportTimerKind kind, Tick delay);
     void cancelTransportTimer();
     void transportTimerExpired();
