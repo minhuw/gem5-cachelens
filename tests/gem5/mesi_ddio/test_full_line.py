@@ -229,6 +229,33 @@ def _register(
 
 
 _register(
+    "mesi-ddio-pvrdma-payload-provenance",
+    "pvrdma_provenance",
+    {
+        "rxPayloadRequests": 1,
+        "rxPayloadHits": 0,
+        "rxPayloadMisses": 1,
+        "rdmaRxPayloadRequests": 1,
+        "rdmaRxPayloadHits": 0,
+        "rdmaRxPayloadMisses": 1,
+        "rdmaRxPayloadUniqueLines": 1,
+        "txPayloadRequests": 1,
+        "txPayloadHits": 1,
+        "txPayloadMisses": 0,
+        "rdmaTxPayloadRequests": 1,
+        "rdmaTxPayloadHits": 1,
+        "rdmaTxPayloadMisses": 0,
+        "rdmaTxPayloadUniqueLines": 1,
+        "rdmaRxPayloadCpuAccessWays::way0": 1,
+        "rdmaRxPayloadCpuFillWays::way0": 0,
+        "rdmaRxPayloadCpuUniqueLines": 1,
+        "ddioWayFill::nic_rx_payload_way0": 1,
+        "ddioWayAccess::nic_tx_payload_way0": 1,
+        "ddioWayAccess::cpu_other_way0": 1,
+    },
+)
+
+_register(
     "mesi-ddio-cold-full-line-write",
     "cold_full_write",
     {

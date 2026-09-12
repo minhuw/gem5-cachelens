@@ -464,6 +464,8 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
       cache.isNicRxHeaderWriteReq(in_msg.seqReq);
   tbe.is_tx_payload := is_HN && in_msg.isSeqReqValid &&
       cache.isNicTxPayloadReadReq(in_msg.seqReq);
+  tbe.is_pvrdma := is_HN && in_msg.isSeqReqValid &&
+      cache.isNicPvrdmaReq(in_msg.seqReq);
   tbe.is_nic_desc := is_HN && in_msg.isSeqReqValid &&
       cache.isNicDescDmaReq(in_msg.seqReq);
   tbe.is_nic_read := is_HN && in_msg.isSeqReqValid &&
@@ -472,10 +474,16 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   // tag state. This counts both hit and miss paths exactly once.
   if (tbe.is_ddio_payload) {
     cache.profileRxPayload(addr);
+    if (tbe.is_pvrdma) {
+      cache.profileRdmaRxPayload(addr);
+    }
   } else if (tbe.is_ddio_header) {
     cache.profileRxHeader(addr);
   } else if (tbe.is_tx_payload) {
     cache.profileTxPayload(addr);
+    if (tbe.is_pvrdma) {
+      cache.profileRdmaTxPayload(addr);
+    }
   }
   tbe.ddio_access_profiled := false;
   tbe.stale_wb_path := false;

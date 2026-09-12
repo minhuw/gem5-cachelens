@@ -3,6 +3,7 @@
 #ifndef __TEST_OBJECTS_PVRDMA_TESTER_HH__
 #define __TEST_OBJECTS_PVRDMA_TESTER_HH__
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,7 @@
 #include "mem/port.hh"
 #include "params/PvrdmaTester.hh"
 #include "sim/eventq.hh"
+#include "sim/probe/mem.hh"
 #include "test_objects/pvrdma_test_link.hh"
 
 namespace gem5
@@ -116,6 +118,8 @@ class PvrdmaTester : public Platform
         PairVerifyStale,
         SemanticPostSq,
         SemanticVerify,
+        RequestObservationPostSq,
+        RequestObservationVerify,
         SemanticMalformedPost,
         SemanticMalformedVerify,
         SemanticMalformedValidVerify,
@@ -177,6 +181,16 @@ class PvrdmaTester : public Platform
     uint64_t reliabilityRxDmasBefore = 0;
     uint32_t busyPolls = 0;
     bool sawCqPublishPollRace = false;
+    std::unique_ptr<ProbeListenerArgFunc<probing::PacketInfo>>
+        senderDmaListener;
+    std::unique_ptr<ProbeListenerArgFunc<probing::PacketInfo>>
+        receiverDmaListener;
+    uint64_t txPayloadRequests = 0;
+    uint64_t rxPayloadRequests = 0;
+    uint64_t unclassifiedWqeRequests = 0;
+    uint64_t unclassifiedCqeRequests = 0;
+    uint64_t unclassifiedConsumerRequests = 0;
+    uint64_t unclassifiedControlRequests = 0;
 
     template <typename T>
     void write(Addr addr, const T &value, Request::Flags flags = 0);
@@ -241,6 +255,8 @@ class PvrdmaTester : public Platform
     void testInboundFrames();
     void runPair();
     void runSemanticPair();
+    void runRequestObservationPair();
+    void observeDmaRequest(const probing::PacketInfo &packet, bool receiver);
     void runReliabilityPair();
     void runReliabilityRnrPair();
     void runReliabilityTimeoutZeroPair();
@@ -265,6 +281,7 @@ class PvrdmaTester : public Platform
 
     Port &getPort(const std::string &if_name,
                   PortID idx = InvalidPortID) override;
+    void regProbeListeners() override;
     void startup() override;
     void postConsoleInt() override {}
     void clearConsoleInt() override {}

@@ -556,12 +556,18 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
       if (in_msg.isSeqReqValid &&
           L2cache.isNicRxPayloadWriteReq(req)) {
         L2cache.profileRxPayload(address);
+        if (L2cache.isNicPvrdmaReq(req)) {
+          L2cache.profileRdmaRxPayload(address);
+        }
       } else if (in_msg.isSeqReqValid &&
                  L2cache.isNicRxHeaderWriteReq(req)) {
         L2cache.profileRxHeader(address);
       } else if (in_msg.isSeqReqValid &&
                  L2cache.isNicTxPayloadReadReq(req)) {
         L2cache.profileTxPayload(address);
+        if (L2cache.isNicPvrdmaReq(req)) {
+          L2cache.profileRdmaTxPayload(address);
+        }
       }
 
       if (is_valid(cache_entry)) {

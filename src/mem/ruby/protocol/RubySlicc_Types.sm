@@ -225,14 +225,17 @@ structure (CacheMemory, external = "yes") {
   AbstractCacheEntry allocateInWays(Addr, AbstractCacheEntry, int);
   int getDDIOWayPart();
   void profileRxPayload(Addr);
+  void profileRdmaRxPayload(Addr);
   void profileRxHeader(Addr);
   void profileTxPayload(Addr);
+  void profileRdmaTxPayload(Addr);
   bool isNicRxWriteReq(RequestPtr);
   bool isNicDdioWriteReq(RequestPtr);
   bool isNicRxPayloadWriteReq(RequestPtr);
   bool isNicRxHeaderWriteReq(RequestPtr);
   bool isNicDdioReadReq(RequestPtr);
   bool isNicTxPayloadReadReq(RequestPtr);
+  bool isNicPvrdmaReq(RequestPtr);
   bool ddioWriteNeedsRead(bool, bool);
   bool isNicDescDmaReq(RequestPtr);
   void profileDdioWayAccess(int, int, Addr);

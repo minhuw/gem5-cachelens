@@ -27,6 +27,7 @@ SUITES = (
     ),
     ("nic-read-no-allocation", "nic_read_no_allocation.py", 1, False),
     ("nic-read-normal-allocation", "nic_read_normal_allocation.py", 1, False),
+    ("pvrdma-payload-provenance", "pvrdma_payload_provenance.py", 3, False),
     ("write-unique-desc-ddio", "write_unique_desc_ddio.py", 3, False),
     ("write-unique-full-ddio", "write_unique_full_ddio.py", 2, False),
     (

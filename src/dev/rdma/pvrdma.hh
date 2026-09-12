@@ -2718,6 +2718,14 @@ processCommand(const CommandRequest &request, CommandResponse &response,
                           cqs, qps, uar_range);
 }
 
+inline Request::Flags
+payloadDmaFlags(bool write)
+{
+    return Request::NIC_PVRDMA |
+        (write ? Request::NIC_RX_PAYLOAD_WRITE :
+                 Request::NIC_TX_PAYLOAD_READ);
+}
+
 } // namespace pvrdma
 
 class PvrdmaTester;
@@ -3014,8 +3022,10 @@ class Pvrdma : public PciDevice
                            pvrdma::rocev2::Syndrome syndrome,
                            uint32_t responsePsn);
     void startInbound();
+    // Only payload callers pass flags. WQE/consumer use this default, and
+    // queue/completion/control DMA use the unflagged dmaRead/dmaWrite helpers.
     void startTransportDma(bool write, uint64_t address, size_t size,
-                           uint8_t *data);
+                           uint8_t *data, Request::Flags flags = {});
     bool beginPayloadDma(bool write, size_t offset, size_t length);
     void startPayloadDma(bool write);
     void submitTransportCompletion();

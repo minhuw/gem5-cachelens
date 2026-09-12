@@ -179,11 +179,15 @@ TEST(DMASequencerFragmentTest, PreservesNicAndGenericProvenance)
     constexpr int BlockSize = 64;
     const auto byte_enable = allEnabled(Length);
 
-    auto payload = makeRequest(Address, Request::NIC_RX_PAYLOAD_WRITE);
+    auto payload = makeRequest(
+        Address, Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA);
     auto payload_fragment = makeDMARequestFragment(
         Address, Length, 61, BlockSize, payload, byte_enable);
     ASSERT_EQ(payload_fragment.seqReq, payload);
     EXPECT_TRUE(payload_fragment.seqReq->isNicRxPayloadWrite());
+    EXPECT_TRUE(payload_fragment.seqReq->isNicPvrdma());
+    EXPECT_TRUE(Request::hasOneNicDmaCategory(
+        payload_fragment.seqReq->getFlags()));
 
     auto header = makeRequest(Address, Request::NIC_RX_HEADER_WRITE);
     auto header_fragment = makeDMARequestFragment(
@@ -191,11 +195,15 @@ TEST(DMASequencerFragmentTest, PreservesNicAndGenericProvenance)
     ASSERT_EQ(header_fragment.seqReq, header);
     EXPECT_TRUE(header_fragment.seqReq->isNicRxHeaderWrite());
 
-    auto tx_payload = makeRequest(Address, Request::NIC_TX_PAYLOAD_READ);
+    auto tx_payload = makeRequest(
+        Address, Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA);
     auto tx_fragment = makeDMARequestFragment(
         Address, Length, 61, BlockSize, tx_payload, byte_enable);
     ASSERT_EQ(tx_fragment.seqReq, tx_payload);
     EXPECT_TRUE(tx_fragment.seqReq->isNicTxPayloadRead());
+    EXPECT_TRUE(tx_fragment.seqReq->isNicPvrdma());
+    EXPECT_TRUE(Request::hasOneNicDmaCategory(
+        tx_fragment.seqReq->getFlags()));
 
     auto descriptor = makeRequest(Address, Request::NIC_TX_DESC_WRITEBACK);
     auto descriptor_fragment = makeDMARequestFragment(

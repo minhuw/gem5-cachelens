@@ -28,9 +28,11 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+#include <iterator>
 #include <memory>
-#include <sstream>
 
+#include "base/gtest/serialization_fixture.hh"
 #include "mem/cache/replacement_policies/lru_rp.hh"
 #include "mem/ruby/structures/CacheMemory.hh"
 #include "mem/ruby/system/RubyPort.hh"
@@ -55,7 +57,7 @@ class TestEntry : public AbstractCacheEntry
     void print(std::ostream &out) const override { out << m_Address; }
 };
 
-class CacheMemoryTest : public testing::Test
+class CacheMemoryTest : public SerializationFixture
 {
   protected:
     static constexpr Addr SameSetStride = 256;
@@ -63,11 +65,16 @@ class CacheMemoryTest : public testing::Test
     Tick tick = 0;
     std::unique_ptr<CacheMemory> cache;
 
-    void SetUp() override { Gem5Internal::_curTickPtr = &tick; }
+    void SetUp() override
+    {
+        SerializationFixture::SetUp();
+        Gem5Internal::_curTickPtr = &tick;
+    }
     void TearDown() override
     {
         cache.reset();
         Gem5Internal::_curTickPtr = nullptr;
+        SerializationFixture::TearDown();
     }
 
     void
@@ -139,12 +146,63 @@ class CacheMemoryTest : public testing::Test
     {
         return cache->cacheMemoryStats.dmaRoutingTransientRecycles.value();
     }
+    Counter rdmaRxRequests() const
+    {
+        return cache->cacheMemoryStats.rdmaRxPayloadRequests.value();
+    }
+    Counter rdmaRxHits() const
+    {
+        return cache->cacheMemoryStats.rdmaRxPayloadHits.value();
+    }
+    Counter rdmaTxRequests() const
+    {
+        return cache->cacheMemoryStats.rdmaTxPayloadRequests.value();
+    }
+    Counter rdmaCpuAccessAt(int way) const
+    {
+        return cache->cacheMemoryStats.rdmaRxPayloadCpuAccessWays[way].value();
+    }
+    Counter rdmaCpuFillAt(int way) const
+    {
+        return cache->cacheMemoryStats.rdmaRxPayloadCpuFillWays[way].value();
+    }
+    Counter rdmaCpuUnique() const
+    {
+        return cache->cacheMemoryStats.rdmaRxPayloadCpuUniqueLines.value();
+    }
     void setSlot(int set, int way, AbstractCacheEntry *entry)
     {
         cache->m_cache[set][way] = entry;
     }
     void setTag(Addr address, int way) { cache->m_tag_index[address] = way; }
+    size_t rxProvenanceCount() const
+    {
+        return cache->rxPayloadEverAddrs.size();
+    }
+    size_t rdmaProvenanceCount() const
+    {
+        return cache->rdmaRxPayloadEverAddrs.size();
+    }
+    void saveCheckpoint() const
+    {
+        std::ofstream cp(getCptPath());
+        Serializable::ScopedCheckpointSection section(cp, "cache");
+        cache->serialize(cp);
+    }
+    void restoreCheckpoint()
+    {
+        CheckpointIn cp(getDirName());
+        Serializable::ScopedCheckpointSection section(cp, "cache");
+        cache->unserialize(cp);
+    }
+    std::string checkpointContents() const
+    {
+        std::ifstream cp(getCptPath());
+        return {std::istreambuf_iterator<char>(cp), {}};
+    }
 };
+
+using CacheMemoryDeathTest = CacheMemoryTest;
 
 TEST_F(CacheMemoryTest, ReuseRemovesOnlyStaleTagMapping)
 {
@@ -344,6 +402,110 @@ TEST_F(CacheMemoryTest, PayloadAndHeaderTelemetryAreSeparate)
     EXPECT_EQ(headerRequests(), 1);
     EXPECT_EQ(payloadMisses(), 1);
     EXPECT_EQ(headerMisses(), 1);
+}
+
+TEST_F(CacheMemoryTest, PvrdmaProfilesAggregateAndDedicatedTelemetry)
+{
+    makeCache(2);
+    auto *entry = new TestEntry;
+    cache->allocateInWays(0, entry, 2);
+    entry->m_Permission = AccessPermission_Read_Write;
+    const int way = wayOf(0);
+
+    auto rdma = std::make_shared<Request>(
+        0, 64, Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA, 0);
+    auto generic = std::make_shared<Request>(
+        0, 64, Request::NIC_RX_PAYLOAD_WRITE, 0);
+    EXPECT_TRUE(cache->isNicRxPayloadWriteReq(rdma));
+    EXPECT_TRUE(cache->isNicPvrdmaReq(rdma));
+    EXPECT_FALSE(cache->isNicPvrdmaReq(generic));
+
+    cache->profileRxPayload(0);
+    cache->profileRdmaRxPayload(0);
+    cache->profileTxPayload(0);
+    cache->profileRdmaTxPayload(0);
+    EXPECT_EQ(payloadRequests(), 1);
+    EXPECT_EQ(rdmaRxRequests(), 1);
+    EXPECT_EQ(rdmaRxHits(), 1);
+    EXPECT_EQ(rdmaTxRequests(), 1);
+
+    cache->profileDdioWayAccess(3, way, 0);
+    EXPECT_EQ(rdmaCpuAccessAt(way), 1);
+    EXPECT_EQ(rdmaCpuUnique(), 1);
+
+    cache->resetStats();
+    cache->profileDdioWayFill(3, way, 0);
+    EXPECT_EQ(rdmaCpuAccessAt(way), 0);
+    EXPECT_EQ(rdmaCpuFillAt(way), 1);
+    EXPECT_EQ(rdmaCpuUnique(), 1);
+}
+
+TEST_F(CacheMemoryTest, PvrdmaProvenanceSurvivesCheckpointAndStatsReset)
+{
+    makeCache(2);
+    constexpr Addr address = 256;
+    cache->profileRxPayload(address);
+    cache->profileRdmaRxPayload(address);
+    saveCheckpoint();
+
+    makeCache(2);
+    restoreCheckpoint();
+
+    cache->resetStats();
+    cache->profileDdioWayAccess(3, 0, address);
+    cache->profileDdioWayFill(3, 1, address);
+    EXPECT_EQ(rdmaCpuAccessAt(0), 1);
+    EXPECT_EQ(rdmaCpuFillAt(1), 1);
+    EXPECT_EQ(rdmaCpuUnique(), 1);
+}
+
+TEST_F(CacheMemoryTest, ProvenanceSerializationIsSorted)
+{
+    makeCache(2);
+    cache->profileRxPayload(256);
+    cache->profileRdmaRxPayload(192);
+    cache->profileRxPayload(64);
+    cache->profileRdmaRxPayload(128);
+    saveCheckpoint();
+
+    EXPECT_EQ(checkpointContents(),
+              "\n[cache]\n"
+              "rxPayloadEverAddrs=64 128 192 256\n"
+              "rdmaRxPayloadEverAddrs=128 192\n");
+}
+
+TEST_F(CacheMemoryTest, MissingProvenanceRestoresEmpty)
+{
+    makeCache(2);
+    cache->profileRdmaRxPayload(64);
+    simulateSerialization("\n[cache]\n");
+    restoreCheckpoint();
+
+    EXPECT_EQ(rxProvenanceCount(), 0);
+    EXPECT_EQ(rdmaProvenanceCount(), 0);
+}
+
+TEST_F(CacheMemoryDeathTest, RejectsUnalignedRxProvenance)
+{
+    makeCache(2);
+    simulateSerialization("\n[cache]\nrxPayloadEverAddrs=65\n");
+    ASSERT_ANY_THROW(restoreCheckpoint());
+}
+
+TEST_F(CacheMemoryDeathTest, RejectsUnalignedRdmaProvenance)
+{
+    makeCache(2);
+    simulateSerialization(
+        "\n[cache]\nrxPayloadEverAddrs=64\nrdmaRxPayloadEverAddrs=65\n");
+    ASSERT_ANY_THROW(restoreCheckpoint());
+}
+
+TEST_F(CacheMemoryDeathTest, RejectsRdmaOutsideRxProvenance)
+{
+    makeCache(2);
+    simulateSerialization(
+        "\n[cache]\nrxPayloadEverAddrs=64\nrdmaRxPayloadEverAddrs=128\n");
+    ASSERT_ANY_THROW(restoreCheckpoint());
 }
 
 TEST_F(CacheMemoryTest, PayloadAllocationHistogramIsPayloadOnly)

@@ -272,6 +272,8 @@ class Request : public Extensible<Request>
         NIC_TX_PAYLOAD_READ         = 0x1000000000000000,
         NIC_TX_DESC_WRITEBACK       = 0x2000000000000000,
         NIC_RX_HEADER_WRITE         = 0x4000000000000000,
+        /** PVRDMA provenance, orthogonal to the NIC DMA category. */
+        NIC_PVRDMA                  = 0x8000000000000000,
     };
     static const FlagsType NIC_DMA_CATEGORY_MASK =
         NIC_RX_DESC_READ | NIC_RX_PAYLOAD_WRITE |
@@ -1078,6 +1080,7 @@ class Request : public Extensible<Request>
     bool isNicRxHeaderWrite() const {
         return _flags.isSet(NIC_RX_HEADER_WRITE);
     }
+    bool isNicPvrdma() const { return _flags.isSet(NIC_PVRDMA); }
     bool isNicDescDma() const {
         return _flags.isSet(NIC_RX_DESC_READ | NIC_RX_DESC_WRITEBACK |
                             NIC_TX_DESC_READ | NIC_TX_DESC_WRITEBACK);

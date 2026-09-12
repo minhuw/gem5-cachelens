@@ -7,6 +7,7 @@ import re
 import m5
 from m5.objects import (
     AddrRange,
+    CommMonitor,
     EtherLink,
     GenericPciHost,
     Pvrdma,
@@ -32,6 +33,7 @@ parser.add_argument(
         "timing-transport-pair",
         "semantic-pair",
         "timing-semantic-pair",
+        "request-observation-pair",
         "reliability-pair",
         "timing-reliability-pair",
         "reliability-rnr-pair",
@@ -111,6 +113,7 @@ system.rdma = Pvrdma(
 if (
     args.mode.endswith("transport-pair")
     or args.mode.endswith("semantic-pair")
+    or args.mode == "request-observation-pair"
     or "reliability" in args.mode
     or ("terminal-" in args.mode and "sq-terminal" not in args.mode)
 ):
@@ -140,10 +143,19 @@ system.memory.port = system.bus.mem_side_ports
 system.tester.port = system.bus.cpu_side_ports
 system.pci_host.pio = system.bus.mem_side_ports
 system.rdma.pio = system.bus.mem_side_ports
-system.rdma.dma = system.bus.cpu_side_ports
+if args.mode == "request-observation-pair":
+    system.rdma_dma_monitor = CommMonitor()
+    system.peer_rdma_dma_monitor = CommMonitor()
+    system.rdma.dma = system.rdma_dma_monitor.cpu_side_port
+    system.rdma_dma_monitor.mem_side_port = system.bus.cpu_side_ports
+    system.peer_rdma.dma = system.peer_rdma_dma_monitor.cpu_side_port
+    system.peer_rdma_dma_monitor.mem_side_port = system.bus.cpu_side_ports
+else:
+    system.rdma.dma = system.bus.cpu_side_ports
+    if hasattr(system, "peer_rdma"):
+        system.peer_rdma.dma = system.bus.cpu_side_ports
 if hasattr(system, "peer_rdma"):
     system.peer_rdma.pio = system.bus.mem_side_ports
-    system.peer_rdma.dma = system.bus.cpu_side_ports
 
 root = Root(full_system=False, system=system)
 m5.instantiate(
@@ -157,6 +169,9 @@ if args.mode in ("transport-pair", "timing-transport-pair"):
 elif args.mode in ("semantic-pair", "timing-semantic-pair"):
     assert exit_event.getCause() == "PVRDMA semantic pair test passed"
     print("PVRDMA_SEMANTIC_PAIR_OK")
+elif args.mode == "request-observation-pair":
+    assert exit_event.getCause() == "PVRDMA request observation test passed"
+    print("PVRDMA_REQUEST_OBSERVATION_OK")
 elif args.mode in ("reliability-pair", "timing-reliability-pair"):
     assert exit_event.getCause() == "PVRDMA reliability pair test passed"
     print("PVRDMA_RELIABILITY_PAIR_OK")

@@ -41,6 +41,8 @@
 
 #include "mem/ruby/structures/CacheMemory.hh"
 
+#include <algorithm>
+
 #include "base/compiler.hh"
 #include "base/intmath.hh"
 #include "base/logging.hh"
@@ -130,6 +132,8 @@ CacheMemory::init()
     // Size the DDIO way-histogram stats now that the associativity is known
     cacheMemoryStats.rxPayloadHitWays.init(m_cache_assoc).flags(
         statistics::total);
+    cacheMemoryStats.rdmaRxPayloadHitWays.init(m_cache_assoc).flags(
+        statistics::total);
     cacheMemoryStats.rxPayloadAllocWays.init(m_cache_assoc).flags(
         statistics::total);
     cacheMemoryStats.ddioAllocWays.init(m_cache_assoc).flags(
@@ -151,6 +155,10 @@ CacheMemory::init()
         statistics::total);
     cacheMemoryStats.rxPayloadCpuFillWays.init(m_cache_assoc).flags(
         statistics::total);
+    cacheMemoryStats.rdmaRxPayloadCpuAccessWays.init(m_cache_assoc).flags(
+        statistics::total);
+    cacheMemoryStats.rdmaRxPayloadCpuFillWays.init(m_cache_assoc).flags(
+        statistics::total);
     for (int s = 0; s < 5; s++) {
         for (int w = 0; w < m_cache_assoc; w++) {
             cacheMemoryStats.ddioWayAccess.subname(
@@ -166,6 +174,10 @@ CacheMemory::init()
         cacheMemoryStats.rxPayloadCpuAccessWays.subname(
             w, csprintf("way%d", w));
         cacheMemoryStats.rxPayloadCpuFillWays.subname(
+            w, csprintf("way%d", w));
+        cacheMemoryStats.rdmaRxPayloadCpuAccessWays.subname(
+            w, csprintf("way%d", w));
+        cacheMemoryStats.rdmaRxPayloadCpuFillWays.subname(
             w, csprintf("way%d", w));
     }
 
@@ -200,7 +212,63 @@ CacheMemory::resetStats()
     SimObject::resetStats();
     rxPayloadUniqueAddrs.clear();
     txPayloadUniqueAddrs.clear();
+    rdmaRxPayloadUniqueAddrs.clear();
+    rdmaTxPayloadUniqueAddrs.clear();
     rxPayloadCpuUniqueAddrs.clear();
+    rdmaRxPayloadCpuUniqueAddrs.clear();
+}
+
+void
+CacheMemory::serialize(CheckpointOut &cp) const
+{
+    std::vector<Addr> rx_addrs(rxPayloadEverAddrs.begin(),
+                               rxPayloadEverAddrs.end());
+    std::vector<Addr> rdma_addrs(rdmaRxPayloadEverAddrs.begin(),
+                                 rdmaRxPayloadEverAddrs.end());
+    for (const Addr addr : rx_addrs) {
+        fatal_if(addr != makeLineAddress(addr),
+                 "Unaligned RX payload provenance address %#x", addr);
+    }
+    for (const Addr addr : rdma_addrs) {
+        fatal_if(addr != makeLineAddress(addr),
+                 "Unaligned RDMA RX payload provenance address %#x", addr);
+        fatal_if(!rxPayloadEverAddrs.count(addr),
+                 "RDMA RX payload provenance address %#x is not RX payload",
+                 addr);
+    }
+    std::sort(rx_addrs.begin(), rx_addrs.end());
+    std::sort(rdma_addrs.begin(), rdma_addrs.end());
+    arrayParamOut(cp, "rxPayloadEverAddrs", rx_addrs);
+    arrayParamOut(cp, "rdmaRxPayloadEverAddrs", rdma_addrs);
+}
+
+void
+CacheMemory::unserialize(CheckpointIn &cp)
+{
+    std::vector<Addr> rx_addrs;
+    std::vector<Addr> rdma_addrs;
+    const auto &section = Serializable::currentSection();
+
+    if (cp.entryExists(section, "rxPayloadEverAddrs"))
+        arrayParamIn(cp, "rxPayloadEverAddrs", rx_addrs);
+    if (cp.entryExists(section, "rdmaRxPayloadEverAddrs"))
+        arrayParamIn(cp, "rdmaRxPayloadEverAddrs", rdma_addrs);
+
+    rxPayloadEverAddrs.clear();
+    rdmaRxPayloadEverAddrs.clear();
+    for (const Addr addr : rx_addrs) {
+        fatal_if(addr != makeLineAddress(addr),
+                 "Unaligned RX payload provenance address %#x", addr);
+        rxPayloadEverAddrs.insert(addr);
+    }
+    for (const Addr addr : rdma_addrs) {
+        fatal_if(addr != makeLineAddress(addr),
+                 "Unaligned RDMA RX payload provenance address %#x", addr);
+        fatal_if(!rxPayloadEverAddrs.count(addr),
+                 "RDMA RX payload provenance address %#x is not RX payload",
+                 addr);
+        rdmaRxPayloadEverAddrs.insert(addr);
+    }
 }
 
 // convert a Address to its location in the cache
@@ -905,6 +973,17 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(rxPayloadHitWays, "Way histogram of RX data hits"),
       ADD_STAT(rxPayloadAllocWays, "Way histogram of RX payload allocations"),
       ADD_STAT(ddioAllocWays, "Way histogram of all NIC DDIO allocations"),
+      ADD_STAT(rdmaRxPayloadRequests,
+               "Number of PVRDMA RX payload write line transactions"),
+      ADD_STAT(rdmaRxPayloadHits,
+               "Number of PVRDMA RX payload writes hitting a present line"),
+      ADD_STAT(rdmaRxPayloadMisses,
+               "Number of PVRDMA RX payload writes missing at acceptance"),
+      ADD_STAT(rdmaRxPayloadHitRate, "PVRDMA RX payload write hit rate",
+               rdmaRxPayloadHits /
+                   (rdmaRxPayloadHits + rdmaRxPayloadMisses)),
+      ADD_STAT(rdmaRxPayloadHitWays,
+               "Way histogram of PVRDMA RX payload hits"),
       ADD_STAT(rxHeaderRequests, "Number of NIC RX header DMA write line transactions"),
       ADD_STAT(rxHeaderHits, "Number of NIC RX header DMA writes hitting a present line"),
       ADD_STAT(rxHeaderMisses, "Number of NIC RX header DMA writes missing at acceptance"),
@@ -918,6 +997,15 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
                "Number of NIC TX payload DMA reads missing"),
       ADD_STAT(txPayloadHitRate, "NIC TX payload DMA read hit rate",
                txPayloadHits / (txPayloadHits + txPayloadMisses)),
+      ADD_STAT(rdmaTxPayloadRequests,
+               "Number of PVRDMA TX payload read line transactions"),
+      ADD_STAT(rdmaTxPayloadHits,
+               "Number of PVRDMA TX payload reads hitting a present line"),
+      ADD_STAT(rdmaTxPayloadMisses,
+               "Number of PVRDMA TX payload reads missing"),
+      ADD_STAT(rdmaTxPayloadHitRate, "PVRDMA TX payload read hit rate",
+               rdmaTxPayloadHits /
+                   (rdmaTxPayloadHits + rdmaTxPayloadMisses)),
       ADD_STAT(ddioWayAccess,
                "Accesses per way by requester class (src x way)"),
       ADD_STAT(ddioWayFill,
@@ -930,13 +1018,25 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
                "CPU/general fills of prior RX payload addresses by way"),
       ADD_STAT(rxPayloadCpuUniqueLines,
                "Prior RX payload lines touched by CPU/general requests"),
+      ADD_STAT(rdmaRxPayloadCpuAccessWays,
+               "CPU/general hits to prior PVRDMA RX payload addresses by way"),
+      ADD_STAT(rdmaRxPayloadCpuFillWays,
+               "CPU/general fills of prior PVRDMA RX payload addresses by way"),
+      ADD_STAT(rdmaRxPayloadCpuUniqueLines,
+               "Prior PVRDMA RX payload lines touched by CPU/general requests"),
       ADD_STAT(rxPayloadSetHits, "RX payload hits per cache set"),
       ADD_STAT(rxPayloadSetMisses, "RX payload misses per cache set"),
       ADD_STAT(rxPayloadUniqueLines, "Unique RX payload line addresses"),
-      ADD_STAT(txPayloadUniqueLines, "Unique TX payload line addresses")
+      ADD_STAT(txPayloadUniqueLines, "Unique TX payload line addresses"),
+      ADD_STAT(rdmaRxPayloadUniqueLines,
+               "Unique PVRDMA RX payload line addresses"),
+      ADD_STAT(rdmaTxPayloadUniqueLines,
+               "Unique PVRDMA TX payload line addresses")
 {
     rxPayloadHitRate.flags(statistics::nonan);
     txPayloadHitRate.flags(statistics::nonan);
+    rdmaRxPayloadHitRate.flags(statistics::nonan);
+    rdmaTxPayloadHitRate.flags(statistics::nonan);
     numDataArrayReads
         .flags(statistics::nozero);
 
@@ -1191,7 +1291,26 @@ CacheMemory::profileRxPayload(Addr address)
     }
     if (rxPayloadUniqueAddrs.insert(address).second)
         cacheMemoryStats.rxPayloadUniqueLines++;
-    rxPayloadEverAddrs.insert(address);
+    rxPayloadEverAddrs.insert(makeLineAddress(address));
+}
+
+void
+CacheMemory::profileRdmaRxPayload(Addr address)
+{
+    cacheMemoryStats.rdmaRxPayloadRequests++;
+    const int64_t cache_set = addressToCacheSet(address);
+    const int loc = findTagInSet(cache_set, address);
+    if (loc >= 0) {
+        cacheMemoryStats.rdmaRxPayloadHits++;
+        cacheMemoryStats.rdmaRxPayloadHitWays[loc]++;
+    } else {
+        cacheMemoryStats.rdmaRxPayloadMisses++;
+    }
+    if (rdmaRxPayloadUniqueAddrs.insert(address).second)
+        cacheMemoryStats.rdmaRxPayloadUniqueLines++;
+    const Addr line_address = makeLineAddress(address);
+    rxPayloadEverAddrs.insert(line_address);
+    rdmaRxPayloadEverAddrs.insert(line_address);
 }
 
 void
@@ -1217,6 +1336,19 @@ CacheMemory::profileTxPayload(Addr address)
     }
     if (txPayloadUniqueAddrs.insert(address).second)
         cacheMemoryStats.txPayloadUniqueLines++;
+}
+
+void
+CacheMemory::profileRdmaTxPayload(Addr address)
+{
+    cacheMemoryStats.rdmaTxPayloadRequests++;
+    if (isTagPresent(address)) {
+        cacheMemoryStats.rdmaTxPayloadHits++;
+    } else {
+        cacheMemoryStats.rdmaTxPayloadMisses++;
+    }
+    if (rdmaTxPayloadUniqueAddrs.insert(address).second)
+        cacheMemoryStats.rdmaTxPayloadUniqueLines++;
 }
 
 void

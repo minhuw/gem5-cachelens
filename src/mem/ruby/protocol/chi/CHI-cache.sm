@@ -691,6 +691,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     bool is_ddio_payload,   default="false",   desc="NIC RX payload DMA write";
     bool is_ddio_header,    default="false",   desc="NIC RX header DMA write";
     bool is_tx_payload,     default="false",   desc="NIC TX payload DMA read";
+    bool is_pvrdma,         default="false",   desc="PVRDMA payload provenance";
     bool is_nic_desc,       default="false",   desc="NIC descriptor DMA";
     bool is_nic_read,       default="false",   desc="NIC DMA read subject to the profile allocation policy";
     bool ddio_access_profiled, default="false", desc="DDIO way access already recorded";
