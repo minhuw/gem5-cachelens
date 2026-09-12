@@ -66,6 +66,8 @@ write_file(const DispatchTable &dt, const std::string &filename,
                 strerror(errno) << std::endl;
             exit(2);
         }
+        if (offset == 0 && len == 0 && src.eof())
+            (*dt.m5_write_file)(buf, 0, 0, host_filename.c_str());
         char *wbuf = buf;
         while (len) {
             int bytes = (*dt.m5_write_file)(

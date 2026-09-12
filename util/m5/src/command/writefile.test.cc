@@ -41,6 +41,9 @@
 #include "dispatch_table.hh"
 
 uint64_t test_total_written;
+uint64_t test_write_calls;
+uint64_t test_last_write_len;
+uint64_t test_last_write_offset;
 std::string test_host_file_name;
 
 std::vector<uint8_t> test_written_data;
@@ -50,6 +53,10 @@ uint64_t
 test_m5_write_file(void *buffer, uint64_t len, uint64_t offset,
                    const char *filename)
 {
+    test_write_calls++;
+    test_last_write_len = len;
+    test_last_write_offset = offset;
+
     if (test_max_buf_size && len > test_max_buf_size)
         len = test_max_buf_size;
 
@@ -67,7 +74,8 @@ test_m5_write_file(void *buffer, uint64_t len, uint64_t offset,
     if (test_written_data.size() < required_size)
         test_written_data.resize(required_size);
 
-    std::memcpy(test_written_data.data() + offset, buffer, len);
+    if (len)
+        std::memcpy(test_written_data.data() + offset, buffer, len);
 
     return len;
 }
@@ -80,6 +88,9 @@ bool
 run(std::initializer_list<std::string> arg_args)
 {
     test_total_written = 0;
+    test_write_calls = 0;
+    test_last_write_len = 0;
+    test_last_write_offset = 0;
     test_host_file_name = "";
     test_written_data.clear();
 
@@ -107,7 +118,7 @@ class TempFile
     void *_buf;
 
   public:
-    TempFile(size_t _size) : _size(_size)
+    TempFile(size_t _size) : _size(_size), _buf(nullptr)
     {
         // Generate a temporary filename.
         char *tmp_name = strdup("/tmp/writefile.test.XXXXXXXX");
@@ -117,6 +128,9 @@ class TempFile
 
         // Make the file the appropriate length.
         assert(!ftruncate(fd, _size));
+
+        if (!_size)
+            return;
 
         // mmap the file.
         _buf = mmap(nullptr, _size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -159,7 +173,8 @@ class TempFile
     verify(const std::string &expected_path)
     {
         EXPECT_EQ(test_written_data.size(), size());
-        EXPECT_EQ(memcmp(test_written_data.data(), buf(), size()), 0);
+        if (size())
+            EXPECT_EQ(memcmp(test_written_data.data(), buf(), size()), 0);
         EXPECT_EQ(test_host_file_name, expected_path);
 
         std::ostringstream os;
@@ -183,6 +198,18 @@ TEST(Writefile, ThreeArguments)
     // Call with no arguments.
     EXPECT_FALSE(run({"writefile", "1", "2", "3"}));
     EXPECT_EQ(test_total_written, 0);
+}
+
+TEST(Writefile, EmptyFile)
+{
+    TempFile tmp(0);
+    test_max_buf_size = 0;
+    std::string host_path = "/different/empty/host/path";
+    EXPECT_TRUE(run({"writefile", tmp.path(), host_path}));
+    EXPECT_EQ(test_write_calls, 1);
+    EXPECT_EQ(test_last_write_len, 0);
+    EXPECT_EQ(test_last_write_offset, 0);
+    tmp.verify(host_path);
 }
 
 TEST(Writefile, SmallFile)
