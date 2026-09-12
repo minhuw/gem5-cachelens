@@ -279,6 +279,19 @@ class CacheMemory : public SimObject
 
           statistics::Vector m_accessModeType;
 
+          // MESI classified-DMA routing telemetry. These counters describe
+          // proxy routing only and are separate from DDIO cache hit
+          // statistics.
+          statistics::Scalar dmaRoutingProxyRequests;
+          statistics::Scalar dmaRoutingTransientRecycles;
+          statistics::Scalar ddioReplacementStalls;
+
+          // Retained DDIO ownership handshakes. A cold/subset-replacement
+          // fill must publish its L2 owner at the directory before the DMA
+          // write is acknowledged.
+          statistics::Scalar ddioOwnershipRequests;
+          statistics::Scalar ddioOwnershipAcks;
+
           // DDIO (NIC RX data DMA write) accounting. A request is a packet
           // data line transaction seen by this cache; a hit means the line
           // was already present at acceptance.
@@ -342,6 +355,27 @@ class CacheMemory : public SimObject
       void profileDemandMiss();
       void profilePrefetchHit();
       void profilePrefetchMiss();
+
+      void profileDmaRoutingProxy()
+      {
+          cacheMemoryStats.dmaRoutingProxyRequests++;
+      }
+      void profileDmaRoutingTransientRecycle()
+      {
+          cacheMemoryStats.dmaRoutingTransientRecycles++;
+      }
+      void profileDdioReplacementStall()
+      {
+          cacheMemoryStats.ddioReplacementStalls++;
+      }
+      void profileDdioOwnershipRequest()
+      {
+          cacheMemoryStats.ddioOwnershipRequests++;
+      }
+      void profileDdioOwnershipAck()
+      {
+          cacheMemoryStats.ddioOwnershipAcks++;
+      }
 
       // DDIO accounting hooks (called from the CHI home node).
       // profileRxPayload/profileRxHeader count one line transaction and record

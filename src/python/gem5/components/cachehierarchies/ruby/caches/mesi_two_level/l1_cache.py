@@ -55,7 +55,7 @@ class L1Cache(MESI_Two_Level_L1Cache_Controller):
         l1d_assoc,
         network,
         core: AbstractCore,
-        num_l2Caches,
+        l2_select_num_bits,
         cache_line_size,
         target_isa: ISA,
         clk_domain: ClockDomain,
@@ -70,19 +70,20 @@ class L1Cache(MESI_Two_Level_L1Cache_Controller):
         self.connectQueues(network)
 
         # This is the cache memory object that stores the cache data and tags
+        start_index_bit = int(math.log2(self._cache_line_size))
         self.L1Icache = RubyCache(
             size=l1i_size,
             assoc=l1i_assoc,
-            start_index_bit=self._cache_line_size,
+            start_index_bit=start_index_bit,
             is_icache=True,
         )
         self.L1Dcache = RubyCache(
             size=l1d_size,
             assoc=l1d_assoc,
-            start_index_bit=self._cache_line_size,
+            start_index_bit=start_index_bit,
             is_icache=False,
         )
-        self.l2_select_num_bits = int(math.log(num_l2Caches, 2))
+        self.l2_select_num_bits = l2_select_num_bits
         self.clk_domain = clk_domain
         self.prefetcher = RubyPrefetcher(block_size=self._cache_line_size)
         self.send_evictions = core.requires_send_evicts()

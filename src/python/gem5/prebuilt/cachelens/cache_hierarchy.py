@@ -444,10 +444,16 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
     def get_configuration(self) -> Dict[str, object]:
         """Return the bounded model choices for logs and configuration tests."""
         return {
+            "coherence_protocol": "CHI",
             "model_profile": self._model_profile,
             "model_description": _MODEL_PROFILES[self._model_profile][
                 "description"
             ],
+            "topology": "private L1I/L1D + private L2 + shared HNF",
+            "topology_matches_chi_three_level": True,
+            "private_data_mapping": "native CHI private L1D and L2",
+            "private_data_size": self._l2_size,
+            "private_data_assoc": self._l2_assoc,
             "cache_state_restore_policy": (
                 self.get_cache_state_restore_policy()
             ),
@@ -460,6 +466,11 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             "hnf_size_per_hnf": self._hnf_size,
             "hnf_size_per_hnf_bytes": self._hnf_size_bytes,
             "total_hnf_capacity_bytes": self.get_total_hnf_capacity_bytes(),
+            "hnf_assoc": self._hnf_assoc,
+            "llc_replacement_policy": (
+                "LRU" if self._ddio_way_part > 0 else "protocol-default"
+            ),
+            "cache_line_size": self._cache_line_size,
             "link_latency": self._link_latency,
             "router_latency": self._router_latency,
             "network_buffer_size": self._network_buffer_size,

@@ -35,25 +35,52 @@ from m5.objects import (
 class SimplePt2Pt(SimpleNetwork):
     """A simple point-to-point network. This doesn't not use garnet."""
 
-    def __init__(self, ruby_system):
+    def __init__(
+        self,
+        ruby_system,
+        *,
+        link_latency=1,
+        router_latency=1,
+        buffer_size=0,
+    ):
+        if link_latency <= 0 or router_latency <= 0:
+            raise ValueError("Network latencies must be positive.")
+        if buffer_size < 0:
+            raise ValueError("Network buffer_size must be non-negative.")
+
         super().__init__()
         self.netifs = []
 
         # TODO: These should be in a base class
         # https://gem5.atlassian.net/browse/GEM5-1039
         self.ruby_system = ruby_system
+        self._link_latency = link_latency
+        self._router_latency = router_latency
+        self.buffer_size = buffer_size
 
     def connectControllers(self, controllers):
         """Connect all of the controllers to routers and connec the routers
         together in a point-to-point network.
         """
         # Create one router/switch per controller in the system
-        self.routers = [Switch(router_id=i) for i in range(len(controllers))]
+        self.routers = [
+            Switch(
+                router_id=i,
+                int_routing_latency=self._router_latency,
+                ext_routing_latency=self._router_latency,
+            )
+            for i in range(len(controllers))
+        ]
 
         # Make a link from each controller to the router. The link goes
         # externally to the network.
         self.ext_links = [
-            SimpleExtLink(link_id=i, ext_node=c, int_node=self.routers[i])
+            SimpleExtLink(
+                link_id=i,
+                ext_node=c,
+                int_node=self.routers[i],
+                latency=self._link_latency,
+            )
             for i, c in enumerate(controllers)
         ]
 
@@ -67,6 +94,11 @@ class SimplePt2Pt(SimpleNetwork):
                     continue  # Don't connect a router to itself!
                 link_count += 1
                 int_links.append(
-                    SimpleIntLink(link_id=link_count, src_node=ri, dst_node=rj)
+                    SimpleIntLink(
+                        link_id=link_count,
+                        src_node=ri,
+                        dst_node=rj,
+                        latency=self._link_latency,
+                    )
                 )
         self.int_links = int_links

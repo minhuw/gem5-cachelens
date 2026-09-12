@@ -63,6 +63,10 @@ class MemTest(ClockedObject):
     percent_functional = Param.Percent(50, "Percentage functional accesses")
     percent_uncacheable = Param.Percent(10, "Percentage uncacheable")
     percent_atomic = Param.Percent(0, "Percentage atomics")
+    nic_dma = Param.Bool(
+        False,
+        "Classify generated reads and writes as NIC DMA requests",
+    )
 
     # Determine how often to print progress messages and what timeout
     # to use for checking progress of both requests and responses

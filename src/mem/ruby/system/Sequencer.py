@@ -156,3 +156,7 @@ class DMASequencer(RubyPort):
     cxx_class = "gem5::ruby::DMASequencer"
 
     max_outstanding_requests = Param.Int(64, "max outstanding requests")
+    supports_masked_writes = Param.Bool(
+        False,
+        "connected Ruby protocol preserves and applies DMA write masks",
+    )

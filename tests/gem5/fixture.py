@@ -156,6 +156,10 @@ class SConsFixture(UniqueFixture):
         obj = super().__new__(cls, target)
         return obj
 
+    def _get_defconfig(self):
+        """Return the build_opts entry used to initialize this target."""
+        return self.isa.upper()
+
     def _setup(self, testitem):
         if config.skip_build:
             return
@@ -171,7 +175,7 @@ class SConsFixture(UniqueFixture):
                 "You may want to use --skip-build, or use 'rerun'."
             )
 
-        # Create the KConfig configuration based on the ISA
+        # Create the KConfig configuration for this fixture.
         defconfig_command = [
             "scons",
             "-C",
@@ -180,7 +184,7 @@ class SConsFixture(UniqueFixture):
             "--no-compress-debug",
             "defconfig",
             self.target_dir,
-            joinpath(self.directory, "build_opts", self.isa.upper()),
+            joinpath(self.directory, "build_opts", self._get_defconfig()),
         ]
         log_call(log.test_log, defconfig_command, time=None, stderr=sys.stderr)
 

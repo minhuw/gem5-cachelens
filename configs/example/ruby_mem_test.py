@@ -49,7 +49,13 @@ parser = argparse.ArgumentParser(
 Options.addNoISAOptions(parser)
 
 parser.add_argument(
-    "--maxloads", metavar="N", default=0, help="Stop after N loads"
+    "--maxloads", metavar="N", default=0, help="Stop after N CPU loads"
+)
+parser.add_argument(
+    "--dma-maxloads",
+    metavar="N",
+    default=None,
+    help="Stop after N DMA loads (defaults to --maxloads)",
 )
 parser.add_argument(
     "--progress",
@@ -59,6 +65,24 @@ parser.add_argument(
     help="Progress message interval ",
 )
 parser.add_argument("--num-dmas", type=int, default=0, help="# of dma testers")
+parser.add_argument(
+    "--num-nic-dmas",
+    type=int,
+    default=0,
+    help="# of DMA testers whose requests carry NIC DMA categories",
+)
+parser.add_argument(
+    "--tester-size",
+    type=int,
+    default=65536,
+    help="Size of each tester's address region in bytes",
+)
+parser.add_argument(
+    "--percent-reads",
+    type=int,
+    default=65,
+    help="Percentage of MemTest accesses that are reads",
+)
 parser.add_argument(
     "--functional",
     type=int,
@@ -109,9 +133,14 @@ if args.num_cpus > block_size:
 #
 # Currently ruby does not support atomic or uncacheable accesses
 #
+if args.num_nic_dmas < 0 or args.num_nic_dmas > args.num_dmas:
+    parser.error("--num-nic-dmas must be between zero and --num-dmas")
+
 cpus = [
     MemTest(
         max_loads=args.maxloads,
+        size=args.tester_size,
+        percent_reads=args.percent_reads,
         percent_functional=args.functional,
         percent_uncacheable=0,
         percent_atomic=args.atomic,
@@ -128,13 +157,19 @@ system = System(
 )
 
 if args.num_dmas > 0:
+    dma_maxloads = (
+        args.maxloads if args.dma_maxloads is None else args.dma_maxloads
+    )
     dmas = [
         MemTest(
-            max_loads=args.maxloads,
+            max_loads=dma_maxloads,
+            size=args.tester_size,
+            percent_reads=args.percent_reads,
             percent_functional=0,
             percent_uncacheable=0,
             progress_interval=args.progress,
             suppress_func_errors=not args.suppress_func_errors,
+            nic_dma=i < args.num_nic_dmas,
         )
         for i in range(args.num_dmas)
     ]
@@ -142,9 +177,7 @@ if args.num_dmas > 0:
 else:
     dmas = []
 
-dma_ports = []
-for i, dma in enumerate(dmas):
-    dma_ports.append(dma.test)
+dma_ports = [dma.port for dma in dmas]
 Ruby.create_system(args, False, system, dma_ports=dma_ports)
 
 # Create a top-level voltage domain and clock domain

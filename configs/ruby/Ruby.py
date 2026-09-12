@@ -247,9 +247,12 @@ def create_system(
         cpus = system.cpu
 
     protocol = buildEnv["PROTOCOL"]
-    if getattr(options, "ddio_way_part", -1) != -1 and protocol != "CHI":
+    if getattr(options, "ddio_way_part", -1) != -1 and protocol not in (
+        "CHI",
+        "MESI_Two_Level",
+    ):
         raise ValueError(
-            "--ddio-way-part is only supported by the CHI protocol"
+            "--ddio-way-part is only supported by CHI and MESI_Two_Level"
         )
     exec(f"from . import {protocol}")
     try:
