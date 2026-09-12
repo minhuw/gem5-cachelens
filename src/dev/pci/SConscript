@@ -53,3 +53,5 @@ DebugFlag('PciHost')
 SimObject('CopyEngine.py', sim_objects=['CopyEngine'])
 Source('copy_engine.cc')
 DebugFlag('DMACopyEngine')
+
+GTest('config_write.test', 'config_write.test.cc')

@@ -54,6 +54,7 @@
 #include "base/str.hh"
 #include "base/trace.hh"
 #include "debug/PciDevice.hh"
+#include "dev/pci/config_write.hh"
 #include "mem/packet.hh"
 #include "mem/packet_access.hh"
 #include "sim/byteswap.hh"
@@ -301,6 +302,18 @@ PciDevice::writeConfig(PacketPtr pkt)
         panic("Out-of-range access to PCI config space!\n");
     }
 
+    const auto writeCommandStatus =
+        [this, offset](unsigned size, uint32_t value)
+        {
+            const auto result = pci::applyCommandStatusWrite(
+                letoh(config.command), letoh(config.status), offset, size,
+                value);
+            config.command = htole(result.command);
+            config.status = htole(result.status);
+            if (result.rangeChanged)
+                pioPort.sendRangeChange();
+        };
+
     switch (pkt->getSize()) {
       case sizeof(uint8_t):
         switch (offset) {
@@ -313,14 +326,12 @@ PciDevice::writeConfig(PacketPtr pkt)
           case PCI_LATENCY_TIMER:
             config.latencyTimer = pkt->getLE<uint8_t>();
             break;
-          // Handle misaligned command register write
-          case 0x5: {
-            uint16_t command = letoh(config.command);
-            command = (command & 0xff) |
-                (static_cast<uint16_t>(pkt->getLE<uint8_t>()) << 8);
-            config.command = htole(command);
+          case PCI_COMMAND:
+          case PCI_COMMAND + 1:
+          case PCI_STATUS:
+          case PCI_STATUS + 1:
+            writeCommandStatus(sizeof(uint8_t), pkt->getLE<uint8_t>());
             break;
-          }
           /* Do nothing for these read-only registers */
           case PCI0_INTERRUPT_PIN:
           case PCI0_MINIMUM_GRANT:
@@ -339,12 +350,8 @@ PciDevice::writeConfig(PacketPtr pkt)
       case sizeof(uint16_t):
         switch (offset) {
           case PCI_COMMAND:
-            config.command = htole(pkt->getLE<uint16_t>());
-            // IO or memory space may have been enabled/disabled.
-            pioPort.sendRangeChange();
-            break;
           case PCI_STATUS:
-            config.status = htole(pkt->getLE<uint16_t>());
+            writeCommandStatus(sizeof(uint16_t), pkt->getLE<uint16_t>());
             break;
           case PCI_CACHE_LINE_SIZE:
             config.cacheLineSize = pkt->getLE<uint8_t>();
@@ -382,12 +389,7 @@ PciDevice::writeConfig(PacketPtr pkt)
             break;
 
           case PCI_COMMAND:
-            // This could also clear some of the error bits in the Status
-            // register. However they should never get set, so lets ignore
-            // it for now
-            config.command = pkt->getLE<uint32_t>();
-            // IO or memory space may have been enabled/disabled.
-            pioPort.sendRangeChange();
+            writeCommandStatus(sizeof(uint32_t), pkt->getLE<uint32_t>());
             break;
 
           default:
