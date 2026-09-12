@@ -127,7 +127,7 @@ Pc::postPciInt(int line)
 void
 Pc::clearPciInt(int line)
 {
-    warn_once("Tried to clear PCI interrupt %d\n", line);
+    southBridge->ioApic->lowerInterruptPin(line);
 }
 
 } // namespace gem5
