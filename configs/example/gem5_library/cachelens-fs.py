@@ -87,6 +87,11 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mem-size", default="8GiB")
 
     parser.add_argument("--num-nics", type=int, default=1)
+    parser.add_argument(
+        "--enable-pvrdma",
+        action="store_true",
+        help="Attach one PVRDMA function beside the x86 E1000.",
+    )
     parser.add_argument("--num-loadgens", type=int, default=1)
     parser.add_argument(
         "--loadgen-type", choices=("Simple", "Pcap"), default="Simple"
@@ -252,6 +257,11 @@ def _validate_args(parser, args) -> None:
         parser.error("--model-profile arm-generic requires ARM.")
     if args.model_profile == "x86-generic" and args.isa != "x86":
         parser.error("--model-profile x86-generic requires x86.")
+    if args.enable_pvrdma:
+        if args.isa != "x86":
+            parser.error("--enable-pvrdma is only valid for x86.")
+        if args.num_nics != 1:
+            parser.error("--enable-pvrdma requires exactly one NIC.")
 
     if args.readfile is not None and not args.readfile.is_file():
         parser.error(f"--readfile is not a file: {args.readfile}")
@@ -308,6 +318,7 @@ def _validate_args(parser, args) -> None:
 def _network_options(args):
     return {
         "num_nics": args.num_nics,
+        **({"enable_pvrdma": True} if args.enable_pvrdma else {}),
         "num_loadgens": args.num_loadgens,
         "loadgen_type": args.loadgen_type,
         "packet_rate": args.packet_rate,

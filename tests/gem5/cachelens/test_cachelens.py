@@ -42,7 +42,9 @@ class CacheLensExactProtocolFixture(Gem5Fixture):
         return self._protocol_defconfigs[self._exact_protocol]
 
 
-def cachelens_board_test(isa, num_nics, expect_reject=False):
+def cachelens_board_test(
+    isa, num_nics, expect_reject=False, enable_pvrdma=False
+):
     marker = (
         "CACHELENS_BOARD_REJECT_OK"
         if expect_reject
@@ -51,9 +53,12 @@ def cachelens_board_test(isa, num_nics, expect_reject=False):
     config_args = ["--isa", isa, "--num-nics", str(num_nics)]
     if expect_reject:
         config_args.append("--expect-reject")
+    if enable_pvrdma:
+        config_args.append("--enable-pvrdma")
 
+    suffix = "-pvrdma" if enable_pvrdma else ""
     gem5_verify_config(
-        name=f"cachelens-{isa}-{num_nics}-nic-board-config",
+        name=f"cachelens-{isa}-{num_nics}-nic{suffix}-board-config",
         fixtures=(),
         verifiers=(
             verifier.MatchRegex(
@@ -69,6 +74,93 @@ def cachelens_board_test(isa, num_nics, expect_reject=False):
         valid_isas=(constants.all_compiled_tag,),
         valid_hosts=constants.supported_hosts,
         length=constants.quick_tag,
+    )
+
+
+def cachelens_pvrdma_parser_test():
+    gem5_verify_config(
+        name="cachelens-pvrdma-parser-config",
+        fixtures=(),
+        verifiers=(
+            verifier.MatchRegex(re.compile("CACHELENS_PVRDMA_PARSER_OK")),
+        ),
+        config=joinpath(
+            absdirpath(__file__),
+            "configs",
+            "cachelens_pvrdma_parser_probe.py",
+        ),
+        config_args=(),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
+
+
+def cachelens_pvrdma_instantiate_test(host):
+    def run_test(params):
+        tempdir = Path(params.fixtures[constants.tempdir_fixture_name].path)
+        gem5 = params.fixtures[constants.gem5_binary_fixture_name].path
+        probe = joinpath(
+            absdirpath(__file__),
+            "configs",
+            "cachelens_board_probe.py",
+        )
+        kernel = joinpath(
+            config.base_dir,
+            "tests",
+            "test-progs",
+            "cachelens-checkpoint",
+            "bin",
+            "x86",
+            "linux",
+            "cachelens-checkpoint",
+        )
+        for hierarchy in ("classic", "mesi-two-level"):
+            checkpoint = tempdir / f"{hierarchy}-checkpoint"
+            for phase in ("save", "restore"):
+                command = [
+                    gem5,
+                    "-d",
+                    (tempdir / f"{hierarchy}-{phase}").as_posix(),
+                    probe,
+                    "--isa",
+                    "x86",
+                    "--num-nics",
+                    "1",
+                    "--enable-pvrdma",
+                    "--hierarchy",
+                    hierarchy,
+                    "--phase",
+                    phase,
+                    "--checkpoint",
+                    checkpoint.as_posix(),
+                    "--kernel",
+                    kernel,
+                ]
+                result = subprocess.run(
+                    command,
+                    cwd=config.base_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                print(result.stdout)
+                assert result.returncode == 0
+                assert (
+                    "CACHELENS_PVRDMA_INSTANTIATED "
+                    f"hierarchy={hierarchy} phase={phase} "
+                    "dma=IDE,E1000,PVRDMA"
+                ) in result.stdout
+
+    name = f"cachelens-pvrdma-instantiate-{host}-opt"
+    TestSuite(
+        name=name,
+        fixtures=[
+            CacheLensExactProtocolFixture("x86", "opt", "MESI_Two_Level"),
+            TempdirFixture(),
+        ],
+        tags=["X86", "opt", constants.quick_tag, host],
+        tests=[TestFunction(run_test, name=name)],
     )
 
 
@@ -418,7 +510,11 @@ for num_nics in range(4):
 cachelens_board_test(isa="arm", num_nics=4, expect_reject=True)
 cachelens_board_test(isa="x86", num_nics=0)
 cachelens_board_test(isa="x86", num_nics=1)
+cachelens_board_test(isa="x86", num_nics=1, enable_pvrdma=True)
 cachelens_board_test(isa="x86", num_nics=2, expect_reject=True)
+cachelens_pvrdma_parser_test()
+for host in constants.supported_hosts:
+    cachelens_pvrdma_instantiate_test(host)
 
 for protocol in ("CHI", "MESI_Two_Level"):
     cachelens_export_test(protocol)
