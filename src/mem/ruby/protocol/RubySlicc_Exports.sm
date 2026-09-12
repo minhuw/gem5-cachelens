@@ -72,6 +72,7 @@ structure(WriteMask, external="yes", desc="...") {
   int count();
   int count(int);
   int countChunks(int);
+  WriteMask extractFirstChunk(int);
   bool test(int);
   int getBlockSize();
   void setBlockSize(int);

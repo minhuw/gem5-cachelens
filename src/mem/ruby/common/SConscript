@@ -43,3 +43,5 @@ Source('IntVec.cc')
 Source('NetDest.cc')
 Source('SubBlock.cc')
 Source('WriteMask.cc')
+
+GTest('write_mask.test', 'write_mask.test.cc')
