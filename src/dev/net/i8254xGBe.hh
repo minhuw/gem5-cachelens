@@ -46,6 +46,7 @@
 #include "dev/net/etherint.hh"
 #include "dev/net/etherpkt.hh"
 #include "dev/net/i8254xGBe_defs.hh"
+#include "dev/net/i8254xGBe_rx_desc.hh"
 #include "dev/net/pktfifo.hh"
 #include "dev/pci/device.hh"
 #include "mem/request.hh"
@@ -103,6 +104,50 @@ class IGbE : public EtherDevice
     void rxNotePayloadComplete(int idx);
     void rxNoteWritebackComplete(int idx);
     Addr rxDescBuffer(const igbreg::RxDesc *desc);
+
+    // TX descriptors are active from software publication at TDT until the
+    // corresponding descriptor writeback advances TDH. Reclaimed entries are
+    // represented by Uninitialized and are outside all queue distributions.
+    using TxDescState = IGbETxDescState;
+
+    struct TxDescTrack
+    {
+        TxDescState state = TxDescState::Uninitialized;
+        uint64_t generation = 0;
+        Tick postedTick = 0;
+        bool postedTickValid = false;
+        bool postedWaitSampled = false;
+    };
+
+    std::vector<TxDescTrack> txDescTrack;
+    uint64_t txCntPosted = 0;
+    uint64_t txCntCached = 0;
+    uint64_t txCntPayload = 0;
+    uint64_t txCntComplete = 0;
+    Tick txLastQueueSample = 0;
+    Tick txLastFifoSample = 0;
+
+    // These deques exactly parallel TxDescCache::{unused,used}Cache.
+    std::deque<int> txUnusedIndices;
+    std::deque<int> txUsedIndices;
+
+    void txEnsureTrack(long len);
+    void txQueueReset();
+    void txQueueSample();
+    void txQueueStatsReset();
+    void txTransition(int idx, TxDescState to);
+    void txNoteAreaChanged();
+    void txNoteTdtWrite(long old_tail, long new_tail);
+    void txNoteFetched(int idx);
+    void txNotePayloadStart(int idx);
+    void txNotePayloadStop(int idx, bool consumed);
+    void txNoteContextConsumed(int idx);
+    void txNoteWritebackComplete(int idx);
+    void txValidateQuick(bool ring_geometry_safe = false);
+    void txValidateConservation(bool ring_geometry_safe = true);
+    int txFrontUnusedIndex() const;
+    void txMoveFrontToUsed();
+
     IGbEInt *etherInt;
 
     // device registers
@@ -280,7 +325,7 @@ class IGbE : public EtherDevice
         virtual Request::Flags descFetchCategory() const { return 0; }
         virtual Request::Flags descWritebackCategory() const { return 0; }
 
-        /** RX descriptor lifecycle hooks (no-ops for TX). */
+        /** Descriptor lifecycle hooks, specialized by RX and TX caches. */
         virtual void noteFetched(int old_cp, int count) {}
         virtual void noteWbComplete(int old_head, int count) {}
 
@@ -383,6 +428,10 @@ class IGbE : public EtherDevice
             return (descTail() - descHead() + len) % len == len - 1;
         }
 
+        /* Return whether a descriptor fetch or writeback DMA is active. */
+        int descriptorsFetching() const { return curFetching; }
+        int descriptorsWritingBack() const { return wbOut; }
+
         /* Return the number of descriptors used and not written back.
          */
         unsigned descUsed() const { return usedCache.size(); }
@@ -390,10 +439,12 @@ class IGbE : public EtherDevice
         /* Return the number of cache unused descriptors we have. */
         unsigned descUnused() const { return unusedCache.size(); }
 
-        /* Get into a state where the descriptor address/head/etc colud be
-         * changed */
+        /* Get into a state where the descriptor address/head/etc could be
+         * changed. */
         void reset();
 
+        /** Expose serialized cursor semantics for strict restore validation. */
+        int cacheCursor() const { return cachePnt; }
 
         void serialize(CheckpointOut &cp) const override;
         void unserialize(CheckpointIn &cp) override;
@@ -493,6 +544,8 @@ class IGbE : public EtherDevice
             return Request::NIC_TX_DESC_WRITEBACK;
         }
         void updateHead(long h) override { igbe->regs.tdh(h); }
+        void noteFetched(int old_cp, int count) override;
+        void noteWbComplete(int old_head, int count) override;
         void enableSm() override;
         void actionAfterWb() override;
         void fetchAfterWb() override {
@@ -563,7 +616,20 @@ class IGbE : public EtherDevice
          * @return packet can't be sent out because it's a multi-descriptor
          * packet
          */
-        bool packetMultiDesc() { return pktMultiDesc;}
+        bool packetMultiDesc() const { return pktMultiDesc; }
+
+        /** Return whether restored cache state carries payload assembly work. */
+        bool hasPayloadWork() const
+        {
+            return igbeTxPayloadWorkLive({
+                .packetDone = pktDone,
+                .packetWaiting = pktWaiting,
+                .packetMultiDesc = pktMultiDesc,
+                .packetPointer = static_cast<bool>(pktPtr),
+                .tsoActive = useTso,
+                .tsoPacketHasHeader = tsoPktHasHeader,
+            });
+        }
 
         /** Called by event when dma to write packet is completed
          */
@@ -580,6 +646,15 @@ class IGbE : public EtherDevice
                     a, enabled);
             completionAddress = a;
             completionEnabled = enabled;
+        }
+
+        /** Return whether restored cache state carries any TX event. */
+        bool hasRestoreEventState() const
+        {
+            return pktEvent.scheduled() || headerEvent.scheduled() ||
+                nullEvent.scheduled() || wbEvent.scheduled() ||
+                fetchEvent.scheduled() || wbDelayEvent.scheduled() ||
+                fetchDelayEvent.scheduled();
         }
 
         bool hasOutstandingEvents() override;
@@ -617,7 +692,22 @@ class IGbE : public EtherDevice
               ADD_STAT(rxPostedWait, statistics::units::Tick::get(),
                        "Time from RX descriptor post to NIC payload write"),
               ADD_STAT(rxDmaEngineLimit, statistics::units::Count::get(),
-                       "Configured RX payload DMA engine limit; currently one")
+                       "Configured RX payload DMA engine limit; currently one"),
+              ADD_STAT(txReplenishQueue, statistics::units::Count::get(),
+                       "Time-weighted TX published/cached descriptor queue"),
+              ADD_STAT(txInFlightQueue, statistics::units::Count::get(),
+                       "Time-weighted TX payload/header DMA descriptor queue"),
+              ADD_STAT(txCompletionQueue, statistics::units::Count::get(),
+                       "Time-weighted TX completed-not-visible descriptor queue"),
+              ADD_STAT(txFifoQueue, statistics::units::Count::get(),
+                       "Time-weighted TX FIFO packet occupancy"),
+              ADD_STAT(txPostedWait, statistics::units::Tick::get(),
+                       "Time from TX descriptor publication to payload DMA"),
+              ADD_STAT(txQueueTransitions, statistics::units::Count::get(),
+                       "TX descriptor lifecycle transitions"),
+              ADD_STAT(txConservationViolations,
+                       statistics::units::Count::get(),
+                       "TX descriptor lifecycle conservation violations")
         {
             rxQueue.init(0, 4096, 1);
             rxReplenishQueue.init(0, 4096, 1);
@@ -625,6 +715,11 @@ class IGbE : public EtherDevice
             rxReservedDescriptors = 0;
             rxPostedWait.init(1);
             rxDmaEngineLimit = 1;
+            txReplenishQueue.init(0, 4096, 1);
+            txInFlightQueue.init(0, 4096, 1);
+            txCompletionQueue.init(0, 4096, 1);
+            txFifoQueue.init(0, 4096, 1);
+            txPostedWait.init(1);
         }
 
         void preDumpStats() override;
@@ -639,6 +734,13 @@ class IGbE : public EtherDevice
         statistics::Scalar rxReservedDescriptors;
         statistics::SparseHistogram rxPostedWait;
         statistics::Scalar rxDmaEngineLimit;
+        statistics::Distribution txReplenishQueue;
+        statistics::Distribution txInFlightQueue;
+        statistics::Distribution txCompletionQueue;
+        statistics::Distribution txFifoQueue;
+        statistics::SparseHistogram txPostedWait;
+        statistics::Scalar txQueueTransitions;
+        statistics::Scalar txConservationViolations;
     } igbeStats;
 
   public:

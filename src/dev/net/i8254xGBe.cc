@@ -85,7 +85,10 @@ IGbE::IGbE(const Params &p)
     warn_once("IGbE RX payload DMA is serialized (rx_dma_engines=1); "
               "this is not a multi-engine NIC model");
     igbeStats.rxDmaEngineLimit = rxDmaEngines;
-    statistics::registerResetCallback([this] { rxQueueStatsReset(); });
+    statistics::registerResetCallback([this] {
+        rxQueueStatsReset();
+        txQueueStatsReset();
+    });
     etherInt = new IGbEInt(name() + ".int", this);
 
     // Initialized internal registers per Intel documentation
@@ -195,6 +198,8 @@ IGbE::IGbEStats::preDumpStats()
 {
     statistics::Group::preDumpStats();
     igbe.rxQueueSample();
+    igbe.txQueueSample();
+    igbe.txValidateConservation();
 }
 
 void
@@ -396,6 +401,314 @@ IGbE::rxDescBuffer(const igbreg::RxDesc *desc)
         return desc->adv_read.pkt;
       default:
         return 0;
+    }
+}
+
+void
+IGbE::txEnsureTrack(long len)
+{
+    if (len <= 0) {
+        txDescTrack.clear();
+        txUnusedIndices.clear();
+        txUsedIndices.clear();
+        txQueueReset();
+        return;
+    }
+    if ((long)txDescTrack.size() != len) {
+        txDescTrack.assign(len, TxDescTrack{});
+        txUnusedIndices.clear();
+        txUsedIndices.clear();
+        txQueueReset();
+    }
+}
+
+void
+IGbE::txQueueReset()
+{
+    txCntPosted = txCntCached = txCntPayload = txCntComplete = 0;
+    txLastQueueSample = curTick();
+    txLastFifoSample = curTick();
+}
+
+void
+IGbE::txQueueStatsReset()
+{
+    // The distributions have already been cleared. Preserve current queue
+    // occupancy, but begin weighting it at the reset tick.
+    txLastQueueSample = curTick();
+    txLastFifoSample = curTick();
+}
+
+void
+IGbE::txQueueSample()
+{
+    const Tick now = curTick();
+    Tick desc_delta = now - txLastQueueSample;
+    txLastQueueSample = now;
+    while (desc_delta) {
+        const int weight = std::min<Tick>(
+            desc_delta, std::numeric_limits<int>::max());
+        igbeStats.txReplenishQueue.sample(txCntPosted + txCntCached, weight);
+        igbeStats.txInFlightQueue.sample(txCntPayload, weight);
+        igbeStats.txCompletionQueue.sample(txCntComplete, weight);
+        desc_delta -= weight;
+    }
+
+    Tick fifo_delta = now - txLastFifoSample;
+    txLastFifoSample = now;
+    while (fifo_delta) {
+        const int weight = std::min<Tick>(
+            fifo_delta, std::numeric_limits<int>::max());
+        igbeStats.txFifoQueue.sample(txFifo.packets(), weight);
+        fifo_delta -= weight;
+    }
+}
+
+void
+IGbE::txTransition(int idx, TxDescState to)
+{
+    txEnsureTrack(regs.tdlen() >> 4);
+    if (idx < 0 || idx >= (int)txDescTrack.size()) {
+        igbeStats.txConservationViolations++;
+        return;
+    }
+
+    TxDescTrack &desc = txDescTrack[idx];
+    const TxDescState from = desc.state;
+    if (from == to)
+        return;
+
+    // Charge the interval ending at this transition to the old state.
+    txQueueSample();
+    auto decrement = [this](uint64_t &count) {
+        if (count == 0)
+            igbeStats.txConservationViolations++;
+        else
+            --count;
+    };
+    switch (from) {
+      case TxDescState::HostPosted: decrement(txCntPosted); break;
+      case TxDescState::NicDescCached: decrement(txCntCached); break;
+      case TxDescState::PayloadDmaInFlight: decrement(txCntPayload); break;
+      case TxDescState::CompleteNotVisible: decrement(txCntComplete); break;
+      case TxDescState::Uninitialized: break;
+    }
+    switch (to) {
+      case TxDescState::HostPosted: txCntPosted++; break;
+      case TxDescState::NicDescCached: txCntCached++; break;
+      case TxDescState::PayloadDmaInFlight: txCntPayload++; break;
+      case TxDescState::CompleteNotVisible: txCntComplete++; break;
+      case TxDescState::Uninitialized: break;
+    }
+    desc.state = to;
+    igbeStats.txQueueTransitions++;
+}
+
+void
+IGbE::txNoteAreaChanged()
+{
+    // Reconstruct active descriptors after a ring address, length or head write.
+    txQueueSample();
+    const long len = regs.tdlen() >> 4;
+    txDescTrack.assign(std::max(0L, len), TxDescTrack{});
+    txUnusedIndices.clear();
+    txUsedIndices.clear();
+    txCntPosted = txCntCached = txCntPayload = txCntComplete = 0;
+    txLastQueueSample = curTick();
+    if (len > 1) {
+        for (uint32_t idx : igbeDescRingRange(
+                 regs.tdh(), regs.tdt(), len)) {
+            TxDescTrack &desc = txDescTrack[idx];
+            desc.state = TxDescState::HostPosted;
+            desc.generation++;
+            // Ring geometry writes do not reveal the original TDT time.
+            // Keep it explicitly unknown rather than fabricating a fresh
+            // publication timestamp at the area-change tick.
+            desc.postedTick = 0;
+            desc.postedTickValid = false;
+            desc.postedWaitSampled = false;
+            txCntPosted++;
+            igbeStats.txQueueTransitions++;
+        }
+    }
+    txValidateConservation();
+}
+
+void
+IGbE::txNoteTdtWrite(long old_tail, long new_tail)
+{
+    const long len = regs.tdlen() >> 4;
+    txEnsureTrack(len);
+    if (len <= 1)
+        return;
+
+    for (uint32_t idx : igbeDescRingRange(old_tail, new_tail, len)) {
+        if (txDescTrack[idx].state != TxDescState::Uninitialized)
+            igbeStats.txConservationViolations++;
+        txTransition(idx, TxDescState::HostPosted);
+        txDescTrack[idx].generation++;
+        txDescTrack[idx].postedTick = curTick();
+        txDescTrack[idx].postedTickValid = true;
+        txDescTrack[idx].postedWaitSampled = false;
+    }
+    txValidateQuick(true);
+}
+
+void
+IGbE::txNoteFetched(int idx)
+{
+    if (idx < 0 || idx >= (int)txDescTrack.size()) {
+        igbeStats.txConservationViolations++;
+        return;
+    }
+    if (txDescTrack[idx].state == TxDescState::HostPosted)
+        txTransition(idx, TxDescState::NicDescCached);
+    else
+        igbeStats.txConservationViolations++;
+}
+
+void
+IGbE::txNotePayloadStart(int idx)
+{
+    if (idx >= 0 && idx < (int)txDescTrack.size() &&
+        txDescTrack[idx].state == TxDescState::NicDescCached) {
+        TxDescTrack &desc = txDescTrack[idx];
+        if (!desc.postedWaitSampled) {
+            if (igbeTxPostedWaitShouldSample(
+                    desc.postedTickValid, desc.postedWaitSampled) &&
+                curTick() >= desc.postedTick) {
+                igbeStats.txPostedWait.sample(curTick() - desc.postedTick, 1);
+            }
+            desc.postedWaitSampled = true;
+        }
+        txTransition(idx, TxDescState::PayloadDmaInFlight);
+        txValidateQuick();
+    } else {
+        igbeStats.txConservationViolations++;
+    }
+}
+
+void
+IGbE::txNotePayloadStop(int idx, bool consumed)
+{
+    if (idx >= 0 && idx < (int)txDescTrack.size() &&
+        txDescTrack[idx].state == TxDescState::PayloadDmaInFlight) {
+        txTransition(idx, consumed ? TxDescState::CompleteNotVisible :
+                     TxDescState::NicDescCached);
+        if (!consumed)
+            txValidateQuick();
+    } else {
+        igbeStats.txConservationViolations++;
+    }
+}
+
+void
+IGbE::txNoteContextConsumed(int idx)
+{
+    if (idx >= 0 && idx < (int)txDescTrack.size() &&
+        txDescTrack[idx].state == TxDescState::NicDescCached) {
+        txTransition(idx, TxDescState::CompleteNotVisible);
+    } else {
+        igbeStats.txConservationViolations++;
+    }
+}
+
+void
+IGbE::txNoteWritebackComplete(int idx)
+{
+    if (idx >= 0 && idx < (int)txDescTrack.size() &&
+        txDescTrack[idx].state == TxDescState::CompleteNotVisible) {
+        txTransition(idx, TxDescState::Uninitialized);
+        txDescTrack[idx].postedTick = 0;
+        txDescTrack[idx].postedTickValid = false;
+        txDescTrack[idx].postedWaitSampled = false;
+    } else {
+        igbeStats.txConservationViolations++;
+    }
+}
+
+int
+IGbE::txFrontUnusedIndex() const
+{
+    if (txUnusedIndices.empty())
+        return -1;
+    return txUnusedIndices.front();
+}
+
+void
+IGbE::txMoveFrontToUsed()
+{
+    if (txUnusedIndices.empty()) {
+        igbeStats.txConservationViolations++;
+        return;
+    }
+    const int idx = txUnusedIndices.front();
+    if (idx < 0 || idx >= static_cast<int>(txDescTrack.size()) ||
+        txDescTrack[idx].state != TxDescState::CompleteNotVisible) {
+        igbeStats.txConservationViolations++;
+    }
+    txUsedIndices.push_back(idx);
+    txUnusedIndices.pop_front();
+    txValidateQuick();
+}
+
+void
+IGbE::txValidateQuick(bool ring_geometry_safe)
+{
+    const IGbETxLifecycleCounts counts{
+        static_cast<uint32_t>(txCntPosted),
+        static_cast<uint32_t>(txCntCached),
+        static_cast<uint32_t>(txCntPayload),
+        static_cast<uint32_t>(txCntComplete)};
+    const bool ring_valid = !ring_geometry_safe ||
+        counts.active() == igbeDescRingOccupancy(
+            regs.tdh(), regs.tdt(), regs.tdlen() >> 4);
+    if (!ring_valid || !igbeTxLifecycleQuickValid(
+            counts, txUnusedIndices.size(), txUsedIndices.size(),
+            txDescCache.descUnused(), txDescCache.descUsed())) {
+        igbeStats.txConservationViolations++;
+    }
+}
+
+void
+IGbE::txValidateConservation(bool ring_geometry_safe)
+{
+    // Full tracker scans are reserved for stable lifecycle boundaries. Fetch
+    // and writeback batch hooks below validate after their whole batch moves;
+    // per-descriptor payload/context/FIFO operations use txValidateQuick().
+    IGbETxLifecycleCounts counts{
+        static_cast<uint32_t>(txCntPosted),
+        static_cast<uint32_t>(txCntCached),
+        static_cast<uint32_t>(txCntPayload),
+        static_cast<uint32_t>(txCntComplete)};
+    IGbETxLifecycleCounts scanned;
+    uint32_t initialized = 0;
+    for (const auto &desc : txDescTrack) {
+        switch (desc.state) {
+          case TxDescState::HostPosted: scanned.posted++; break;
+          case TxDescState::NicDescCached: scanned.cached++; break;
+          case TxDescState::PayloadDmaInFlight: scanned.inFlight++; break;
+          case TxDescState::CompleteNotVisible: scanned.complete++; break;
+          case TxDescState::Uninitialized: continue;
+        }
+        initialized++;
+    }
+
+    const uint32_t occupancy = ring_geometry_safe ?
+        igbeDescRingOccupancy(regs.tdh(), regs.tdt(), regs.tdlen() >> 4) :
+        counts.active();
+    const bool counters_match = counts.posted == scanned.posted &&
+        counts.cached == scanned.cached &&
+        counts.inFlight == scanned.inFlight &&
+        counts.complete == scanned.complete;
+    const bool cache_alignment =
+        txUnusedIndices.size() == txDescCache.descUnused() &&
+        txUsedIndices.size() == txDescCache.descUsed();
+    if (!counters_match || !cache_alignment ||
+        !igbeTxLifecycleAccountingValid(
+            counts, initialized, txUnusedIndices.size(),
+            txUsedIndices.size(), occupancy)) {
+        igbeStats.txConservationViolations++;
     }
 }
 
@@ -650,7 +963,6 @@ IGbE::write(PacketPtr pkt)
     uint32_t val = pkt->getLE<uint32_t>();
 
     Regs::RCTL oldrctl;
-    Regs::TCTL oldtctl;
 
     switch (daddr) {
       case REG_CTRL:
@@ -836,15 +1148,11 @@ IGbE::write(PacketPtr pkt)
         regs.fcttv = val;
         break;
       case REG_TCTL:
-        regs.tctl = val;
-        oldtctl = regs.tctl;
+        // Enable resumes TX, including descriptors prefetched while disabled.
         regs.tctl = val;
         if (regs.tctl.en())
             txTick = true;
         restartClock();
-        if (regs.tctl.en() && !oldtctl.en()) {
-            txDescCache.reset();
-        }
         break;
       case REG_PBA:
         regs.pba.rxa(val);
@@ -920,18 +1228,22 @@ IGbE::write(PacketPtr pkt)
       case REG_TDBAL:
         regs.tdba.tdbal( val & ~mask(4));
         txDescCache.areaChanged();
+        txNoteAreaChanged();
         break;
       case REG_TDBAH:
         regs.tdba.tdbah(val);
         txDescCache.areaChanged();
+        txNoteAreaChanged();
         break;
       case REG_TDLEN:
         regs.tdlen = val & ~mask(7);
         txDescCache.areaChanged();
+        txNoteAreaChanged();
         break;
       case REG_TDH:
         regs.tdh = val;
         txDescCache.areaChanged();
+        txNoteAreaChanged();
         break;
       case REG_TXDCA_CTL:
         regs.txdca_ctl = val;
@@ -939,7 +1251,11 @@ IGbE::write(PacketPtr pkt)
             panic("No support for DCA\n");
         break;
       case REG_TDT:
-        regs.tdt = val;
+        {
+            const long old_tdt = regs.tdt();
+            regs.tdt = val;
+            txNoteTdtWrite(old_tdt, regs.tdt());
+        }
         DPRINTF(EthernetSM, "TXS: TX Tail pointer updated\n");
         if (drainState() == DrainState::Running) {
             DPRINTF(EthernetSM, "TXS: TDT Fetching Descriptors!\n");
@@ -1909,6 +2225,38 @@ IGbE::TxDescCache::TxDescCache(IGbE *i, const std::string n, int s)
 }
 
 void
+IGbE::TxDescCache::noteFetched(int old_cp, int count)
+{
+    const long len = descLen();
+    if (len <= 0 || count <= 0)
+        return;
+    for (uint32_t idx : igbeDescRingIndices(old_cp, count, len)) {
+        igbe->txUnusedIndices.push_back(idx);
+        igbe->txNoteFetched(idx);
+    }
+    igbe->txValidateConservation();
+}
+
+void
+IGbE::TxDescCache::noteWbComplete(int old_head, int count)
+{
+    const long len = descLen();
+    for (uint32_t fallback : igbeDescRingIndices(old_head, count, len)) {
+        int idx = fallback;
+        if (!igbe->txUsedIndices.empty()) {
+            idx = igbe->txUsedIndices.front();
+            igbe->txUsedIndices.pop_front();
+            if (idx != static_cast<int>(fallback))
+                igbe->igbeStats.txConservationViolations++;
+        } else {
+            igbe->igbeStats.txConservationViolations++;
+        }
+        igbe->txNoteWritebackComplete(idx);
+    }
+    igbe->txValidateConservation();
+}
+
+void
 IGbE::TxDescCache::processContextDesc()
 {
     assert(unusedCache.size());
@@ -1949,8 +2297,11 @@ IGbE::TxDescCache::processContextDesc()
         }
 
         txd_op::setDd(desc);
+        const int tx_idx = igbe->txFrontUnusedIndex();
+        igbe->txNoteContextConsumed(tx_idx);
         unusedCache.pop_front();
         usedCache.push_back(desc);
+        igbe->txMoveFrontToUsed();
     }
 
     if (!unusedCache.size())
@@ -1978,6 +2329,7 @@ IGbE::TxDescCache::processContextDesc()
         assert(txd_op::isData(desc) && txd_op::getLen(desc) >= tsoHeaderLen);
         pktWaiting = true;
         assert(tsoHeaderLen <= 256);
+        igbe->txNotePayloadStart(igbe->txFrontUnusedIndex());
         igbe->txPayloadRead(pciToDma(txd_op::getBuf(desc)), tsoHeaderLen,
                             &headerEvent, tsoHeader, 0);
     }
@@ -1997,12 +2349,15 @@ IGbE::TxDescCache::headerComplete()
     if (txd_op::getLen(desc) == tsoHeaderLen) {
         tsoDescBytesUsed = 0;
         tsoLoadedHeader = true;
+        igbe->txNotePayloadStop(igbe->txFrontUnusedIndex(), true);
         unusedCache.pop_front();
         usedCache.push_back(desc);
+        igbe->txMoveFrontToUsed();
     } else {
         DPRINTF(EthernetDesc, "TSO: header part of larger payload\n");
         tsoDescBytesUsed = tsoHeaderLen;
         tsoLoadedHeader = true;
+        igbe->txNotePayloadStop(igbe->txFrontUnusedIndex(), false);
     }
     enableSm();
     igbe->checkDrain();
@@ -2064,6 +2419,7 @@ IGbE::TxDescCache::getPacketData(EthPacketPtr p)
     pktPtr = p;
 
     pktWaiting = true;
+    igbe->txNotePayloadStart(igbe->txFrontUnusedIndex());
 
     DPRINTF(EthernetDesc, "Starting DMA of packet at offset %d\n", p->length);
 
@@ -2135,8 +2491,10 @@ IGbE::TxDescCache::pktComplete()
         (pktPtr->length < ( tsoMss + tsoHeaderLen) &&
          tsoTotalLen != tsoUsedLen && useTso)) {
         assert(!useTso || (tsoDescBytesUsed == txd_op::getLen(desc)));
+        igbe->txNotePayloadStop(igbe->txFrontUnusedIndex(), true);
         unusedCache.pop_front();
         usedCache.push_back(desc);
+        igbe->txMoveFrontToUsed();
 
         tsoDescBytesUsed = 0;
         pktDone = true;
@@ -2256,10 +2614,14 @@ IGbE::TxDescCache::pktComplete()
     }
 
 
-    if (!useTso ||  txd_op::getLen(desc) == tsoDescBytesUsed) {
+    const bool descriptor_consumed =
+        !useTso || txd_op::getLen(desc) == tsoDescBytesUsed;
+    igbe->txNotePayloadStop(igbe->txFrontUnusedIndex(), descriptor_consumed);
+    if (descriptor_consumed) {
         DPRINTF(EthernetDesc, "Descriptor Done\n");
         unusedCache.pop_front();
         usedCache.push_back(desc);
+        igbe->txMoveFrontToUsed();
         tsoDescBytesUsed = 0;
     }
 
@@ -2392,8 +2754,8 @@ IGbE::TxDescCache::enableSm()
 bool
 IGbE::TxDescCache::hasOutstandingEvents()
 {
-    return pktEvent.scheduled() || wbEvent.scheduled() ||
-        fetchEvent.scheduled();
+    return pktEvent.scheduled() || headerEvent.scheduled() ||
+        wbEvent.scheduled() || fetchEvent.scheduled();
 }
 
 
@@ -2476,6 +2838,7 @@ IGbE::txStateMachine()
         && !txDescCache.packetMultiDesc() && txPacket->length) {
         DPRINTF(EthernetSM, "TXS: packet placed in TX FIFO\n");
         DPRINTF(EthernetDpdk, "TXS: packet placed in TX FIFO\n");
+        txQueueSample();
 #ifndef NDEBUG
         bool success =
 #endif
@@ -2776,6 +3139,7 @@ IGbE::txWire()
         etherDeviceStats.txBytes += txFifo.front()->length;
         etherDeviceStats.txPackets++;
 
+        txQueueSample();
         txFifo.pop();
     }
 }
@@ -2826,6 +3190,7 @@ IGbE::ethTxDone()
 void
 IGbE::serialize(CheckpointOut &cp) const
 {
+    const_cast<IGbE *>(this)->txValidateConservation();
     PciDevice::serialize(cp);
 
     regs.serialize(cp);
@@ -2894,6 +3259,34 @@ IGbE::serialize(CheckpointOut &cp) const
     SERIALIZE_SCALAR(rxLastQueueSample);
     SERIALIZE_CONTAINER(rxUnusedIndices);
     SERIALIZE_CONTAINER(rxUsedIndices);
+
+    const unsigned txLifecycleVersion = 2;
+    SERIALIZE_SCALAR(txLifecycleVersion);
+    std::vector<unsigned> txDescStates;
+    std::vector<uint64_t> txDescGenerations;
+    std::vector<Tick> txDescPostedTicks;
+    std::vector<unsigned> txDescPostedTickValid;
+    std::vector<unsigned> txDescPostedWaitSampled;
+    for (const auto &desc : txDescTrack) {
+        txDescStates.push_back(static_cast<unsigned>(desc.state));
+        txDescGenerations.push_back(desc.generation);
+        txDescPostedTicks.push_back(desc.postedTick);
+        txDescPostedTickValid.push_back(desc.postedTickValid);
+        txDescPostedWaitSampled.push_back(desc.postedWaitSampled);
+    }
+    SERIALIZE_CONTAINER(txDescStates);
+    SERIALIZE_CONTAINER(txDescGenerations);
+    SERIALIZE_CONTAINER(txDescPostedTicks);
+    SERIALIZE_CONTAINER(txDescPostedTickValid);
+    SERIALIZE_CONTAINER(txDescPostedWaitSampled);
+    SERIALIZE_SCALAR(txCntPosted);
+    SERIALIZE_SCALAR(txCntCached);
+    SERIALIZE_SCALAR(txCntPayload);
+    SERIALIZE_SCALAR(txCntComplete);
+    SERIALIZE_SCALAR(txLastQueueSample);
+    SERIALIZE_SCALAR(txLastFifoSample);
+    SERIALIZE_CONTAINER(txUnusedIndices);
+    SERIALIZE_CONTAINER(txUsedIndices);
 
     txDescCache.serializeSection(cp, "TxDescCache");
     rxDescCache.serializeSection(cp, "RxDescCache");
@@ -2991,8 +3384,161 @@ IGbE::unserialize(CheckpointIn &cp)
         UNSERIALIZE_CONTAINER(rxUsedIndices);
     }
 
+    unsigned txLifecycleVersion = 0;
+    std::vector<unsigned> txDescStates;
+    std::vector<uint64_t> txDescGenerations;
+    std::vector<Tick> txDescPostedTicks;
+    std::vector<unsigned> txDescPostedTickValid;
+    std::vector<unsigned> txDescPostedWaitSampled;
+    const bool has_tx_lifecycle =
+        optParamIn(cp, "txLifecycleVersion", txLifecycleVersion);
+    if (has_tx_lifecycle) {
+        fatal_if(txLifecycleVersion < 1 || txLifecycleVersion > 2,
+                 "Unsupported IGbE TX lifecycle checkpoint version %u",
+                 txLifecycleVersion);
+        UNSERIALIZE_CONTAINER(txDescStates);
+        UNSERIALIZE_CONTAINER(txDescGenerations);
+        if (txLifecycleVersion >= 2) {
+            UNSERIALIZE_CONTAINER(txDescPostedTicks);
+            UNSERIALIZE_CONTAINER(txDescPostedTickValid);
+            UNSERIALIZE_CONTAINER(txDescPostedWaitSampled);
+        } else {
+            txDescPostedTicks.assign(txDescStates.size(), 0);
+            txDescPostedTickValid.assign(txDescStates.size(), 0);
+            txDescPostedWaitSampled.assign(txDescStates.size(), 0);
+        }
+        fatal_if(txDescStates.size() != txDescGenerations.size() ||
+                 txDescStates.size() != txDescPostedTicks.size() ||
+                 txDescStates.size() != txDescPostedTickValid.size() ||
+                 txDescStates.size() != txDescPostedWaitSampled.size(),
+                 "Invalid IGbE TX lifecycle checkpoint state");
+        txDescTrack.resize(txDescStates.size());
+        for (size_t i = 0; i < txDescTrack.size(); ++i) {
+            fatal_if(txDescStates[i] >
+                     static_cast<unsigned>(TxDescState::CompleteNotVisible),
+                     "Invalid IGbE TX descriptor state in checkpoint");
+            txDescTrack[i].state = static_cast<TxDescState>(txDescStates[i]);
+            fatal_if(txDescPostedTickValid[i] > 1 ||
+                     txDescPostedWaitSampled[i] > 1,
+                     "Invalid IGbE TX descriptor telemetry flags");
+            txDescTrack[i].generation = txDescGenerations[i];
+            txDescTrack[i].postedTick = txDescPostedTicks[i];
+            txDescTrack[i].postedTickValid = txDescPostedTickValid[i];
+            txDescTrack[i].postedWaitSampled = txDescPostedWaitSampled[i];
+        }
+        UNSERIALIZE_SCALAR(txCntPosted);
+        UNSERIALIZE_SCALAR(txCntCached);
+        UNSERIALIZE_SCALAR(txCntPayload);
+        UNSERIALIZE_SCALAR(txCntComplete);
+        UNSERIALIZE_SCALAR(txLastQueueSample);
+        UNSERIALIZE_SCALAR(txLastFifoSample);
+        UNSERIALIZE_CONTAINER(txUnusedIndices);
+        UNSERIALIZE_CONTAINER(txUsedIndices);
+    }
+
+    // Restore the descriptor cache before deciding whether missing lifecycle
+    // telemetry can be reconstructed. Legacy checkpoints carry the stable
+    // cache counters and queues needed to prove that the TX path is empty.
     txDescCache.unserializeSection(cp, "TxDescCache");
     rxDescCache.unserializeSection(cp, "RxDescCache");
+
+    const long tx_len = regs.tdlen() >> 4;
+    fatal_if(tx_len < 0, "Invalid IGbE TX ring length in checkpoint");
+
+    if (!has_tx_lifecycle) {
+        const uint32_t ring_occupancy =
+            igbeDescRingOccupancy(regs.tdh(), regs.tdt(), tx_len);
+        const uint32_t tx_packet_bytes = txPacket ?
+            std::max(txPacket->length, txPacket->simLength) : 0;
+        const bool descriptor_events = txDescCache.hasRestoreEventState();
+        const bool payload_work = txDescCache.hasPayloadWork();
+        const IGbELegacyTxRestoreState legacy_tx_state{
+            .ringOccupancy = ring_occupancy,
+            .descriptorsUsed = txDescCache.descUsed(),
+            .descriptorsUnused = txDescCache.descUnused(),
+            .descriptorsFetching = txDescCache.descriptorsFetching(),
+            .descriptorsWritingBack =
+                txDescCache.descriptorsWritingBack(),
+            .descriptorEvents = descriptor_events,
+            .fifoPackets = txFifo.packets(),
+            .fifoBytes = txFifo.size(),
+            .fifoReserved = txFifo.reserved(),
+            .currentPacketBytes = tx_packet_bytes,
+            .payloadWork = payload_work,
+        };
+        fatal_if(!igbeLegacyTxRestoreQuiescent(legacy_tx_state),
+                 "Cannot reconstruct missing IGbE TX lifecycle from "
+                 "non-quiescent legacy checkpoint: ring=%u used=%u "
+                 "unused=%u fetching=%d writing_back=%d events=%d "
+                 "fifo_packets=%u fifo_bytes=%u fifo_reserved=%u "
+                 "tx_packet_bytes=%u payload_work=%d",
+                 ring_occupancy, txDescCache.descUsed(),
+                 txDescCache.descUnused(),
+                 txDescCache.descriptorsFetching(),
+                 txDescCache.descriptorsWritingBack(), descriptor_events,
+                 txFifo.packets(), txFifo.size(), txFifo.reserved(),
+                 tx_packet_bytes, payload_work);
+
+        txDescTrack.assign(tx_len, TxDescTrack{});
+        txUnusedIndices.clear();
+        txUsedIndices.clear();
+        txQueueReset();
+        return;
+    }
+
+    fatal_if(txDescTrack.size() != (size_t)tx_len,
+             "IGbE TX lifecycle ring length does not match TDLEN");
+    fatal_if(txLastQueueSample > curTick() || txLastFifoSample > curTick(),
+             "IGbE TX lifecycle checkpoint sample tick is in the future");
+    if (txLifecycleVersion >= 2) {
+        for (const auto &desc : txDescTrack) {
+            fatal_if(!igbeTxPublicationTelemetryValid(
+                         desc.state, desc.postedTick, desc.postedTickValid,
+                         desc.postedWaitSampled, curTick()),
+                     "Invalid IGbE TX descriptor publication telemetry");
+        }
+    }
+    fatal_if(txCntPosted > std::numeric_limits<uint32_t>::max() ||
+             txCntCached > std::numeric_limits<uint32_t>::max() ||
+             txCntPayload > std::numeric_limits<uint32_t>::max() ||
+             txCntComplete > std::numeric_limits<uint32_t>::max(),
+             "IGbE TX lifecycle checkpoint counter exceeds ring range");
+    std::vector<TxDescState> tx_states;
+    tx_states.reserve(txDescStates.size());
+    for (unsigned state : txDescStates)
+        tx_states.push_back(static_cast<TxDescState>(state));
+    fatal_if(!igbeTxRestoreLayoutValid(
+                 tx_states, txUnusedIndices, txUsedIndices,
+                 regs.tdh(), regs.tdt(), txDescCache.cacheCursor(), tx_len),
+             "Invalid IGbE TX lifecycle checkpoint descriptor layout");
+    IGbETxLifecycleCounts tx_counts{
+        static_cast<uint32_t>(txCntPosted),
+        static_cast<uint32_t>(txCntCached),
+        static_cast<uint32_t>(txCntPayload),
+        static_cast<uint32_t>(txCntComplete)};
+    IGbETxLifecycleCounts tx_scanned;
+    uint32_t tx_initialized = 0;
+    for (const auto &desc : txDescTrack) {
+        switch (desc.state) {
+          case TxDescState::HostPosted: tx_scanned.posted++; break;
+          case TxDescState::NicDescCached: tx_scanned.cached++; break;
+          case TxDescState::PayloadDmaInFlight: tx_scanned.inFlight++; break;
+          case TxDescState::CompleteNotVisible: tx_scanned.complete++; break;
+          case TxDescState::Uninitialized: continue;
+        }
+        tx_initialized++;
+    }
+    fatal_if(tx_counts.posted != tx_scanned.posted ||
+             tx_counts.cached != tx_scanned.cached ||
+             tx_counts.inFlight != tx_scanned.inFlight ||
+             tx_counts.complete != tx_scanned.complete ||
+             txUnusedIndices.size() != txDescCache.descUnused() ||
+             txUsedIndices.size() != txDescCache.descUsed() ||
+             !igbeTxLifecycleAccountingValid(
+                 tx_counts, tx_initialized, txUnusedIndices.size(),
+                 txUsedIndices.size(),
+                 igbeDescRingOccupancy(regs.tdh(), regs.tdt(), tx_len)),
+             "Invalid IGbE TX lifecycle checkpoint accounting");
 }
 
 } // namespace gem5
