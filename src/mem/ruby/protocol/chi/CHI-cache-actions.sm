@@ -262,6 +262,14 @@ action(Initiate_Request, desc="") {
   DirEntry dir_entry := getDirEntry(address);
   copyCacheAndDir(cache_entry, dir_entry, tbe, initial);
 
+  // Per-way, per-source accounting: record accesses that hit a line in a
+  // DDIO way (once per transaction).
+  if (is_HN && !tbe.ddio_access_profiled && is_valid(cache_entry)) {
+    tbe.ddio_access_profiled := true;
+    cache.profileDdioWayAccess(
+        ddioSrcClass(tbe), cache_entry.getWay(), address);
+  }
+
   tbe.use_DMT := is_HN && enable_DMT;
   tbe.use_DCT := enable_DCT;
 
@@ -309,6 +317,14 @@ action(Initiate_Request_Stale, desc="") {
     was_retried := in_msg.allowRetry == false;
   }
   copyCacheAndDir(cache_entry, getDirEntry(address), tbe, initial);
+
+  // Stale requests still access a physically present cache entry. Account for
+  // that access with the same exactly-once semantics as ordinary requests.
+  if (is_HN && !tbe.ddio_access_profiled && is_valid(cache_entry)) {
+    tbe.ddio_access_profiled := true;
+    cache.profileDdioWayAccess(
+        ddioSrcClass(tbe), cache_entry.getWay(), address);
+  }
 
   // usually we consider data locally invalid on RU states even if we
   // have a copy; so it override it to valid so we can comeback to UD_RU/UC_RU
@@ -3751,12 +3767,18 @@ action(CheckCacheFill, desc="") {
   } else if (need_fill && ddio_fill && cache.cacheAvailInWays(address, ddio_ways)) {
     // NIC DDIO fill: allocate inside the DDIO way subset only.
     set_cache_entry(cache.allocateInWays(address, new CacheEntry, ddio_ways));
+    cache.profileDdioWayFill(
+        ddioSrcClass(tbe), cache_entry.getWay(), address);
     tbe.actions.pushFront(Event:DataArrayWriteOnFill);
     tbe.actions.pushFront(Event:FillPipe);
 
   } else if (need_fill && !ddio_fill && cache.cacheAvail(address)) {
     // don't have a cache block, but there is space to allocate one
     set_cache_entry(cache.allocate(address, new CacheEntry));
+    if (is_HN) {
+      cache.profileDdioWayFill(
+          ddioSrcClass(tbe), cache_entry.getWay(), address);
+    }
     tbe.actions.pushFront(Event:DataArrayWriteOnFill);
     tbe.actions.pushFront(Event:FillPipe);
 

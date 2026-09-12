@@ -61,7 +61,7 @@ class CacheMemoryTest : public testing::Test
     }
 
     void
-    makeCache(int ddioWays)
+    makeCache(int ddioWays, bool addrHash = false)
     {
         LRURPParams lruParams;
         lruParams.eventq_index = 0;
@@ -75,6 +75,7 @@ class CacheMemoryTest : public testing::Test
         params.start_index_bit = 6;
         params.replacement_policy = lru;
         params.ddio_way_part = ddioWays;
+        params.addr_hash = addrHash;
         cache = std::make_unique<CacheMemory>(params);
         cache->init();
     }
@@ -225,6 +226,16 @@ TEST_F(CacheMemoryTest, DisabledDDIOUsesReplacementPolicySelection)
     cache->allocate(0, entry);
     // LRU's equal-tick tie behavior is the pre-DDIO candidate-order choice.
     EXPECT_EQ(wayOf(0), 0);
+}
+
+TEST_F(CacheMemoryTest, AddressHashAvalanchesFullLineAddress)
+{
+    makeCache(2, true);
+    // Four sets: these are the stable low bits of SplitMix64 for line
+    // addresses 0 through 7. Contiguous lines are deliberately non-linear.
+    constexpr int expected[] = {3, 1, 2, 1, 2, 2, 0, 3};
+    for (int line = 0; line < 8; ++line)
+        EXPECT_EQ(setOf(line * 64), expected[line]);
 }
 
 TEST_F(CacheMemoryTest, RxHeaderIsClassifiedAsDDIOWrite)
