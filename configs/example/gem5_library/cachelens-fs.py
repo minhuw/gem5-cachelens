@@ -75,6 +75,16 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-ticks", type=int, default=m5.MaxTick)
     parser.add_argument(
+        "--stats-reset-delay",
+        type=int,
+        default=None,
+        help=(
+            "Reset host-controlled statistics this many simulated ticks after "
+            "start/restore, then measure until --max-ticks. Timing/O3 only; "
+            "guest statistics instructions are disabled."
+        ),
+    )
+    parser.add_argument(
         "--cpu-type",
         choices=("atomic", "timing", "o3"),
         default="timing",
@@ -239,6 +249,16 @@ def _require_selected_protocol(parser, args) -> None:
 
 
 def _validate_args(parser, args) -> None:
+    if args.stats_reset_delay is not None:
+        if args.cpu_type not in ("timing", "o3"):
+            parser.error("--stats-reset-delay requires timing/o3 cores.")
+        if not 0 < args.stats_reset_delay < args.max_ticks:
+            parser.error("--stats-reset-delay must satisfy 0 < delay < --max-ticks.")
+        if args.checkpoint_at_max_tick:
+            parser.error(
+                "--stats-reset-delay cannot be used with --checkpoint-at-max-tick."
+            )
+
     if args.cache_stashing == "hnf":
         if args.coherence_protocol != "chi" or args.isa != "arm":
             parser.error("--cache-stashing hnf requires ARM CHI.")
@@ -587,6 +607,37 @@ def _format_configuration_banner(
     )
 
 
+def _run_with_stats_window(simulator, processor, args) -> None:
+    delay = args.stats_reset_delay
+    if delay is None:
+        simulator.run()
+        return
+
+    # Set native CPU parameters before run() instantiates or restores the board.
+    for core in processor.get_cores():
+        core.get_simobject().do_statistics_insts = False
+
+    simulator.run(max_ticks=delay)
+    cause = simulator.get_last_exit_event_cause()
+    # Simulator.run restarts its duration after continued exit events. Do not
+    # certify a shifted window if a work item or checkpoint intervened.
+    if cause != "simulate() limit reached" or any(
+        event != ExitEvent.MAX_TICK for event, _ in simulator.get_tick_stopwatch()
+    ):
+        raise RuntimeError(f"CacheLens warmup ended before stats reset: {cause}")
+    m5.stats.dump()
+    m5.stats.reset()
+    print(f"CACHELENS_STATS_RESET tick={m5.curTick()}")
+
+    simulator.run(max_ticks=args.max_ticks - delay)
+    cause = simulator.get_last_exit_event_cause()
+    if cause != "simulate() limit reached" or any(
+        event != ExitEvent.MAX_TICK for event, _ in simulator.get_tick_stopwatch()
+    ):
+        raise RuntimeError(f"CacheLens measurement ended early: {cause}")
+    print(f"CACHELENS_STATS_COMPLETE tick={m5.curTick()}")
+
+
 def main() -> None:
     parser = _create_parser()
     args = parser.parse_args()
@@ -696,7 +747,7 @@ def main() -> None:
         on_exit_event=exit_handlers,
         max_ticks=args.max_ticks,
     )
-    simulator.run()
+    _run_with_stats_window(simulator, processor, args)
 
 
 if __name__ == "__m5_main__":

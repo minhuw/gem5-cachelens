@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import (
     Mock,
+    call,
     patch,
 )
 
@@ -56,6 +57,133 @@ class CacheLensRunnerTestSuite(unittest.TestCase):
         self.assertEqual(
             CoherenceProtocol.CHI, _RUNNER._selected_protocol(args)
         )
+
+    def test_stats_window_validation(self) -> None:
+        parser = _RUNNER._create_parser()
+        self.assertIsNone(self._parse().stats_reset_delay)
+        for isa in ("arm", "x86"):
+            assets = ("--bootloader", str(_RUNNER_PATH)) if isa == "arm" else ()
+            for cpu in ("timing", "o3"):
+                args = self._parse(
+                    "--isa", isa, *assets, "--cpu-type", cpu,
+                    "--max-ticks", "100", "--stats-reset-delay", "25",
+                )
+                _RUNNER._validate_args(parser, args)
+            for invalid in (
+                ("--stats-reset-delay", "0"),
+                ("--stats-reset-delay", "-1"),
+                ("--stats-reset-delay", "100"),
+                ("--stats-reset-delay", "101"),
+                ("--max-ticks", "0"),
+                ("--max-ticks", "-1"),
+                ("--cpu-type", "atomic"),
+                ("--checkpoint-at-max-tick",),
+            ):
+                with self.subTest(isa=isa, invalid=invalid):
+                    args = self._parse(
+                        "--isa", isa, *assets, "--max-ticks", "100",
+                        "--stats-reset-delay", "25", *invalid,
+                    )
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit):
+                            _RUNNER._validate_args(parser, args)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self._parse("--stats-reset-delay", "1.5")
+
+    def test_stats_window_default_unchanged(self) -> None:
+        simulator, processor = Mock(), Mock()
+        with patch.object(_RUNNER.m5, "stats") as stats:
+            _RUNNER._run_with_stats_window(simulator, processor, self._parse())
+        self.assertEqual([call.run()], simulator.mock_calls)
+        self.assertEqual([], processor.mock_calls)
+        self.assertEqual([], stats.mock_calls)
+
+    def test_stats_window_order_and_relative_ticks(self) -> None:
+        for isa in ("arm", "x86"):
+            for cpu in ("timing", "o3"):
+                with self.subTest(isa=isa, cpu=cpu):
+                    args = self._parse(
+                        "--isa", isa, "--cpu-type", cpu,
+                        "--max-ticks", "100", "--stats-reset-delay", "25",
+                    )
+                    simulator, processor, events = Mock(), Mock(), Mock()
+                    cores = [Mock(), Mock()]
+                    processor.get_cores.return_value = cores
+                    for core in cores:
+                        core.get_simobject.return_value.do_statistics_insts = True
+                    tick = 1000  # A restored checkpoint, not tick zero.
+
+                    def run(max_ticks):
+                        nonlocal tick
+                        for core in cores:
+                            self.assertIs(
+                                core.get_simobject().do_statistics_insts, False
+                            )
+                        tick += max_ticks
+
+                    simulator.run.side_effect = run
+                    simulator.get_tick_stopwatch.return_value = []
+                    simulator.get_last_exit_event_cause.return_value = (
+                        "simulate() limit reached"
+                    )
+                    events.attach_mock(simulator.run, "run")
+                    stdout = io.StringIO()
+                    with patch.object(_RUNNER.m5, "stats") as stats, patch.object(
+                        _RUNNER.m5, "curTick", side_effect=lambda: tick
+                    ), contextlib.redirect_stdout(stdout):
+                        events.attach_mock(stats.dump, "dump")
+                        events.attach_mock(stats.reset, "reset")
+                        _RUNNER._run_with_stats_window(simulator, processor, args)
+                    self.assertEqual(
+                        [call.run(max_ticks=25), call.dump(), call.reset(),
+                         call.run(max_ticks=75)], events.mock_calls,
+                    )
+                    self.assertEqual(
+                        "CACHELENS_STATS_RESET tick=1025\n"
+                        "CACHELENS_STATS_COMPLETE tick=1100\n",
+                        stdout.getvalue(),
+                    )
+
+    def test_stats_window_rejects_early_exits(self) -> None:
+        args = self._parse("--max-ticks", "100", "--stats-reset-delay", "25")
+        for phase in ("warmup", "measurement"):
+            with self.subTest(phase=phase):
+                simulator, processor = Mock(), Mock()
+                processor.get_cores.return_value = []
+                simulator.get_tick_stopwatch.return_value = []
+                simulator.get_last_exit_event_cause.side_effect = (
+                    ["m5_exit instruction encountered"] if phase == "warmup"
+                    else ["simulate() limit reached", "m5_exit instruction encountered"]
+                )
+                stdout = io.StringIO()
+                with patch.object(_RUNNER.m5, "stats") as stats, patch.object(
+                    _RUNNER.m5, "curTick", return_value=25
+                ), contextlib.redirect_stdout(stdout):
+                    with self.assertRaisesRegex(RuntimeError, phase):
+                        _RUNNER._run_with_stats_window(simulator, processor, args)
+                self.assertNotIn("CACHELENS_STATS_COMPLETE", stdout.getvalue())
+                if phase == "warmup":
+                    simulator.run.assert_called_once_with(max_ticks=25)
+                    self.assertEqual([], stats.mock_calls)
+                    self.assertEqual("", stdout.getvalue())
+                else:
+                    self.assertEqual(2, simulator.run.call_count)
+                    stats.dump.assert_called_once_with()
+                    stats.reset.assert_called_once_with()
+
+    def test_stats_window_rejects_continued_exit(self) -> None:
+        args = self._parse("--max-ticks", "100", "--stats-reset-delay", "25")
+        simulator, processor = Mock(), Mock()
+        processor.get_cores.return_value = []
+        simulator.get_last_exit_event_cause.return_value = "simulate() limit reached"
+        simulator.get_tick_stopwatch.return_value = [
+            (_RUNNER.ExitEvent.WORKBEGIN, 10), (_RUNNER.ExitEvent.MAX_TICK, 35)
+        ]
+        with patch.object(_RUNNER.m5, "stats") as stats:
+            with self.assertRaisesRegex(RuntimeError, "warmup"):
+                _RUNNER._run_with_stats_window(simulator, processor, args)
+            stats.reset.assert_not_called()
 
     def test_arm_chi_validation(self) -> None:
         args = self._parse(
