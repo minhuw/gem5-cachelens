@@ -103,13 +103,19 @@ parser.add_argument("--scenario", required=True, choices=(
     "cold_full_write", "partial_dirty_owner", "pvrdma_provenance",
     "stash_partial_cold", "partial_ss_sharers", "hit_update",
     "stash_unclassified", "stash_replacement", "stash_clean_owner",
+    "nic_cpu_nic", "clean_private_victim", "hnf_evict_shared",
     "zero_mask", "sparse_mask",  # Unsupported by RubySequencer: must fail.
 ))
 parser.add_argument("--cache-stashing", choices=("off", "hnf"), default=None)
 parser.add_argument("--decline-stash", action="store_true")
 parser.add_argument("--ddio-way-part", type=int, default=None)
-parser.add_argument("--hnf-inclusion", choices=("inclusive", "noninclusive"),
-                    default="inclusive")
+parser.add_argument(
+    "--hnf-inclusion",
+    choices=("inclusive", "noninclusive", "mostly-exclusive"),
+    default="inclusive",
+)
+parser.add_argument("--read-not-shared-dirty", action="store_true")
+parser.add_argument("--dealloc-on-unique", action="store_true")
 parser.add_argument("--abs-max-tick", type=int, default=10000000000)
 args = parser.parse_args()
 stash_test = args.cache_stashing is not None
@@ -136,6 +142,7 @@ system.cache_hierarchy = CacheLensCHIHierarchy(
     model_profile="arm-generic" if stash_test else "abstract",
     cache_stashing=args.cache_stashing or "off",
     hnf_inclusion=args.hnf_inclusion, indexing_policy="linear",
+    dealloc_on_unique=args.dealloc_on_unique,
 )
 hierarchy = system.cache_hierarchy
 hierarchy.incorporate_cache(DirectedBoard(system))
@@ -151,9 +158,21 @@ assert len(hierarchy.misc_nodes) == 1
 for cluster in hierarchy.core_clusters:
     assert list(cluster.l1d.downstream_destinations) == [cluster.l2]
     assert list(cluster.l2.downstream_destinations) == list(hierarchy.hnfs)
+    # Test the alternate read opcode emitted when shared dirty is disallowed.
+    cluster.l2.allow_SD = not args.read_not_shared_dirty
 hnf = hierarchy.hnfs[0]
 assert bool(hnf.is_HN) and not bool(hnf.nic_read_no_allocate)
 inclusive = args.hnf_inclusion == "inclusive"
+mostly_exclusive = args.hnf_inclusion == "mostly-exclusive"
+dealloc_unique = mostly_exclusive or (not inclusive and args.dealloc_on_unique)
+assert bool(hnf.dealloc_on_unique) == dealloc_unique
+assert bool(hnf.fwd_unique_on_readshared) == mostly_exclusive
+assert metadata["hnf_dealloc_on_unique"] == dealloc_unique
+assert metadata["hnf_fwd_unique_on_readshared"] == mostly_exclusive
+assert not bool(hnf.dealloc_on_shared)
+assert all(bool(getattr(hnf, flag)) for flag in (
+    "alloc_on_readshared", "alloc_on_readonce", "alloc_on_writeback",
+))
 assert bool(hnf.alloc_on_readunique) == inclusive
 assert bool(hnf.dealloc_backinv_unique) == inclusive
 assert bool(hnf.dealloc_backinv_shared) == inclusive
@@ -194,6 +213,8 @@ partial = args.scenario in (
 if args.scenario == "stash_clean_owner" and not inclusive:
     # DMT fills the clean private owner directly, bypassing HNF allocation.
     partial = False
+if mostly_exclusive and args.scenario == "partial_dirty_owner":
+    partial = False
 rdma = args.scenario == "pvrdma_provenance"
 retained = ddio >= 0 or (
     args.cache_stashing == "hnf" and not args.decline_stash
@@ -202,6 +223,13 @@ rx, rx_hits, tx, tx_hits = 1, int(partial), 1, int(retained)
 allocations = int(retained and not partial)
 if args.scenario == "cold_full_write" and not stash_test:
     tx = tx_hits = 0
+elif args.scenario == "nic_cpu_nic":
+    rx, rx_hits = 2, int(retained and not mostly_exclusive)
+elif args.scenario == "clean_private_victim":
+    rx, rx_hits = 1, int(not mostly_exclusive)
+    tx = tx_hits = 2
+elif args.scenario == "hnf_evict_shared":
+    rx, rx_hits, tx, tx_hits = 4, 0, 1, 0
 elif args.scenario == "hit_update":
     rx, rx_hits = 2, int(retained)
 elif args.scenario == "stash_unclassified":
@@ -244,6 +272,26 @@ for name, value in expected.items():
     stat.prepare()
     assert stat.value == value, f"{name}: observed={stat.value}, expected={value}"
     print(f"CHI_HNF_STAT {name}={stat.value}")
+if args.scenario in ("clean_private_victim", "hnf_evict_shared"):
+    # Demand-hit counts distinguish surviving private copies from refills;
+    # full-line read checks in the tester alone cannot prove no backinv.
+    clusters = (hierarchy.core_clusters if args.scenario == "hnf_evict_shared"
+                else hierarchy.core_clusters[:1])
+    for index, cluster in enumerate(clusters):
+        for level in ("l1d", "l2"):
+            if args.scenario == "hnf_evict_shared":
+                misses = 2 if inclusive else 1
+                hits = int(not inclusive and level == "l1d")
+            else:
+                misses, hits = 4, 0
+            for name, value in (
+                ("m_demand_hits", hits), ("m_demand_misses", misses),
+            ):
+                stat = getattr(cluster, level).cache.resolveStat(name)
+                stat.prepare()
+                assert stat.value == value, (index, level, name, stat.value, value)
+                print(f"CHI_PRIVATE_STAT core={index} level={level} "
+                      f"{name}={stat.value}")
 if stash_test and args.scenario in (
     "stash_partial_cold", "stash_clean_owner", "partial_dirty_owner",
 ):

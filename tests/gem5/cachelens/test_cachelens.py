@@ -100,10 +100,22 @@ def cachelens_arm_chi_profile_test(profile, inclusion="noninclusive"):
     )
 
 
-def cachelens_chi_dma_test(scenario):
+def cachelens_chi_dma_test(scenario, inclusion=None,
+                           read_not_shared_dirty=False, dealloc=False):
     # Protocol/data-value coverage only: no guest execution or external TLM.
+    config_args = ["--scenario", scenario]
+    suffix = ""
+    if inclusion is not None:
+        config_args += ["--hnf-inclusion", inclusion, "--ddio-way-part", "4"]
+        suffix += f"-{inclusion}"
+    if read_not_shared_dirty:
+        config_args.append("--read-not-shared-dirty")
+        suffix += "-read-not-shared-dirty"
+    if dealloc:
+        config_args.append("--dealloc-on-unique")
+        suffix += "-legacy-dealloc"
     gem5_verify_config(
-        name=f"cachelens-arm-chi-dma-{scenario}",
+        name=f"cachelens-arm-chi-dma-{scenario}{suffix}",
         fixtures=(),
         verifiers=(
             verifier.MatchRegex(re.compile(
@@ -113,7 +125,7 @@ def cachelens_chi_dma_test(scenario):
         config=joinpath(
             absdirpath(__file__), "configs", "chi_dma_directed.py"
         ),
-        config_args=["--scenario", scenario],
+        config_args=config_args,
         valid_isas=(constants.arm_tag,),
         valid_hosts=constants.supported_hosts,
         length=constants.quick_tag,
@@ -627,6 +639,33 @@ def run_pcap_replay_tests(params):
 
 for scenario in ("cold_full_write", "partial_dirty_owner", "pvrdma_provenance"):
     cachelens_chi_dma_test(scenario)
+
+# All normal NIC allocation ways, no stashing. Include old policies as controls.
+for inclusion in ("mostly-exclusive", "inclusive", "noninclusive"):
+    for scenario in ("nic_cpu_nic", "clean_private_victim", "hnf_evict_shared",
+                     "partial_ss_sharers", "partial_dirty_owner"):
+        cachelens_chi_dma_test(scenario, inclusion)
+    for scenario in ("nic_cpu_nic", "clean_private_victim"):
+        cachelens_chi_dma_test(scenario, inclusion, read_not_shared_dirty=True)
+for scenario in ("cold_full_write", "pvrdma_provenance"):
+    cachelens_chi_dma_test(scenario, "mostly-exclusive")
+# dealloc alone must not change the historical ReadShared grant behavior.
+cachelens_chi_dma_test("nic_cpu_nic", "noninclusive", dealloc=True)
+
+gem5_verify_config(
+    name="cachelens-arm-chi-inclusion-parameters",
+    fixtures=(),
+    verifiers=(verifier.MatchRegex(re.compile(
+        "CACHELENS_CHI_INCLUSION_PARAMETERS_OK"
+    )),),
+    config=joinpath(absdirpath(__file__), "configs", "chi_inclusion_probe.py"),
+    config_args=(),
+    valid_isas=(constants.arm_tag,),
+    valid_hosts=constants.supported_hosts,
+    length=constants.quick_tag,
+    protocol="CHI",
+    gem5_fixture_factory=CacheLensExactProtocolFixture,
+)
 
 
 for scenario in (

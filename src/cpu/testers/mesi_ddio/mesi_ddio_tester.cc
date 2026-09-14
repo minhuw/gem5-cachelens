@@ -317,6 +317,53 @@ MESIDDIODirectedTester::buildScenario()
                  "RX full-line hit update");
         addRead(PortKind::Dma, 0, a, txPayload, second,
                 "TX observes RX hit update");
+    } else if (scenario == "nic_cpu_nic") {
+        addWrite(PortKind::Dma, 0, a, rxPayload, first, "cold RX write A");
+        addRead(PortKind::Cpu, 0, a, generic, first,
+                "CPU consumes NIC-filled A");
+        addWrite(PortKind::Dma, 0, a, rxPayload, second,
+                 "second RX write probes LLC after CPU read");
+        addRead(PortKind::Dma, 0, a, txPayload, second,
+                "TX checks entire overwritten line");
+        addRead(PortKind::Cpu, 0, a, generic, second,
+                "private holder observes NIC invalidation");
+    } else if (scenario == "clean_private_victim") {
+        // CHI: cold DMT read leaves clean A private-only. Three conflicting
+        // reads exceed the two-way private L1D/L2 set, but not the HNF set.
+        const std::vector<uint8_t> zero(blockSize, 0);
+        addRead(PortKind::Cpu, 0, a, generic, zero, "cold clean CPU read A");
+        for (unsigned i = 1; i <= 3; ++i) {
+            addRead(PortKind::Cpu, 0, a + i * setStride, generic, zero,
+                    "conflicting clean CPU read forces private eviction");
+        }
+        addRead(PortKind::Dma, 0, a, txPayload, zero,
+                "TX probes clean private victim inserted in LLC");
+        addRead(PortKind::Cpu, 1, a, generic, zero,
+                "CPU consumes clean LLC victim with UC grant");
+        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+                 "RX probes LLC after clean unique grant");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "TX verifies full clean-victim overwrite");
+    } else if (scenario == "hnf_evict_shared") {
+        addWrite(PortKind::Dma, 0, a, generic, first, "seed shared A");
+        addRead(PortKind::Cpu, 0, a, generic, first, "first private reader");
+        addRead(PortKind::Cpu, 1, a, generic, first, "second private reader");
+        // Four conflicting NIC fills evict A from the four-way CHI HNF,
+        // without any CPU accesses that could evict the private holders.
+        for (unsigned i = 1; i <= 4; ++i) {
+            addWrite(PortKind::Dma, 0, a + i * setStride, rxPayload,
+                     pattern(0x20 + i), "force shared HNF victim eviction");
+        }
+        // A write ACK precedes its HNF fill. Serialize behind that fill,
+        // then probe A while its replacement TBE blocks new requests.
+        addRead(PortKind::Dma, 0, e, generic, pattern(0x24),
+                "fence final NIC fill before testing eviction");
+        addRead(PortKind::Dma, 0, a, txPayload, first,
+                "TX miss proves shared A was evicted from HNF");
+        addRead(PortKind::Cpu, 0, a, generic, first,
+                "first private holder survives noninclusive eviction");
+        addRead(PortKind::Cpu, 1, a, generic, first,
+                "second private holder survives noninclusive eviction");
     } else if (scenario == "outside_subset_hit") {
         addWrite(PortKind::Dma, 0, a, generic, first,
                  "initialize way-zero line");

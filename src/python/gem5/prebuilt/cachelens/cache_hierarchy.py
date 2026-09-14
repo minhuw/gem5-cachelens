@@ -239,7 +239,13 @@ class _CachedHNF(AbstractNode):
         self.alloc_on_readonce = True
         self.alloc_on_writeback = True
         self.alloc_on_atomic = True
-        self.dealloc_on_unique = False if inclusive else dealloc_on_unique
+        mostly_exclusive = hnf_inclusion == "mostly-exclusive"
+        # Grant UC/UD to a sole reader of NIC-filled data, then drop our copy.
+        # Shared data remains cached: this is not strict exclusivity.
+        self.fwd_unique_on_readshared = mostly_exclusive
+        self.dealloc_on_unique = not inclusive and (
+            mostly_exclusive or dealloc_on_unique
+        )
         self.dealloc_on_shared = False
         self.dealloc_backinv_unique = inclusive
         self.dealloc_backinv_shared = inclusive
@@ -349,9 +355,10 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             raise ValueError("Network latencies must be positive.")
         if network_buffer_size <= 0:
             raise ValueError("network_buffer_size must be positive.")
-        if hnf_inclusion not in ("noninclusive", "inclusive"):
+        if hnf_inclusion not in ("noninclusive", "inclusive", "mostly-exclusive"):
             raise ValueError(
-                "hnf_inclusion must be 'noninclusive' or 'inclusive'."
+                "hnf_inclusion must be 'noninclusive', 'inclusive', or "
+                "'mostly-exclusive'."
             )
 
         if indexing_policy is None:
@@ -483,6 +490,13 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             ),
             "nic_read_no_allocate": self._nic_read_no_allocate,
             "hnf_inclusion": self._hnf_inclusion,
+            "hnf_dealloc_on_unique": self._hnf_inclusion != "inclusive" and (
+                self._hnf_inclusion == "mostly-exclusive"
+                or self._dealloc_on_unique
+            ),
+            "hnf_fwd_unique_on_readshared": (
+                self._hnf_inclusion == "mostly-exclusive"
+            ),
             "num_hnfs": self._num_hnfs,
             "hnf_size_per_hnf": self._hnf_size,
             "hnf_size_per_hnf_bytes": self._hnf_size_bytes,

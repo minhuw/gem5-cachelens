@@ -174,8 +174,9 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   bool dealloc_backinv_shared;
 
   // If the responder has the line in UC or UD state, propagate this state
-  // on a ReadShared. Notice data won't be deallocated if dealloc_on_unique is
-  // set
+  // on a ReadShared/ReadNotSharedDirty. At an HNF, also setting
+  // dealloc_on_unique drops the local copy after an actual UC/UD grant.
+  // Shared grants and non-HNF responders retain the existing behavior.
   bool fwd_unique_on_readshared := "False";
 
   // Allow receiving data in SD state.

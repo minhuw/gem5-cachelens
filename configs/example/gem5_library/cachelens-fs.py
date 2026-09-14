@@ -183,10 +183,12 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hnf-inclusion",
-        choices=("noninclusive", "inclusive"),
+        choices=("noninclusive", "inclusive", "mostly-exclusive"),
         default=None,
         help=(
-            "CHI HNF policy (default: noninclusive). Both MESI protocols are "
+            "CHI HNF policy (default: noninclusive). Mostly-exclusive drops "
+            "unique copies and retains shared data; not a calibrated hardware "
+            "model. Both MESI protocols are "
             "inclusive by protocol and only accept an explicit inclusive."
         ),
     )
@@ -327,7 +329,7 @@ def _validate_args(parser, args) -> None:
         if args.hnf_inclusion not in (None, "inclusive"):
             parser.error(
                 f"{_selected_protocol(args).value} is inclusive by protocol; "
-                "--hnf-inclusion noninclusive is invalid."
+                f"--hnf-inclusion {args.hnf_inclusion} is invalid."
             )
         if args.dealloc_on_unique:
             parser.error(
