@@ -2793,9 +2793,11 @@ Pvrdma::runTransport()
                 return;
             }
             scheduleSend();
+            // A send event queued before retirement cannot refill an empty
+            // pipeline: runSend() returns immediately when no WQEs remain.
             if (!transport.sendLoading && !sendPipelineFailed &&
                 sendWqes.size() < 2 &&
-                (txBusyClass != TxFrameClass::None ||
+                (sendWqes.empty() || txBusyClass != TxFrameClass::None ||
                  !sendEvent.scheduled())) {
                 if (transport.kind == pvrdma::QueueKind::Sq)
                     startSendLoad();

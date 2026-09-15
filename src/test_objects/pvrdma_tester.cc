@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cmath>
 
 #include "base/logging.hh"
 #include "base/statistics.hh"
@@ -171,8 +172,29 @@ PvrdmaTester::PvrdmaTester(const Params &p)
       faultPort1(name() + ".fault1", *this, 1),
       requestorId(system->getRequestorId(this)),
       testEvent([this] { run(); }, name() + ".test"),
-      commandTest(p.command_test), testMode(p.test_mode)
+      commandTest(p.command_test), testMode(p.test_mode),
+      linkDelay(p.link_delay), linkTicksPerByte(p.link_speed)
 {}
+
+Tick
+PvrdmaTester::linkWait(Tick baseline, unsigned exchanges) const
+{
+    // Keep the historical 10Gbps/10ns schedule exactly. Budget additional
+    // wire time for each bounded DATA/control exchange, retaining the old
+    // DMA/processing margin. A max-MTU DATA frame bounds smaller messages.
+    using namespace pvrdma::rocev2;
+    const auto round_trip = [](Tick delay, double rate) {
+        return 2 * delay +
+            static_cast<Tick>(std::ceil(
+                (SendHeaderSize + MaxPayloadSize + IcrcSize) * rate + 1)) +
+            static_cast<Tick>(std::ceil(ControlFrameSize * rate + 1));
+    };
+    const Tick original = round_trip(10 * sim_clock::as_int::ns,
+                                     sim_clock::as_float::s * 8 / 1e10);
+    const Tick selected = round_trip(linkDelay, linkTicksPerByte);
+    return baseline + exchanges * (selected > original ?
+                                    selected - original : 0);
+}
 
 Port &
 PvrdmaTester::getPort(const std::string &if_name, PortID idx)
@@ -249,6 +271,7 @@ PvrdmaTester::startup()
         testMode == "timing-semantic-pair" ||
         testMode == "request-observation-pair" ||
         testMode == "pipeline-throughput-pair" ||
+        testMode == "pipeline-throughput-report-pair" ||
         testMode == "transport-stats-boundary-pair" || reliability_pair ||
         terminal_pair) {
         peerRdma = dynamic_cast<Pvrdma *>(
@@ -2530,7 +2553,9 @@ PvrdmaTester::runSemanticPair()
       case TimingStage::SemanticPostSq:
         postReliabilitySend(Lengths[reliabilityCase]);
         timingStage = TimingStage::SemanticVerify;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000),
+            std::max(1U, (Lengths[reliabilityCase] + pvrdma::FixedMtu - 1) /
+                         pvrdma::FixedMtu)));
         return;
       case TimingStage::SemanticVerify: {
         const uint32_t length = Lengths[reliabilityCase];
@@ -2625,7 +2650,9 @@ PvrdmaTester::runSemanticPair()
                      malformed, sender_mac, receiver_mac)),
                  "PVRDMA semantic EtherLink rejected malformed DATA");
         timingStage = TimingStage::SemanticMalformedVerify;
-        schedule(testEvent, curTick() + microseconds(100));
+        // Drain the malformed request AND its NAK before reusing this PSN.
+        // Otherwise that NAK can legitimately fail the following valid WQE.
+        schedule(testEvent, curTick() + linkWait(microseconds(100)));
         return;
       }
       case TimingStage::SemanticMalformedVerify: {
@@ -2660,7 +2687,7 @@ PvrdmaTester::runSemanticPair()
 
         postReliabilitySend(128);
         timingStage = TimingStage::SemanticMalformedValidVerify;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000)));
         return;
       }
       case TimingStage::SemanticMalformedValidVerify: {
@@ -2699,7 +2726,7 @@ PvrdmaTester::runSemanticPair()
         ++reliabilityCase;
         postReliabilitySend(64);
         timingStage = TimingStage::SemanticRnrVerify;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000)));
         return;
       }
       case TimingStage::SemanticRnrVerify: {
@@ -2780,7 +2807,7 @@ PvrdmaTester::runSemanticPair()
                  "PVRDMA semantic short RQ was not observed");
         postReliabilitySend(64);
         timingStage = TimingStage::SemanticShortVerify;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000)));
         return;
       case TimingStage::SemanticShortVerify: {
         const auto error = read<pvrdma::CompletionQueueElement>(
@@ -2952,22 +2979,43 @@ PvrdmaTester::runPipelinePair()
                      rdma->queueStats.conservationViolations.value() ||
                      peerRdma->queueStats.conservationViolations.value(),
                  "PVRDMA pipeline throughput accounting mismatch");
+        const bool report_only = testMode == "pipeline-throughput-report-pair";
+        inform("PVRDMA_PIPELINE_THROUGHPUT window=%u "
+               "payload_bytes=%llu encoded_bytes=%llu "
+               "busy_ticks=%llu elapsed_ticks=%llu payload_bps=%.3f "
+               "wire_bps=%.3f ceiling_bps=%.3f utilization=%.6f "
+               "max_in_flight=%llu mode=%s saturation_gate=%u "
+               "multiple_wqes=%u cross_wqe_flight=%u "
+               "fail_max_flight=%u fail_multiple_wqes=%u "
+               "fail_cross_wqe_flight=%u below_95pct=%u",
+               rdma->transportWindowSegments, payload, encoded, busy, elapsed,
+               payload_bps, wire_bps, ceiling_bps, utilization, max_flight,
+               testMode, !report_only, sawMultipleWqes,
+               sawCrossWqeFlight, max_flight < 2, !sawMultipleWqes,
+               !sawCrossWqeFlight, utilization < 0.95);
+        if (report_only) {
+            // A fixed 2-MiB transfer includes the last ACK's RTT and 100-us
+            // sampling tail. This is data/liveness coverage, not saturation.
+            const double ten_g_rate = sim_clock::as_float::s * 8 / 1e10;
+            const Tick expected_busy = Segments * static_cast<Tick>(
+                std::ceil((encoded / Segments) * ten_g_rate + 1));
+            panic_if(linkTicksPerByte != ten_g_rate || busy != expected_busy ||
+                         ceiling_bps > 1e10 || ceiling_bps < 0.99999e10 ||
+                         rdma->transportWindowSegments <= 1,
+                     "PVRDMA reporting mode requires a pipelined 10Gbps "
+                     "encoded serialization ceiling");
+        }
         if (rdma->transportWindowSegments == 1) {
             panic_if(max_flight != 1 || utilization >= 0.5,
                      "PVRDMA window=1 did not remain stop-and-wait");
         } else {
             panic_if(max_flight < 2 || !sawMultipleWqes ||
-                         !sawCrossWqeFlight || utilization < 0.95,
+                         !sawCrossWqeFlight ||
+                         (!report_only && utilization < 0.95),
                      "PVRDMA pipeline missed its window/WQE/utilization gate");
         }
-        inform("PVRDMA_PIPELINE_THROUGHPUT window=%u payload_bytes=%llu "
-               "encoded_bytes=%llu busy_ticks=%llu elapsed_ticks=%llu "
-               "payload_bps=%.3f wire_bps=%.3f ceiling_bps=%.3f "
-               "utilization=%.6f max_in_flight=%llu",
-               rdma->transportWindowSegments, payload, encoded, busy,
-               elapsed, payload_bps, wire_bps, ceiling_bps, utilization,
-               max_flight);
-        exitSimLoop("PVRDMA pipeline throughput test passed");
+        exitSimLoop(report_only ? "PVRDMA pipeline throughput report passed" :
+                                  "PVRDMA pipeline throughput test passed");
         return;
       }
       default:
@@ -5430,7 +5478,8 @@ PvrdmaTester::runPair()
               htole(pvrdma::CqPollAction | 1), MmioFlags);
         panic_if(rdma->cqDirty & (uint64_t{1} << 1),
                  "PVRDMA empty CQ poll queued an observation");
-        panic_if(++busyPolls > 100000,
+        panic_if(++busyPolls > linkWait(microseconds(100)) /
+                         sim_clock::as_int::ns,
                  "PVRDMA empty CQ polls starved runnable SQ transport");
         schedule(testEvent, curTick() + sim_clock::as_int::ns);
         return;
@@ -5468,7 +5517,7 @@ PvrdmaTester::runPair()
                           !sawCqPublishPollRace),
                      "PVRDMA inbound empty-poll race was not exercised");
             timingStage = TimingStage::PairVerify;
-            schedule(testEvent, curTick() + microseconds(1000));
+            schedule(testEvent, curTick() + linkWait(microseconds(1000), 3));
             return;
         }
         const bool publish_in_flight =
@@ -5482,7 +5531,8 @@ PvrdmaTester::runPair()
         panic_if(dirty != publish_in_flight,
                  "PVRDMA empty CQ poll publication-race handling mismatch");
         sawCqPublishPollRace |= publish_in_flight;
-        panic_if(++busyPolls > 100000,
+        panic_if(++busyPolls > linkWait(microseconds(100)) /
+                         sim_clock::as_int::ns,
                  "PVRDMA empty CQ polls starved inbound transport");
         schedule(testEvent, curTick() + sim_clock::as_int::ns);
         return;
@@ -5503,6 +5553,28 @@ PvrdmaTester::runPair()
             PairSenderCqe);
         const auto send1 = read<pvrdma::CompletionQueueElement>(
             PairSenderCqe + pvrdma::CqeSize);
+        inform("PVRDMA_PAIR_STATE sq=%u rq=%u tx_cq=%u rx_cq=%u "
+               "send_psn=%u recv_psn=%u sq_posted=%llu sq_consumed=%llu "
+               "stage=%u loading=%u fetch=%u wqes=%u qp_state=%u "
+               "send0_status=%u send1_status=%u",
+               letoh(sender_ring.tx.consumerHead),
+               letoh(receiver_ring.rx.consumerHead),
+               letoh(sender_cq.producerTail), letoh(receiver_cq.producerTail),
+               rdma->queuePairs.entries[1].attributes.sendPsn,
+               peerRdma->queuePairs.entries[1].attributes.receivePsn,
+               rdma->queueStats.sqPosted.value(),
+               rdma->queueStats.sqConsumed.value(),
+               static_cast<unsigned>(rdma->transport.stage),
+               rdma->transport.sendLoading, rdma->sqFetchHead[1],
+               rdma->sendWqes.size(),
+               static_cast<unsigned>(rdma->queuePairs.entries[1].state),
+               letoh(send0.status), letoh(send1.status));
+        for (const auto &send : rdma->sendWqes)
+            inform("PVRDMA_PAIR_WQE consumer=%u length=%u segments=%u "
+                   "sent=%u acked=%u lease=%u status=%u terminal=%u",
+                   send.consumer, send.wqe.length, send.segmentCount,
+                   send.sentSegments, send.ackedSegments, send.leaseHeld,
+                   static_cast<unsigned>(send.status), send.terminalQpError);
         panic_if(letoh(sender_ring.tx.consumerHead) != 3 ||
                      letoh(receiver_ring.rx.consumerHead) != 3 ||
                      letoh(sender_cq.producerTail) != 2 ||
@@ -5540,7 +5612,7 @@ PvrdmaTester::runPair()
         write(UarBarAddress + pvrdma::UarPageSize,
               htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
         timingStage = TimingStage::PairVerifyRnr;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000)));
         return;
       }
       case TimingStage::PairVerifyRnr: {
@@ -5584,7 +5656,7 @@ PvrdmaTester::runPair()
         write(UarBarAddress + pvrdma::UarPageSize,
               htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
         timingStage = TimingStage::PairVerifyShort;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000)));
         return;
       }
       case TimingStage::PairVerifyShort: {
@@ -5665,7 +5737,7 @@ PvrdmaTester::runPair()
         write(UarBarAddress + pvrdma::UarPageSize,
               htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
         timingStage = TimingStage::PairVerifyOversized;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000)));
         return;
       }
       case TimingStage::PairVerifyOversized: {
@@ -5742,7 +5814,7 @@ PvrdmaTester::runPair()
         write(UarBarAddress + pvrdma::UarPageSize,
               htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
         timingStage = TimingStage::PairVerifyCqBlocked;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000)));
         return;
       }
       case TimingStage::PairVerifyCqBlocked: {
@@ -5776,7 +5848,7 @@ PvrdmaTester::runPair()
         panic_if(!(peerRdma->cqDirty & (uint64_t{1} << 1)),
                  "PVRDMA nonempty CQ poll skipped observation");
         timingStage = TimingStage::PairVerifyCqRecovered;
-        schedule(testEvent, curTick() + microseconds(1000));
+        schedule(testEvent, curTick() + linkWait(microseconds(1000)));
         return;
       }
       case TimingStage::PairVerifyCqRecovered: {
@@ -6044,7 +6116,8 @@ PvrdmaTester::run()
         runSemanticPair();
         return;
     }
-    if (testMode == "pipeline-throughput-pair") {
+    if (testMode == "pipeline-throughput-pair" ||
+        testMode == "pipeline-throughput-report-pair") {
         runPipelinePair();
         return;
     }

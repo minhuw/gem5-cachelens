@@ -179,6 +179,9 @@ class PvrdmaTester : public Platform
     PvrdmaTestLink *testLink = nullptr;
     const bool commandTest;
     const std::string testMode;
+    const Tick linkDelay;
+    const double linkTicksPerByte;
+    Tick linkWait(Tick baseline, unsigned exchanges = 1) const;
     bool dsrConfigured = false;
     TimingStage timingStage = TimingStage::Configure;
     uint32_t pioError = 0;

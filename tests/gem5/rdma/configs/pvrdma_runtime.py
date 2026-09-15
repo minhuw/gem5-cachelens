@@ -35,6 +35,7 @@ parser.add_argument(
         "timing-semantic-pair",
         "request-observation-pair",
         "pipeline-throughput-pair",
+        "pipeline-throughput-report-pair",
         "transport-stats-boundary-pair",
         "reliability-pair",
         "timing-reliability-pair",
@@ -94,6 +95,8 @@ parser.add_argument(
 )
 parser.add_argument("--checkpoint", type=Path)
 parser.add_argument("--transport-window-segments", type=int, default=1)
+parser.add_argument("--link-speed", choices=("1Gbps", "10Gbps"))
+parser.add_argument("--link-delay", choices=("10ns", "200us"))
 args = parser.parse_args()
 if args.mode.startswith("checkpoint-") and args.checkpoint is None:
     parser.error("checkpoint modes require --checkpoint")
@@ -132,6 +135,7 @@ if (
     in (
         "request-observation-pair",
         "pipeline-throughput-pair",
+        "pipeline-throughput-report-pair",
         "transport-stats-boundary-pair",
     )
     or "reliability" in args.mode
@@ -152,14 +156,17 @@ if (
         PvrdmaTestLink()
         if "reliability" in args.mode or "transport-review-" in args.mode
         else EtherLink(
-            speed="1Gbps"
-            if args.mode
-            in ("pipeline-throughput-pair", "transport-stats-boundary-pair")
-            else "10Gbps",
-            delay="200us"
-            if args.mode
-            in ("pipeline-throughput-pair", "transport-stats-boundary-pair")
-            else "10ns",
+            speed=args.link_speed or (
+                "1Gbps" if args.mode in (
+                    "pipeline-throughput-pair", "transport-stats-boundary-pair"
+                ) else "10Gbps"
+            ),
+            delay=args.link_delay or (
+                "200us" if args.mode in (
+                    "pipeline-throughput-pair", "transport-stats-boundary-pair",
+                    "pipeline-throughput-report-pair",
+                ) else "10ns"
+            ),
             delay_var="0ns",
         )
     )
@@ -169,6 +176,20 @@ elif args.mode.endswith("fault-link"):
     system.rdma_link = PvrdmaTestLink()
     system.tester.fault0 = system.rdma_link.int0
     system.tester.fault1 = system.rdma_link.int1
+
+if args.link_speed is not None or args.link_delay is not None:
+    if not hasattr(system, "rdma_link") or not isinstance(
+        system.rdma_link, EtherLink
+    ):
+        parser.error("--link-speed/--link-delay require a normal EtherLink mode")
+
+if hasattr(system, "rdma_link") and isinstance(system.rdma_link, EtherLink):
+    system.tester.link_delay = system.rdma_link.delay
+    system.tester.link_speed = system.rdma_link.speed
+if args.mode == "pipeline-throughput-report-pair":
+    if args.link_speed not in (None, "10Gbps") or args.transport_window_segments <= 1:
+        parser.error("pipeline-throughput-report-pair requires 10Gbps and window > 1")
+    print("PVRDMA_PIPELINE_CONFIG measurement=finite-transfer saturation_claim=0")
 
 system.system_port = system.bus.cpu_side_ports
 system.memory.port = system.bus.mem_side_ports
@@ -207,6 +228,9 @@ elif args.mode == "request-observation-pair":
 elif args.mode == "pipeline-throughput-pair":
     assert exit_event.getCause() == "PVRDMA pipeline throughput test passed"
     print("PVRDMA_PIPELINE_THROUGHPUT_OK")
+elif args.mode == "pipeline-throughput-report-pair":
+    assert exit_event.getCause() == "PVRDMA pipeline throughput report passed"
+    print("PVRDMA_PIPELINE_THROUGHPUT_REPORT_OK saturation_claim=0")
 elif args.mode == "transport-stats-boundary-pair":
     assert exit_event.getCause() == (
         "PVRDMA transport stats boundary test passed"

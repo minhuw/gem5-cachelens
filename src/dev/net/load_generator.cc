@@ -22,11 +22,17 @@ namespace gem5
     }
     LoadGenerator::LoadGeneratorStats::LoadGeneratorStats(statistics::Group *parent)
         : statistics::Group(parent, "LoadGenerator"),
+        ADD_STAT(attemptedPackets, statistics::units::Count::get(),
+                 "Number of packet send attempts (sentPackets + backpressureDrops)"),
+        ADD_STAT(backpressureDrops, statistics::units::Count::get(),
+                 "Number of packets dropped when the link rejects a send"),
         ADD_STAT(sentPackets, statistics::units::Count::get(), "Number of Generated Packets"),
         ADD_STAT(recvPackets, statistics::units::Count::get(), "Number of Recieved Packets"),
         ADD_STAT(latency, statistics::units::Second::get(),
                  "Distribution of latency in seconds")
         {
+            attemptedPackets.precision(0);
+            backpressureDrops.precision(0);
             sentPackets.precision(0);
             recvPackets.precision(0);
             latency.init(100);
@@ -150,9 +156,12 @@ namespace gem5
         txPacket->length = packetSize;
         txPacket->simLength = packetSize;
         buildPacket(txPacket);
+        loadGeneratorStats.attemptedPackets++;
         if (interface->sendPacket(txPacket)) {
             loadGeneratorStats.sentPackets++;
             lastTxCount++;
+        } else {
+            loadGeneratorStats.backpressureDrops++;
         }
 
         if (curTick() < stopTick)

@@ -53,6 +53,8 @@ namespace gem5
             struct LoadGeneratorStats : public statistics::Group
             {
                 LoadGeneratorStats(statistics::Group *parent);
+                statistics::Scalar attemptedPackets;
+                statistics::Scalar backpressureDrops;
                 statistics::Scalar sentPackets;
                 statistics::Scalar recvPackets;
                 statistics::Histogram latency;

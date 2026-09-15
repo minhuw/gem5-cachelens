@@ -15,3 +15,5 @@ class PvrdmaTester(Platform):
     fault1 = EtherInt("Fault-link test endpoint 1")
     command_test = Param.Bool(False, "Test command response visibility")
     test_mode = Param.String("atomic", "Focused PVRDMA tester mode")
+    link_delay = Param.Latency("10ns", "Test EtherLink one-way propagation")
+    link_speed = Param.NetworkBandwidth("10Gbps", "Test EtherLink bit rate")

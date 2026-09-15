@@ -795,3 +795,22 @@ for host in constants.supported_hosts:
             host,
         ),
     )
+
+
+for speed in ("1Gbps", "10Gbps"):
+    gem5_verify_config(
+        name=f"cachelens-load-generator-rate-{speed}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(
+            f"CACHELENS_LOAD_GENERATOR_RATE_OK speed={speed}"
+        )),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "load_generator_rate.py"
+        ),
+        config_args=("--link-speed", speed),
+        valid_isas=(constants.arm_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+        protocol="CHI",
+        gem5_fixture_factory=CacheLensExactProtocolFixture,
+    )

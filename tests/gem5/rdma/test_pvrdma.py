@@ -594,3 +594,90 @@ for host in constants.supported_hosts:
     pvrdma_completion_checkpoint_test(host)
     pvrdma_terminal_drain_checkpoint_test(host)
     pvrdma_terminal_drain_checkpoint_test(host, "sq")
+
+
+# Synthetic data/completion coverage at long RTT, not guest performance.
+for mode, marker in (
+    ("semantic-pair", "PVRDMA_SEMANTIC_PAIR_OK"),
+    ("timing-semantic-pair", "PVRDMA_SEMANTIC_PAIR_OK"),
+    ("transport-pair", "PVRDMA_TRANSPORT_PAIR_OK"),
+    ("timing-transport-pair", "PVRDMA_TRANSPORT_PAIR_OK"),
+):
+    gem5_verify_config(
+        name=f"pvrdma-{mode}-10Gbps-200us-window1024",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(marker)),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "pvrdma_runtime.py"
+        ),
+        config_args=(
+            "--mode", mode, "--link-speed", "10Gbps",
+            "--link-delay", "200us", "--transport-window-segments", "1024",
+        ),
+        valid_isas=(constants.x86_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )
+
+
+def pvrdma_link_override_rejection_test(host):
+    def run_test(params):
+        tempdir = Path(params.fixtures[constants.tempdir_fixture_name].path)
+        gem5 = params.fixtures[constants.gem5_binary_fixture_name].path
+        cases = [
+            (mode, [knob, value], "require a normal EtherLink mode")
+            for mode in ("fault-link", "reliability-pair",
+                         "timing-transport-review-load-rnr-pair", "completion")
+            for knob, value in (("--link-speed", "10Gbps"),
+                                ("--link-delay", "200us"))
+        ]
+        cases += [
+            ("pipeline-throughput-report-pair", args,
+             "requires 10Gbps and window > 1")
+            for args in (
+                ["--link-speed", "1Gbps", "--transport-window-segments", "1024"],
+                ["--transport-window-segments", "1"],
+            )
+        ]
+        for index, (mode, args, diagnostic) in enumerate(cases):
+            result = subprocess.run(
+                [gem5, "-d", str(tempdir / f"reject-{index}"),
+                 joinpath(absdirpath(__file__), "configs",
+                          "pvrdma_runtime.py"), "--mode", mode, *args],
+                cwd=config.base_dir, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=120,
+            )
+            print(result.stdout)
+            assert result.returncode == 2
+            assert diagnostic in result.stdout
+
+    name = f"pvrdma-link-override-rejection-{host}-opt"
+    TestSuite(
+        name=name,
+        fixtures=[Gem5Fixture("x86", "opt"), TempdirFixture()],
+        tags=["X86", "opt", constants.quick_tag, host],
+        tests=[TestFunction(run_test, name=name)],
+    )
+
+
+for host in constants.supported_hosts:
+    pvrdma_link_override_rejection_test(host)
+
+
+# Finite 2-MiB data/completion/liveness check. Unlike the original 1Gbps test,
+# this mode reports end-to-end throughput and does not claim saturation.
+gem5_verify_config(
+    name="pvrdma-pipeline-throughput-report-10Gbps-200us-window1024",
+    fixtures=(),
+    verifiers=(verifier.MatchRegex(re.compile(
+        "PVRDMA_PIPELINE_THROUGHPUT_REPORT_OK saturation_claim=0"
+    )),),
+    config=joinpath(absdirpath(__file__), "configs", "pvrdma_runtime.py"),
+    config_args=(
+        "--mode", "pipeline-throughput-report-pair", "--link-speed", "10Gbps",
+        "--link-delay", "200us", "--transport-window-segments", "1024",
+    ),
+    valid_isas=(constants.x86_tag,),
+    valid_hosts=constants.supported_hosts,
+    length=constants.quick_tag,
+)
