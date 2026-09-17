@@ -283,10 +283,10 @@ class PciDevice : public DmaDevice
     const int PMCAP_PMCS_OFFSET;
     PMCAP pmcap;
 
-    const int MSICAP_BASE;
+    int MSICAP_BASE;
     MSICAP msicap;
 
-    const int MSIXCAP_BASE;
+    int MSIXCAP_BASE;
     const int MSIXCAP_ID_OFFSET;
     const int MSIXCAP_MXC_OFFSET;
     const int MSIXCAP_MTAB_OFFSET;

@@ -108,6 +108,8 @@ class PioDevice : public ClockedObject
      * that it sees. */
     PioPort<PioDevice> pioPort;
 
+    virtual ResponsePort &getPioPort() { return pioPort; }
+
     /**
      * Every PIO device is obliged to provide an implementation that
      * returns the address ranges the device responds to.

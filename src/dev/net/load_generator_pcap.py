@@ -1,12 +1,19 @@
 from m5.objects.Ethernet import EtherInt
 from m5.params import *
 from m5.SimObject import SimObject
+from m5.util.pybind import PyBindMethod
 
 
 class LoadGeneratorPcap(SimObject):
     type = "LoadGeneratorPcap"
     cxx_header = "dev/net/load_generator_pcap.hh"
     cxx_class = "gem5::LoadGeneratorPcap"
+
+    cxx_exports = [PyBindMethod(name) for name in (
+        "startReplay", "replaySent", "replayAttempts", "replayRetries",
+        "replayEof", "replayEofTick", "replayEofCount",
+    )]
+    deferred_start = Param.Bool(False, "Wait for startReplay; checkpoints unsupported")
 
     interface = EtherInt("interface")
     loadgen_id = Param.UInt8(0, "For match NIC")

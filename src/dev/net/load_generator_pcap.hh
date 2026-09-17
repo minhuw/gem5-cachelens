@@ -33,6 +33,8 @@ class LoadGeneratorPcap : public SimObject {
   LoadGenPcapInt *interface;
   const Tick startTick;
   const Tick stopTick;
+  const bool deferredStart;
+  bool replayStarted = false;
   const uint64_t maxPcktSize;
   const uint16_t portFilter;
   const std::string srcIP, destIP;
@@ -75,6 +77,10 @@ class LoadGeneratorPcap : public SimObject {
   struct LoadGeneratorPcapStats : public statistics::Group {
     LoadGeneratorPcapStats(statistics::Group *parent);
     statistics::Scalar sentPackets;
+    statistics::Scalar attemptedPackets;
+    statistics::Scalar backpressureRetries;
+    statistics::Scalar eofTick;
+    statistics::Scalar eofPackets;
     statistics::Scalar recvPackets;
     statistics::Scalar uncorrelatedPackets;
   } loadGeneratorPcapStats;
@@ -99,6 +105,13 @@ class LoadGeneratorPcap : public SimObject {
 
   Port &getPort(const std::string &if_name, PortID idx);
   void startup();
+  void startReplay();
+  uint64_t replaySent() const { return loadGeneratorPcapStats.sentPackets.value(); }
+  uint64_t replayAttempts() const { return loadGeneratorPcapStats.attemptedPackets.value(); }
+  uint64_t replayRetries() const { return loadGeneratorPcapStats.backpressureRetries.value(); }
+  bool replayEof() const { return eofSeen; }
+  Tick replayEofTick() const { return loadGeneratorPcapStats.eofTick.value(); }
+  uint64_t replayEofCount() const { return loadGeneratorPcapStats.eofPackets.value(); }
   void sendDone();
 
   bool processRxPkt(EthPacketPtr pkt);

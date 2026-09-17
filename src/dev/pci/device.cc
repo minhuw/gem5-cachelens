@@ -311,7 +311,7 @@ PciDevice::writeConfig(PacketPtr pkt)
             config.command = htole(result.command);
             config.status = htole(result.status);
             if (result.rangeChanged)
-                pioPort.sendRangeChange();
+                getPioPort().sendRangeChange();
         };
 
     switch (pkt->getSize()) {
@@ -377,7 +377,7 @@ PciDevice::writeConfig(PacketPtr pkt)
                 auto *bar = BARs[num];
                 config.baseAddr[num] =
                     htole(bar->write(hostInterface, pkt->getLE<uint32_t>()));
-                pioPort.sendRangeChange();
+                getPioPort().sendRangeChange();
             }
             break;
 
@@ -560,7 +560,7 @@ PciDevice::unserialize(CheckpointIn &cp)
     pxcap.pxdcap2 = tmp32;
     paramIn(cp, csprintf("pxcap.pxdc2"), tmp32);
     pxcap.pxdc2 = tmp32;
-    pioPort.sendRangeChange();
+    getPioPort().sendRangeChange();
 }
 
 } // namespace gem5

@@ -58,7 +58,15 @@ LoadGeneratorPcap::LoadGeneratorPcapStats::LoadGeneratorPcapStats(
     statistics::Group *parent)
     : statistics::Group(parent, "LoadGeneratorPcap"),
       ADD_STAT(sentPackets, statistics::units::Count::get(),
-               "Number of Generated Packets"),
+               "Unique PCAP frames accepted by the Ethernet peer"),
+      ADD_STAT(attemptedPackets, statistics::units::Count::get(),
+               "Ethernet send attempts, including backpressure retries"),
+      ADD_STAT(backpressureRetries, statistics::units::Count::get(),
+               "Ethernet sends rejected by backpressure"),
+      ADD_STAT(eofTick, statistics::units::Tick::get(),
+               "Absolute tick when EOF was observed (current stats epoch)"),
+      ADD_STAT(eofPackets, statistics::units::Count::get(),
+               "Accepted frames at EOF (current stats epoch)"),
       ADD_STAT(recvPackets, statistics::units::Count::get(),
                "Number of Recieved Packets"),
       ADD_STAT(uncorrelatedPackets, statistics::units::Count::get(),
@@ -72,6 +80,7 @@ LoadGeneratorPcap::LoadGeneratorPcap(const LoadGeneratorPcapParams &p)
       loadgenId(p.loadgen_id),
       startTick(p.start_tick),
       stopTick(p.stop_tick),
+      deferredStart(p.deferred_start),
       maxPcktSize(p.max_packetsize),
       portFilter(p.port_filter),
       srcIP(p.replace_src_ip),
@@ -197,7 +206,7 @@ bool LoadGeneratorPcap::scheduleLossAfter(Tick delay) {
   return true;
 }
 void LoadGeneratorPcap::startup() {
-  if (restoredFromCheckpoint)
+  if (restoredFromCheckpoint || deferredStart)
     return;
 
   const Tick first = std::max(curTick(), startTick);
@@ -205,6 +214,20 @@ void LoadGeneratorPcap::startup() {
     DPRINTF(LoadgenDebug, "Starting LoadGenPcap\n");
     schedule(sendPacketEvent, first + 1);
   }
+}
+
+void
+LoadGeneratorPcap::startReplay()
+{
+  fatal_if(!deferredStart || replayStarted || draining ||
+           restoredFromCheckpoint || pendingPacket || eofSeen ||
+           sendPacketEvent.scheduled() || checkLossEvent.scheduled() ||
+           eofEvent.scheduled() || recordsConsumed != 0,
+           "startReplay requires an inactive, fresh deferred PCAP generator");
+  fatal_if(curTick() >= stopTick,
+           "startReplay must precede stop_tick");
+  replayStarted = true;
+  scheduleSendAfter(1);
 }
 
 Port &LoadGeneratorPcap::getPort(const std::string &if_name, PortID idx) {
@@ -412,6 +435,8 @@ LoadGeneratorPcap::sendPacket()
             DPRINTF(LoadgenDebug,
                     "End of pcap trace is reached; generation stops.\n");
             eofSeen = true;
+            loadGeneratorPcapStats.eofTick = curTick();
+            loadGeneratorPcapStats.eofPackets = replaySent();
             if (exitOnEof && !eofEvent.scheduled())
                 schedule(eofEvent, curTick() + eofDrainDelay);
             return;
@@ -554,10 +579,12 @@ LoadGeneratorPcap::sendPacket()
     }
 
     // Send packet.
+    loadGeneratorPcapStats.attemptedPackets++;
     sendInProgress = true;
     const bool accepted = interface->sendPacket(pendingPacket);
     sendInProgress = false;
     if (!accepted) {
+        loadGeneratorPcapStats.backpressureRetries++;
         DPRINTF(LoadgenDebug, "Peer rejected packet\n");
         scheduleSendAfter(frequency());
         return;
@@ -674,6 +701,7 @@ bool LoadGeneratorPcap::processRxPkt(EthPacketPtr pkt) {
 void
 LoadGeneratorPcap::serialize(CheckpointOut &cp) const
 {
+  fatal_if(deferredStart, "Deferred PCAP replay does not support checkpoints");
   fatal_if(sendInProgress,
            "Cannot checkpoint LoadGeneratorPcap during a send callback");
 
@@ -724,6 +752,7 @@ LoadGeneratorPcap::serialize(CheckpointOut &cp) const
 void
 LoadGeneratorPcap::unserialize(CheckpointIn &cp)
 {
+    fatal_if(deferredStart, "Deferred PCAP replay does not support checkpoints");
     unsigned checkpointVersion;
     UNSERIALIZE_SCALAR(checkpointVersion);
     fatal_if(checkpointVersion != 1 && checkpointVersion != 2,

@@ -58,16 +58,16 @@ PioDevice::~PioDevice()
 void
 PioDevice::init()
 {
-    if (!pioPort.isConnected())
+    if (!getPioPort().isConnected())
         panic("Pio port of %s not connected to anything!", name());
-    pioPort.sendRangeChange();
+    getPioPort().sendRangeChange();
 }
 
 Port &
 PioDevice::getPort(const std::string &if_name, PortID idx)
 {
     if (if_name == "pio") {
-        return pioPort;
+        return getPioPort();
     }
     return ClockedObject::getPort(if_name, idx);
 }
