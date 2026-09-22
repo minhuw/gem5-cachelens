@@ -1315,6 +1315,10 @@ CPU::wakeDependents(const DynInstPtr &inst)
 void
 CPU::wakeCPU()
 {
+    // Keep wakeups pending until drainResume() restarts active threads.
+    if (drainState() == DrainState::Drained)
+        return;
+
     if (activityRec.active() || tickEvent.scheduled()) {
         DPRINTF(Activity, "CPU already running.\n");
         return;
