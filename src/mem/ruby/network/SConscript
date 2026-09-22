@@ -43,3 +43,22 @@ Source('BasicRouter.cc')
 Source('MessageBuffer.cc')
 Source('Network.cc')
 Source('Topology.cc')
+
+# Isolated native MessageBuffer regression; no protocol controllers or NIC.
+GTest('message_buffer.test', 'message_buffer.test.cc', 'MessageBuffer.cc',
+      SourceLib('z', tags=[]),
+      '../../../sim/cur_tick.cc', '../../../sim/sim_object.cc',
+      '../../../sim/serialize.cc', '../../../sim/drain.cc',
+      '../../../sim/eventq.cc', '../../../sim/root.cc', '../../../sim/globals.cc',
+      '../../../sim/sim_events.cc', '../../../sim/global_event.cc',
+      '../../../sim/core.cc', '../../../sim/bufval.cc',
+      '../../../base/debug.cc', '../../../base/statistics.cc',
+      '../../../base/stats/group.cc', '../../../base/stats/info.cc',
+      '../../../base/stats/storage.cc', '../../../base/match.cc',
+      '../../../base/str.cc', '../../../base/trace.cc',
+      '../../../base/atomicio.cc', '../../../base/hostinfo.cc',
+      '../../../base/inifile.cc', '../../../base/time.cc',
+      '../../../base/output.cc',
+      '../../../sim/backtrace_glibc.cc', '../../../base/version.cc',
+      '../../../sim/port.cc', '../../../base/random.cc',
+      env.File('sim/tags.cc', env['BUILDDIR']))

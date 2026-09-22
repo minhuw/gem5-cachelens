@@ -93,10 +93,22 @@ class MessageBuffer : public SimObject
     delayHead(Tick current_time, Tick delta, bool ruby_is_random,
               bool ruby_warmup)
     {
+        assert(isReady(current_time));
+        // Validate the requested latency before an ordered retry can raise it.
+        panic_if((delta == 0) && !m_allow_zero_latency,
+                 "Delta equals zero and allow_zero_latency is false "
+                 "during enqueue");
+        // A local retry is not a new producer arrival. Keep it behind the
+        // recorded tail without weakening enqueue's producer FIFO check.
+        if (m_strict_fifo && m_last_arrival_time > current_time)
+            delta = std::max(delta, m_last_arrival_time - current_time);
+
         MsgPtr m = m_prio_heap.front();
         std::pop_heap(m_prio_heap.begin(), m_prio_heap.end(),
                       std::greater<MsgPtr>());
         m_prio_heap.pop_back();
+        // enqueue increments occupancy; this retry has not added a message.
+        m_buf_msgs--;
         enqueue(m, current_time, delta, ruby_is_random, ruby_warmup);
     }
 

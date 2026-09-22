@@ -1618,6 +1618,16 @@ ${ident}_Controller::wakeup()
             """
         break;
     }
+"""
+        )
+        for func in self.functions:
+            if ("run_on_input_cycle_end" in func and
+                    func["run_on_input_cycle_end"] == "yes"):
+                if func.param_types or func.return_type.c_ident != "void":
+                    func.error("Input-cycle-end hooks must be void and take no arguments")
+                code(f"    {func.c_name}();")
+        code(
+            """
 }
 
 } // namespace ${protocol}

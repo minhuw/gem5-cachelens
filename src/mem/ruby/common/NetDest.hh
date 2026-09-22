@@ -101,7 +101,15 @@ class NetDest
 
     void print(std::ostream& out) const;
 
-    void setRubySystem(RubySystem *rs) { m_ruby_system = rs; resize(); }
+    void
+    setRubySystem(RubySystem *rs)
+    {
+        // Rebinding a live TBE must not discard its pending destinations.
+        if (m_ruby_system != rs) {
+            m_ruby_system = rs;
+            resize();
+        }
+    }
 
   private:
     // returns a value >= MachineType_base_level("this machine")
