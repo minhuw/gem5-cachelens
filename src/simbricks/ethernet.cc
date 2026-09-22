@@ -60,6 +60,7 @@ Adapter::Adapter(const Params &p)
 
     interface = new Interface(name() + ".int0", this);
 
+    adapter.cfgCheckpoint(p.initialized_checkpoint);
     adapter.cfgSetPollInterval(p.poll_interval);
     if (p.listen)
         adapter.listen(p.uxsocket_path, p.shm_path);
@@ -117,6 +118,7 @@ Adapter::init()
 void
 Adapter::handleInMsg(volatile union SimbricksProtoNetMsg *msg)
 {
+    packetHistory = true;
     volatile struct SimbricksProtoNetMsgPacket *pkt = &msg->packet;
 
     uint8_t ty = adapter.inType(msg);
@@ -149,6 +151,7 @@ Adapter::handleInMsg(volatile union SimbricksProtoNetMsg *msg)
 bool
 Adapter::recvPacket(EthPacketPtr packet)
 {
+    packetHistory = true;
     DPRINTF(SimBricksEthernet, "sending out a packet\n");
     volatile union SimbricksProtoNetMsg *msg_to = adapter.outAlloc();
 
@@ -164,6 +167,29 @@ Adapter::recvPacket(EthPacketPtr packet)
     ethernetStats.outgoingBytes += packet->length;
     interface->recvDone();
     return true;
+}
+
+void
+Adapter::checkInitializedCheckpoint() const
+{
+    fatal_if(!params().initialized_checkpoint || packetHistory,
+             "Initialized NIC checkpoint requires traffic-free Ethernet");
+}
+
+void
+Adapter::serialize(CheckpointOut &cp) const
+{
+    checkInitializedCheckpoint();
+    adapter.checkpointSerialize(cp);
+    SimObject::serialize(cp);
+}
+
+void
+Adapter::unserialize(CheckpointIn &cp)
+{
+    checkInitializedCheckpoint();
+    adapter.checkpointUnserialize(cp);
+    SimObject::unserialize(cp);
 }
 
 void

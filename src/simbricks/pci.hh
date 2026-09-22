@@ -96,6 +96,7 @@ class TimingPioPort : public QueuedResponsePort
     virtual ~TimingPioPort() {}
 
     void timingPioCompl(TimingPioCompl &comp);
+    bool responsePending() const { return respQueue.size() != 0; }
 
     virtual AddrRangeList getAddrRanges() const;
 };
@@ -147,6 +148,11 @@ public:
     virtual void unserialize(CheckpointIn &cp) override;
 
     virtual void startup() override;
+    void initializedCheckpointBootReady();
+    void initializedCheckpointBegin(uint64_t hi, uint64_t lo);
+    bool initializedCheckpointReady() const;
+    void initializedCheckpointFinish();
+    bool initializedCheckpointFrozen() const { return adapter.checkpointFrozen(); }
 
     // used by Bar class during setup
     Bar *getSimBricksBar(size_t i) const;
@@ -157,6 +163,9 @@ protected:
 
 private:
     friend class DMACompl;
+    void checkInitializedCheckpoint() const;
+    std::string checkpointBody;
+    uint64_t dmaOutstanding = 0;
     class DMACompl : public EventFunctionWrapper
     {
         protected:

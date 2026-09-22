@@ -76,7 +76,7 @@ InitManager::connected(Adapter &a)
 }
 
 void
-InitManager::processEvents()
+InitManager::processEvents(int timeout)
 {
     nfds_t n = unconnected.size() + waitRx.size();
     if (n == 0)
@@ -130,14 +130,14 @@ InitManager::processEvents()
     if (i == 0)
         return;
 
-    int ret = poll(pfds, i, -1);
+    int ret = poll(pfds, i, timeout);
     if (ret < 0)
         panic("poll failed");
 
     const unsigned max_handshake = 4096;
     std::vector<uint8_t> handshake(max_handshake);
 
-    for (int k = 0; k < ret; k++) {
+    for (nfds_t k = 0; k < i; k++) {
         Adapter *a = as[k];
         if (pfds[k].revents == 0)
             continue;
@@ -173,6 +173,7 @@ InitManager::waitReady(Adapter &a)
     // process events until this adapter is ready, in the process others may
     // be ready too, in which case they will already be removed from the lists
 
+    const auto deadline = nicbm::checkpoint::Deadline();
     while (true) {
         auto i = unconnected.find(&a);
         auto j = waitRx.find(&a);
@@ -181,7 +182,9 @@ InitManager::waitReady(Adapter &a)
             return;
         }
 
-        processEvents();
+        fatal_if(a.checkpointEnabled && nicbm::checkpoint::Clock::now() >= deadline,
+                 "Initialized NIC adapter initialization wall deadline exceeded");
+        processEvents(a.checkpointEnabled ? 100 : -1);
     }
 }
 

@@ -21,3 +21,9 @@ class SimBricksDmaChecker(ClockedObject):
     cxx_class = 'gem5::simbricks::pci::DmaChecker'
     cxx_header = 'simbricks/dma_checker.hh'
     port = ResponsePort('Directed DMA flag checker')
+
+class SimBricksCheckpointTester(SimBricksPci):
+    type = 'SimBricksCheckpointTester'
+    cxx_class = 'gem5::simbricks::pci::CheckpointTester'
+    cxx_header = 'simbricks/checkpoint_tester.hh'
+    restore_probe = Param.Bool(False, 'Read preserved NIC state without initialization')

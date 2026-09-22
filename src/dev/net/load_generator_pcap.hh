@@ -86,6 +86,7 @@ class LoadGeneratorPcap : public SimObject {
   } loadGeneratorPcapStats;
 
   // Scheduling event callbacks.
+  std::string deferredReplayConfig() const;
   void sendPacket();
   void checkLoss();
   Tick frequency();

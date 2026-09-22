@@ -49,6 +49,7 @@ protected:
     base::GenericBaseAdapter
         <SimbricksProtoNetMsg, SimbricksProtoNetMsg> adapter;
     bool sync;
+    bool packetHistory = false;
     struct EthernetStats : public statistics::Group {
         EthernetStats(statistics::Group *parent);
         statistics::Scalar incomingPackets, incomingBytes;
@@ -90,6 +91,10 @@ public:
     virtual Port &getPort(const std::string &if_name,
                           PortID idx=InvalidPortID) override;
 
+    base::Adapter &checkpointAdapter() { return adapter; }
+    void checkInitializedCheckpoint() const;
+    void serialize(CheckpointOut &cp) const override;
+    void unserialize(CheckpointIn &cp) override;
     void init() override;
     virtual void startup() override;
 };

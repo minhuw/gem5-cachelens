@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <sstream>
 
 #include <base/stats/types.hh>
 
@@ -698,15 +699,45 @@ bool LoadGeneratorPcap::processRxPkt(EthPacketPtr pkt) {
   return true;
 }
 
+// Exact configuration identity only for never-started deferred checkpoints.
+// Nondeferred checkpoints retain their existing restore policy.
+std::string
+LoadGeneratorPcap::deferredReplayConfig() const
+{
+  std::ostringstream out;
+  out << unsigned(loadgenId) << ' ' << int(stackMode) << ' '
+      << startTick << ' ' << stopTick << ' ' << maxPcktSize << ' '
+      << portFilter << ' ' << srcIP << ' ' << destIP << ' '
+      << int(replayMode) << ' ' << packetRate << ' ' << incrementInterval
+      << ' ' << checkLossInterval << ' ' << checkLossWait << ' '
+      << exitOnEof << ' ' << eofDrainDelay;
+  return out.str();
+}
+
 void
 LoadGeneratorPcap::serialize(CheckpointOut &cp) const
 {
-  fatal_if(deferredStart, "Deferred PCAP replay does not support checkpoints");
+  // Statistics can be reset; replayStarted is an irreversible lifetime latch.
+  // Test both scheduled and drain-latched events, not just the visible queue.
+  fatal_if(deferredStart && (replayStarted || recordsConsumed != 0 ||
+           count_packets != 0 || lastRxCount != 0 || lastTxCount != 0 ||
+           eofSeen || pendingPacket || sendInProgress ||
+           sendPacketEvent.scheduled() || checkLossEvent.scheduled() ||
+           eofEvent.scheduled() || drainSendEvent || drainLossEvent ||
+           drainEofEvent),
+           "Deferred PCAP checkpoint requires never-started pristine replay");
   fatal_if(sendInProgress,
            "Cannot checkpoint LoadGeneratorPcap during a send callback");
 
-  const unsigned checkpointVersion = 2;
+  const unsigned checkpointVersion = 3;
   SERIALIZE_SCALAR(checkpointVersion);
+  SERIALIZE_SCALAR(deferredStart);
+  SERIALIZE_SCALAR(replayStarted);
+  SERIALIZE_SCALAR(count_packets);
+  if (deferredStart) {
+    const std::string deferredConfig = deferredReplayConfig();
+    SERIALIZE_SCALAR(deferredConfig);
+  }
   SERIALIZE_SCALAR(packetRate);
   SERIALIZE_SCALAR(lastRxCount);
   SERIALIZE_SCALAR(lastTxCount);
@@ -752,12 +783,31 @@ LoadGeneratorPcap::serialize(CheckpointOut &cp) const
 void
 LoadGeneratorPcap::unserialize(CheckpointIn &cp)
 {
-    fatal_if(deferredStart, "Deferred PCAP replay does not support checkpoints");
     unsigned checkpointVersion;
     UNSERIALIZE_SCALAR(checkpointVersion);
-    fatal_if(checkpointVersion != 1 && checkpointVersion != 2,
+    fatal_if(checkpointVersion != 1 && checkpointVersion != 2 &&
+             checkpointVersion != 3,
              "Unsupported LoadGeneratorPcap checkpoint version %u",
              checkpointVersion);
+
+    // v1/v2 were exclusively nondeferred. Never reinterpret their dormant
+    // state as deferred, or a deferred checkpoint as automatic replay.
+    bool checkpointDeferredStart = false;
+    bool checkpointReplayStarted = false;
+    int checkpointCountPackets = 0;
+    if (checkpointVersion >= 3) {
+        paramIn(cp, "deferredStart", checkpointDeferredStart);
+        paramIn(cp, "replayStarted", checkpointReplayStarted);
+        paramIn(cp, "count_packets", checkpointCountPackets);
+    }
+    fatal_if(deferredStart != checkpointDeferredStart,
+             "Deferred PCAP checkpoint mode mismatch");
+    if (deferredStart) {
+        std::string deferredConfig;
+        UNSERIALIZE_SCALAR(deferredConfig);
+        fatal_if(deferredConfig != deferredReplayConfig(),
+                 "Deferred PCAP checkpoint replay settings mismatch");
+    }
 
     uint64_t checkpointPacketRate;
     uint64_t checkpointLastRxCount;
@@ -811,6 +861,17 @@ LoadGeneratorPcap::unserialize(CheckpointIn &cp)
         checkpointLastRxCount != 0 || checkpointLastTxCount != 0 ||
         checkpointEofSeen || pendingPacketExists || sendEventScheduled ||
         lossEventScheduled || eofEventScheduled;
+
+    if (deferredStart) {
+        fatal_if(checkpointReplayStarted || checkpointCountPackets != 0 ||
+                 activeCheckpoint,
+                 "Deferred PCAP checkpoint requires never-started pristine replay");
+        fatal_if(captureFileHash != checkpointPcapFileHash,
+                 "PCAP file %s changed since the checkpoint was created",
+                 pcapFilename);
+        fatal_if(checkpointPacketRate != packetRate,
+                 "Deferred PCAP checkpoint replay settings mismatch");
+    }
 
     if (activeCheckpoint) {
         fatal_if(captureFileHash != checkpointPcapFileHash,

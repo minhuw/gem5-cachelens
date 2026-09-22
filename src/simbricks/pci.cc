@@ -30,6 +30,10 @@
 #include "base/trace.hh"
 #include "base/output.hh"
 #include "simbricks/pci_safety.hh"
+#include "simbricks/ethernet.hh"
+#include "sim/serialize.hh"
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace gem5 {
 namespace simbricks {
@@ -65,6 +69,9 @@ Device::Device(const Params &p)
         });
         semanticTrace << "op_id,timestamp_ps,request_id,kind,queue_id,port_id,packet_id,packet_offset,packet_length,pci_address,physical_address,length,write\n";
     }
+    fatal_if(p.initialized_checkpoint != bool(p.checkpoint_ethernet),
+             "Initialized NIC checkpoint requires its explicit Ethernet peer");
+    adapter.cfgCheckpoint(p.initialized_checkpoint);
     adapter.cfgSetPollInterval(p.poll_interval);
     if (p.listen)
         adapter.listen(p.uxsocket_path, p.shm_path);
@@ -261,6 +268,7 @@ Device::init()
 void
 Device::readAsync(PciPioCompl &comp)
 {
+    fatal_if(adapter.checkpointFrozen(), "PCI access after checkpoint producer gate");
     int bar;
     Addr daddr;
 
@@ -293,6 +301,7 @@ Device::readAsync(PciPioCompl &comp)
 void
 Device::writeAsync(PciPioCompl &comp)
 {
+    fatal_if(adapter.checkpointFrozen(), "PCI access after checkpoint producer gate");
     int bar;
     Addr daddr;
 
@@ -404,12 +413,14 @@ Device::configAccess(PacketPtr pkt, bool write)
 Tick
 Device::readConfig(PacketPtr pkt)
 {
+    fatal_if(adapter.checkpointFrozen(), "PCI access after checkpoint producer gate");
     return configAccess(pkt, false) ? configDelay : PciDevice::readConfig(pkt);
 }
 
 Tick
 Device::writeConfig(PacketPtr pkt)
 {
+    fatal_if(adapter.checkpointFrozen(), "PCI access after checkpoint producer gate");
     bool intx_before = !!(config.command & PciCommandIntxDisable);
     bool msi_before = (msicap.mc & 0x1);
     bool msix_before = (msixcap.mxc & 0x8000);
@@ -451,10 +462,12 @@ Device::DMACompl::DMACompl(Device *dev_, uint64_t id_, size_t bufsiz_,
     : EventFunctionWrapper([this]{ done(); }, name_, true), dev(dev_), id(id_),
     ty(ty_), buf(new uint8_t[bufsiz_]), bufsiz(bufsiz_)
 {
+    ++dev->dmaOutstanding;
 }
 
 Device::DMACompl::~DMACompl()
 {
+    --dev->dmaOutstanding;
     delete[] buf;
 }
 
@@ -669,6 +682,7 @@ Device::msix_signal(uint16_t vec)
 bool
 Device::readMsix(PciPioCompl &comp, Addr addr, int bar)
 {
+    fatal_if(adapter.checkpointFrozen(), "PCI access after checkpoint producer gate");
     if (!MSIXCAP_BASE)
         return false;
 
@@ -708,6 +722,7 @@ Device::readMsix(PciPioCompl &comp, Addr addr, int bar)
 bool
 Device::writeMsix(PciPioCompl &comp, Addr addr, int bar)
 {
+    fatal_if(adapter.checkpointFrozen(), "PCI access after checkpoint producer gate");
     if (!MSIXCAP_BASE)
         return false;
 
@@ -754,16 +769,132 @@ Device::writeMsix(PciPioCompl &comp, Addr addr, int bar)
     return false;
 }
 
+
+void
+Device::checkInitializedCheckpoint() const
+{
+    fatal_if(!params().initialized_checkpoint || !pending.empty() || dmaPending() ||
+             dmaOutstanding || overridePort.responsePending() || msicap.mpend,
+             "NIC checkpoint requires drained PCI MMIO/DMA/interrupts");
+    for (const auto &entry : msix_pba)
+        fatal_if(entry.bits, "NIC checkpoint has pending MSI-X");
+    params().checkpoint_ethernet->checkInitializedCheckpoint();
+}
+
+void
+Device::initializedCheckpointBootReady()
+{
+    if (!params().initialized_checkpoint) return;
+    fatal_if(!adapter.checkpointPeerIdentity().SameToken(
+                 params().checkpoint_ethernet->checkpointAdapter().checkpointPeerIdentity()),
+             "PCI and Ethernet belong to different NIC peers");
+    adapter.checkpointBootReady();
+    params().checkpoint_ethernet->checkpointAdapter().checkpointBootReady();
+}
+
+void
+Device::initializedCheckpointBegin(uint64_t hi, uint64_t lo)
+{
+    fatal_if(drainState() != DrainState::Drained,
+             "NIC checkpoint requires global drain before producer gates");
+    checkInitializedCheckpoint();
+    adapter.checkpointBegin(hi, lo);
+    params().checkpoint_ethernet->checkpointAdapter().checkpointBegin(hi, lo);
+}
+
+bool
+Device::initializedCheckpointReady() const
+{
+    return adapter.checkpointReady() &&
+        params().checkpoint_ethernet->checkpointAdapter().checkpointReady();
+}
+
+void
+Device::initializedCheckpointFinish()
+{
+    fatal_if(!initializedCheckpointReady(), "NIC checkpoint barrier incomplete");
+    checkInitializedCheckpoint();
+    adapter.checkpointStop();
+    params().checkpoint_ethernet->checkpointAdapter().checkpointStop();
+    checkpointBody = adapter.checkpointFetch();
+}
+
 void
 Device::serialize(CheckpointOut &cp) const
 {
-    fatal("SimBricks PCI checkpointing is unsupported");
+    checkInitializedCheckpoint();
+    fatal_if(checkpointBody.empty(), "NIC checkpoint missing acknowledged device snapshot");
+    adapter.checkpointSerialize(cp);
+    const auto control = adapter.checkpointControl();
+    paramOut(cp, "initializedStateLength", control.length);
+    paramOut(cp, "initializedStateHash", control.hash);
+    fatal_if(name().find('/') != std::string::npos, "Invalid checkpoint object name");
+    const auto path = CheckpointIn::dir() + name() + ".nic-state";
+    // The checkpoint wrapper creates an exclusive staging directory and only
+    // publishes the directory after every sidecar and gem5 state succeeds.
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    fatal_if(fd < 0, "Cannot exclusively create NIC state sidecar");
+    auto header = control;
+    std::string bytes = header.Encode() + checkpointBody;
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        auto n = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        fatal_if(n <= 0, "Cannot write NIC state sidecar");
+        offset += n;
+    }
+    fatal_if(fsync(fd) != 0, "Cannot sync NIC state sidecar");
+    fatal_if(::close(fd) != 0, "Cannot close NIC state sidecar");
+    SERIALIZE_SCALAR(nextRequest);
+    SERIALIZE_SCALAR(writesPosted);
+    SERIALIZE_SCALAR(semanticOpId);
+    PciDevice::serialize(cp);
 }
 
 void
 Device::unserialize(CheckpointIn &cp)
 {
-    fatal("SimBricks PCI checkpoint restore is unsupported");
+    checkInitializedCheckpoint();
+    adapter.checkpointUnserialize(cp);
+    uint64_t length, hash;
+    paramIn(cp, "initializedStateLength", length);
+    paramIn(cp, "initializedStateHash", hash);
+    fatal_if(!length || length > nicbm::checkpoint::MaxState, "Invalid NIC state size");
+    std::ifstream file(cp.getCptDir() + name() + ".nic-state", std::ios::binary);
+    std::string bytes(64 + length, '\0');
+    fatal_if(!file.read(bytes.data(), bytes.size()) || file.peek() != EOF,
+             "NIC state sidecar missing/truncated/oversized");
+    auto saved = nicbm::checkpoint::Control::Decode(bytes.substr(0, 64));
+    auto expected = adapter.checkpointControl();
+    checkpointBody = bytes.substr(64);
+    fatal_if(saved.command != nicbm::checkpoint::State || !saved.SameToken(expected) ||
+             saved.epoch != expected.epoch || saved.length != length || saved.hash != hash ||
+             nicbm::checkpoint::Hash(checkpointBody) != hash, "NIC state sidecar binding mismatch");
+    adapter.checkpointRestoreBody(checkpointBody);
+    // Parent serialization restores contents, not a different capability layout.
+    if (MSIXCAP_BASE) {
+        int tableSize, pbaSize;
+        paramIn(cp, "msix_array_size", tableSize);
+        paramIn(cp, "pba_array_size", pbaSize);
+        fatal_if(tableSize < 0 || pbaSize < 0 ||
+                 size_t(tableSize) != msix_table.size() || size_t(pbaSize) != msix_pba.size(),
+                 "NIC checkpoint MSI-X geometry mismatch");
+    }
+    uint16_t mxc, mc;
+    uint32_t mtab, mpba;
+    paramIn(cp, "msixcap.mxc", mxc); paramIn(cp, "msicap.mc", mc);
+    paramIn(cp, "msixcap.mtab", mtab); paramIn(cp, "msixcap.mpba", mpba);
+    fatal_if((mxc & 0x3fff) != (msixcap.mxc & 0x3fff) ||
+             (mc & ~0x71) != (msicap.mc & ~0x71) ||
+             mtab != msixcap.mtab || mpba != msixcap.mpba,
+             "NIC checkpoint capability identity mismatch");
+    bool posted;
+    paramIn(cp, "writesPosted", posted);
+    fatal_if(posted != writesPosted, "NIC checkpoint posted-write mode mismatch");
+    UNSERIALIZE_SCALAR(nextRequest);
+    UNSERIALIZE_SCALAR(semanticOpId);
+    fatal_if(!nextRequest, "NIC checkpoint request ID invalid");
+    PciDevice::unserialize(cp);
+    checkInitializedCheckpoint();
 }
 
 void

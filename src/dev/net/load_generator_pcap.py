@@ -13,7 +13,7 @@ class LoadGeneratorPcap(SimObject):
         "startReplay", "replaySent", "replayAttempts", "replayRetries",
         "replayEof", "replayEofTick", "replayEofCount",
     )]
-    deferred_start = Param.Bool(False, "Wait for startReplay; checkpoints unsupported")
+    deferred_start = Param.Bool(False, "Wait for startReplay; checkpoints only before first start")
 
     interface = EtherInt("interface")
     loadgen_id = Param.UInt8(0, "For match NIC")

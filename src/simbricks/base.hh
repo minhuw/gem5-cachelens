@@ -29,6 +29,7 @@
 #include "sim/eventq.hh"
 #include "sim/sim_object.hh"
 #include "simbricks/cur_tick.hh"
+#include <simbricks/nicbm/checkpoint.h>
 
 namespace gem5 {
 namespace simbricks {
@@ -46,6 +47,15 @@ class Adapter : public EventManager
     friend class InitManager;
 
     bool sync;
+    bool checkpointEnabled = false;
+    bool checkpointGated = false, checkpointAck = false;
+    nicbm::checkpoint::Clock::time_point checkpointDeadline;
+    nicbm::checkpoint::Control checkpointToken = nicbm::checkpoint::Empty(nicbm::checkpoint::Boot);
+    nicbm::checkpoint::Control checkpointPeer;
+    std::string checkpointBody, incomingIntro, outgoingIntro;
+    uint64_t deviceEpoch = 0;
+    void checkCheckpointDeadline() const;
+    std::string checkpointIdentity() const;
     bool isListen;
     Tick pollInterval;
     EventFunctionWrapper inEvent;
@@ -77,6 +87,20 @@ class Adapter : public EventManager
     void listen(const std::string &sock_path, const std::string &shm_path);
     void init();
     void startup();
+    void cfgCheckpoint(bool enabled);
+    void checkpointBootReady();
+    void checkpointBegin(uint64_t hi, uint64_t lo);
+    bool checkpointReady() const { return checkpointAck; }
+    bool checkpointFrozen() const { return checkpointGated; }
+    uint64_t checkpointEpoch() const { return deviceEpoch; }
+    void checkpointStop();
+    std::string checkpointFetch();
+    void checkpointSerialize(CheckpointOut &cp) const;
+    void checkpointUnserialize(CheckpointIn &cp);
+    void checkpointRestoreBody(const std::string &body) { checkpointBody = body; }
+    nicbm::checkpoint::Control checkpointControl() const { return checkpointToken; }
+    nicbm::checkpoint::Control checkpointPeerIdentity() const { return checkpointPeer; }
+    void rememberIntro(const void *data, size_t len, bool incoming);
 
     bool poll();
     size_t inPayload() const { return baseIf.in_elen >= 64 ? baseIf.in_elen - 64 : 0; }
@@ -91,6 +115,7 @@ class Adapter : public EventManager
     }
 
     volatile union SimbricksProtoBaseMsg *outAlloc() {
+        fatal_if(checkpointGated, "SimBricks semantic allocation after producer gate");
         volatile union SimbricksProtoBaseMsg *msg;
         do {
             msg = SimbricksBaseIfOutAlloc(&baseIf, curTickAsSimbricksTs());
@@ -99,6 +124,7 @@ class Adapter : public EventManager
     }
 
     void outSend(volatile union SimbricksProtoBaseMsg *msg, uint8_t ty) {
+        fatal_if(checkpointGated, "SimBricks semantic publication after producer gate");
         SimbricksBaseIfOutSend(&baseIf, msg, ty);
     }
 };
@@ -120,11 +146,14 @@ class GenericBaseAdapter : public Adapter
     Interface &intf;
 
     virtual size_t introOutPrepare(void *data, size_t len) {
-        return intf.introOutPrepare(data, len);
+        size_t size = intf.introOutPrepare(data, len);
+        rememberIntro(data, size, false);
+        return size;
     }
 
     virtual void introInReceived(const void *data, size_t len) {
         intf.introInReceived(data, len);
+        rememberIntro(data, len, true);
     }
 
     virtual void handleInMsg(volatile union SimbricksProtoBaseMsg *msg) {

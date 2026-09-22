@@ -38,6 +38,13 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import atexit
+import ctypes
+import hashlib
+import json
+import shutil
+import tempfile
+import time
+import uuid
 import os
 import sys
 
@@ -163,6 +170,8 @@ def instantiate(ckpt_dir=None):
 
     # Restore checkpoint (if any)
     if ckpt_dir:
+        if _initialized_nics():
+            _verify_initialized_checkpoint(ckpt_dir)
         _drain_manager.preCheckpointRestore()
         ckpt = _m5.core.getCheckpoint(ckpt_dir)
         for obj in root.descendants():
@@ -192,6 +201,8 @@ def simulate(*args, **kwargs):
         root = objects.Root.getInstance()
         for obj in root.descendants():
             obj.startup()
+        for nic in _initialized_nics():
+            nic.initializedCheckpointBootReady()
         need_startup = False
 
         # Python exit handlers happen in reverse order.
@@ -204,6 +215,8 @@ def simulate(*args, **kwargs):
         # Reset to put the stats in a consistent state.
         stats.reset()
 
+    if any(nic.initializedCheckpointFrozen() for nic in _initialized_nics()):
+        fatal("Initialized NIC checkpoint is frozen; exit and restore fresh peers")
     if _drain_manager.isDrained():
         _drain_manager.resume()
 
@@ -321,12 +334,123 @@ def memInvalidate(root):
         obj.memInvalidate()
 
 
+def _initialized_nics():
+    root = objects.Root.getInstance()
+    return [obj for obj in root.descendants()
+            if isinstance(obj, getattr(objects, "SimBricksPci", ()))
+            and bool(obj.initialized_checkpoint)]
+
+
+def _checkpoint_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _verify_initialized_checkpoint(directory):
+    # The opt-in graph requires this manifest; absence is never a legacy/fresh
+    # fallback. Bind the exact gem5 metadata and exact device sidecar together.
+    names = {"m5.cpt"} | {nic.path() + ".nic-state" for nic in _initialized_nics()}
+    with open(os.path.join(directory, "initialized-nic.json"), "rb") as source:
+        data = source.read(65537)
+        if len(data) > 65536:
+            fatal("Oversized initialized NIC checkpoint manifest")
+        manifest = json.loads(data)
+    if manifest.get("version") != 1 or set(manifest.get("files", {})) != names:
+        fatal("Initialized NIC checkpoint manifest version/identity mismatch")
+    for name in names:
+        if _checkpoint_digest(os.path.join(directory, name)) != manifest["files"][name]:
+            fatal("Initialized NIC checkpoint hash mismatch: %s", name)
+
+
+def _initialized_checkpoint(directory, nics):
+    if len(nics) != 1 or need_startup or not _drain_manager.isDrained():
+        fatal("Initialized NIC checkpoint requires one started, globally drained NIC")
+    for obj in objects.Root.getInstance().descendants():
+        if (isinstance(obj, getattr(objects, "BaseCPU", ()))
+                and not obj.switchedOut()
+                and not isinstance(obj, getattr(objects, "BaseO3CPU", ()))):
+            fatal("Initialized NIC checkpoints currently require O3 CPUs")
+        if (isinstance(obj, getattr(objects, "LoadGeneratorPcap", ()))
+                and not bool(obj.deferred_start)):
+            fatal("Initialized NIC checkpoints require deferred PCAP replay")
+    token = uuid.uuid4().int
+    nics[0].initializedCheckpointBegin(token >> 64, token & ((1 << 64) - 1))
+    wall_deadline = time.monotonic() + 30
+    old_limit = getMaxTick()
+    deadline = min(curTick() + 1_000_000_000, old_limit)
+    try:
+        while not nics[0].initializedCheckpointReady():
+            if curTick() >= deadline or time.monotonic() >= wall_deadline:
+                fatal("Initialized NIC checkpoint barrier deadline exceeded")
+            # Do NOT call public simulate(): it resumes drained CPUs/devices.
+            event = _m5.event.simulate(min(1_000_000, deadline - curTick()))
+            if event.getCause() != "simulate() limit reached":
+                fatal("Unexpected exit during initialized NIC barrier: %s", event.getCause())
+            if not _drain_manager.isDrained():
+                fatal("Global drain state changed during NIC barrier")
+        nics[0].initializedCheckpointFinish()
+    finally:
+        _m5.event.setMaxTick(old_limit)
+    memWriteback(objects.Root.getInstance())
+    directory = os.path.abspath(os.fspath(directory).replace("%d", str(curTick())))
+    if os.path.exists(directory):
+        fatal("Initialized NIC checkpoints require a new destination directory")
+    parent = os.path.dirname(directory)
+    os.makedirs(parent, exist_ok=True)
+    stage = tempfile.mkdtemp(prefix=".initialized-nic-", dir=parent)
+    try:
+        _m5.core.serializeAll(stage)
+        names = ["m5.cpt", nics[0].path() + ".nic-state"]
+        manifest = {"version": 1, "files": {
+            name: _checkpoint_digest(os.path.join(stage, name)) for name in names}}
+        with open(os.path.join(stage, "initialized-nic.json"), "x") as output:
+            json.dump(manifest, output, sort_keys=True)
+            output.flush()
+            os.fsync(output.fileno())
+        # The complete checkpoint is published at once. A partial save never
+        # becomes a restorable final path or reuses a previous sidecar.
+        for current, _, files in os.walk(stage):
+            for name in files:
+                with open(os.path.join(current, name), "rb") as source:
+                    os.fsync(source.fileno())
+            fd = os.open(current, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        # Linux RENAME_NOREPLACE closes the destination-creation race; even an
+        # empty directory created by another save must never be overwritten.
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = libc.renameat2
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(stage), -100, os.fsencode(directory), 1):
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), directory)
+        fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
 def checkpoint(dir):
     root = objects.Root.getInstance()
     if not isinstance(root, objects.Root):
         raise TypeError("Checkpoint must be called on a root object.")
 
     drain()
+    nics = _initialized_nics()
+    if nics:
+        _initialized_checkpoint(dir, nics)
+        return
     memWriteback(root)
 
     # Recursively create the checkpoint directory if it does not exist.

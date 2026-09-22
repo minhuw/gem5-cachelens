@@ -54,7 +54,7 @@ class InitManager
 
         InitManager();
 
-        void processEvents();
+        void processEvents(int timeout);
         void connected(Adapter &a);
     public:
         static InitManager &get();

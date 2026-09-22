@@ -64,6 +64,6 @@ CompoundFlag('SimBricksAll', [ 'SimBricks', 'SimBricksSync',
 if env['CONF']['USE_SIMBRICKS']:
     GTest('pci_safety.test', 'pci_safety.test.cc')
     if env['CONF']['USE_TEST_OBJECTS']:
-        SimObject('PciPortTester.py', sim_objects=['SimBricksPciPortTester', 'SimBricksTestPlatform', 'SimBricksDmaChecker'])
+        SimObject('PciPortTester.py', sim_objects=['SimBricksPciPortTester', 'SimBricksTestPlatform', 'SimBricksDmaChecker', 'SimBricksCheckpointTester'])
         Source('pci_port_tester.cc')
         Source('dma_checker.cc')

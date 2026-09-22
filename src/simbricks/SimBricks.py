@@ -27,7 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from m5.defines import buildEnv
-from m5.SimObject import SimObject
+from m5.SimObject import SimObject, PyBindMethod
 from m5.params import *
 from m5.proxy import *
 from m5.objects.PciDevice import PciBar
@@ -42,6 +42,7 @@ class SimBricksEthernet(SimObject):
     cxx_header = "simbricks/ethernet.hh"
 
     int0 = EtherInt("interface 0")
+    initialized_checkpoint = Param.Bool(False, "Opt-in post-probe, pre-data-queue checkpoint")
 
     listen = Param.Bool(False, "Open listening instead of connecting")
     uxsocket_path = Param.String("unix socket path")
@@ -62,6 +63,14 @@ class SimBricksPci(PciDevice):
     type = "SimBricksPci"
     cxx_class = "gem5::simbricks::pci::Device"
     cxx_header = "simbricks/pci.hh"
+
+    initialized_checkpoint = Param.Bool(False, "Opt-in post-probe, pre-data-queue checkpoint")
+    checkpoint_ethernet = Param.SimBricksEthernet(NULL, "Ethernet endpoint of the same NIC")
+    cxx_exports = [PyBindMethod(name) for name in (
+        "initializedCheckpointBootReady", "initializedCheckpointBegin",
+        "initializedCheckpointReady", "initializedCheckpointFinish",
+        "initializedCheckpointFrozen",
+    )]
 
     semantic_dma = Param.Bool(False, "Require accuracy DMA v1 on both peers")
     semantic_dma_trace = Param.String("", "Optional DMA CSV filename")
