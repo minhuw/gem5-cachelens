@@ -109,6 +109,22 @@ class DrainManager
     bool tryDrain();
 
     /**
+     * Verify a drained fence after event advancement, without invoking drain()
+     * or changing any object's state. Timing packets produced while globally
+     * drained invalidate the fence even if they have since left their queue.
+     * Call only with simulation stopped; this is a conservative packet-work
+     * guard, not a replacement for the initial full drain or device validators.
+     */
+    void verifyDrained() const;
+
+    /** Called at the shared timing-packet enqueue point. */
+    void notePacketActivity()
+    {
+        if (_state == DrainState::Drained)
+            _packetActivityAfterDrain = true;
+    }
+
+    /**
      * Resume normal simulation in a Drained system.
      *
      * @ingroup api_drain
@@ -188,6 +204,9 @@ class DrainManager
      * threads.
      */
     std::atomic_uint _count;
+
+    // Sticky until a genuine drain completes (or a new image is restored).
+    std::atomic_bool _packetActivityAfterDrain{false};
 
     /** Global simulator drain state */
     DrainState _state;

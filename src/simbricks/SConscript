@@ -67,3 +67,6 @@ if env['CONF']['USE_SIMBRICKS']:
         SimObject('PciPortTester.py', sim_objects=['SimBricksPciPortTester', 'SimBricksTestPlatform', 'SimBricksDmaChecker', 'SimBricksCheckpointTester'])
         Source('pci_port_tester.cc')
         Source('dma_checker.cc')
+        if env['CONF']['USE_X86_ISA']:
+            SimObject('CheckpointInterruptTester.py',
+                      sim_objects=['SimBricksCheckpointInterruptTester'])

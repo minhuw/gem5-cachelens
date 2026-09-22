@@ -83,6 +83,7 @@ DrainManager::tryDrain()
 
     if (_count == 0) {
         DPRINTF(Drain, "Drain done.\n");
+        _packetActivityAfterDrain = false;
         _state = DrainState::Drained;
         return true;
     } else {
@@ -90,6 +91,15 @@ DrainManager::tryDrain()
                 _count, drainableCount());
         return false;
     }
+}
+
+void
+DrainManager::verifyDrained() const
+{
+    fatal_if(_state != DrainState::Drained || _count != 0,
+             "Checkpoint verification requires a fully drained system");
+    fatal_if(_packetActivityAfterDrain,
+             "Timing packets produced while globally drained; checkpoint unsafe");
 }
 
 void
@@ -138,6 +148,7 @@ DrainManager::preCheckpointRestore()
              "preCheckpointRestore() called on a system that isn't in the "
              "Running state.\n");
 
+    _packetActivityAfterDrain = false;
     DPRINTF(Drain, "Applying pre-restore fixes to %u objects.\n",
             drainableCount());
     _state = DrainState::Drained;

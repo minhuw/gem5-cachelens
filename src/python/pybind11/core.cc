@@ -108,6 +108,7 @@ init_drain(py::module_ &m_native)
     py::class_<DrainManager, std::unique_ptr<DrainManager, py::nodelete>>(
         m, "DrainManager")
         .def("tryDrain", &DrainManager::tryDrain)
+        .def("verifyDrained", &DrainManager::verifyDrained)
         .def("resume", &DrainManager::resume)
         .def("preCheckpointRestore", &DrainManager::preCheckpointRestore)
         .def("isDrained", &DrainManager::isDrained)

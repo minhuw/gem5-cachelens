@@ -376,6 +376,7 @@ def _initialized_checkpoint(directory, nics):
         if (isinstance(obj, getattr(objects, "LoadGeneratorPcap", ()))
                 and not bool(obj.deferred_start)):
             fatal("Initialized NIC checkpoints require deferred PCAP replay")
+    _drain_manager.verifyDrained()
     token = uuid.uuid4().int
     nics[0].initializedCheckpointBegin(token >> 64, token & ((1 << 64) - 1))
     wall_deadline = time.monotonic() + 30
@@ -391,10 +392,13 @@ def _initialized_checkpoint(directory, nics):
                 fatal("Unexpected exit during initialized NIC barrier: %s", event.getCause())
             if not _drain_manager.isDrained():
                 fatal("Global drain state changed during NIC barrier")
-        nics[0].initializedCheckpointFinish()
+        _drain_manager.verifyDrained()
     finally:
         _m5.event.setMaxTick(old_limit)
     memWriteback(objects.Root.getInstance())
+    _drain_manager.verifyDrained()
+    # No events run between these checks, final epoch capture and serialization.
+    nics[0].initializedCheckpointFinish()
     directory = os.path.abspath(os.fspath(directory).replace("%d", str(curTick())))
     if os.path.exists(directory):
         fatal("Initialized NIC checkpoints require a new destination directory")

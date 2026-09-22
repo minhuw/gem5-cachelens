@@ -16,6 +16,7 @@ def main():
     parser.add_argument('--gem5', type=Path, required=True)
     parser.add_argument('--nic', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--interrupts', action='store_true', help='Require X86 test objects')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     pcap = args.out / 'input.pcap'
@@ -124,6 +125,23 @@ def main():
             manifest['files'][sidecar.name] = hashlib.sha256(data).hexdigest()
             path.write_text(json.dumps(manifest))
         run(mode, bad, True, None)
+    if args.interrupts:
+        idle = args.out / 'timing-idle-state'
+        run('timing-idle-save', idle, False, 'INITIALIZED_NIC_GEM5_SAVE_OK',
+            ['--interrupt-case', 'idle'])
+        run('timing-idle-restore', idle, True, 'INITIALIZED_NIC_GEM5_RESTORE_OK',
+            ['--interrupt-case', 'idle'])
+        for case in ('queued', 'delivered', 'writeback'):
+            state = args.out / ('interrupt-' + case + '-state')
+            run('interrupt-' + case, state, False, None, ['--interrupt-case', case],
+                error='Timing packets produced while globally drained')
+            assert not state.exists(), 'Unsafe checkpoint was published'
+            text = (args.out / ('interrupt-' + case) / 'gem5.log').read_text()
+            if case == 'writeback':
+                assert 'WRITEBACK_INTERRUPT_QUEUED' in text, text
+            else:
+                assert 'PIT_BARRIER_FIRED' in text, text
+                assert ('delivered=1' if case == 'delivered' else 'delivered=0') in text, text
     run('stalled-introduction', checkpoint, True, None, pause_peer=True)
     stalled_state = args.out / 'stalled-state'
     run('stalled-barrier', stalled_state, False, None, stall_barrier=True)

@@ -106,6 +106,10 @@ PacketQueue::trySatisfyFunctional(PacketPtr pkt)
 void
 PacketQueue::schedSendTiming(PacketPtr pkt, Tick when)
 {
+    // This covers queued requests, responses and snoops, including IOAPIC
+    // timing interrupts. Do not trust the latched DrainState after new work.
+    DrainManager::instance().notePacketActivity();
+
     DPRINTF(PacketQueue, "%s for %s address %x size %d when %lu ord: %i\n",
             __func__, pkt->cmdString(), pkt->getAddr(), pkt->getSize(), when,
             forceOrder);

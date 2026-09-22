@@ -16,9 +16,10 @@ parser.add_argument('--rate', type=int, default=1_000_000)
 parser.add_argument('--stall-peer', type=int)
 parser.add_argument('--start-before-save', action='store_true')
 parser.add_argument('--resume-frozen', action='store_true')
+parser.add_argument('--interrupt-case', choices=['idle', 'queued', 'delivered', 'writeback'])
 args = parser.parse_args()
 
-system = System(mem_mode='atomic', mem_ranges=[AddrRange(0x80000000, size='16MiB')])
+system = System(mem_mode='timing' if args.interrupt_case else 'atomic', mem_ranges=[AddrRange(0x80000000, size='16MiB')])
 system.voltage_domain = VoltageDomain()
 system.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=system.voltage_domain)
 system.bus = SystemXBar()
@@ -42,6 +43,17 @@ system.source = LoadGeneratorPcap(pcap_filename=args.pcap, deferred_start=True,
     exit_on_eof=True, eof_drain_delay='1us')
 system.source.interface = system.eth.int0
 root = Root(full_system=False, system=system)
+if args.interrupt_case:
+    system.pit = I8254(pio_addr=0x30000000)
+    system.ioapic = I82094AA(pio_addr=0x30001000,
+        int_latency='1ns' if args.interrupt_case == 'delivered' else '100us')
+    system.irqprobe = SimBricksCheckpointInterruptTester(pit=system.pit,
+        ioapic=system.ioapic, system=system,
+        inject_writeback=args.interrupt_case == 'writeback')
+    system.pit.pio = system.bus.mem_side_ports
+    system.ioapic.pio = system.bus.mem_side_ports
+    system.pit.int_pin = system.ioapic.inputs
+    system.ioapic.int_requestor = system.irqprobe.interrupt
 m5.instantiate(args.checkpoint if args.restore else None)
 event = m5.simulate(100_000_000)
 assert event.getCause() == 'INITIALIZED_NIC_PROBE_READY', event.getCause()
@@ -55,6 +67,8 @@ else:
         os.kill(args.stall_peer, signal.SIGSTOP)
     if args.start_before_save:
         system.source.startReplay()
+    if args.interrupt_case in ('queued', 'delivered'):
+        system.irqprobe.armPit()
     before = m5.curTick()
     m5.checkpoint(args.checkpoint)
     assert m5.curTick() > before
