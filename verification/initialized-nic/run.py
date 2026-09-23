@@ -17,7 +17,24 @@ def main():
     parser.add_argument('--nic', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--interrupts', action='store_true', help='Require X86 test objects')
+    parser.add_argument('--mem-size', default='16MiB', help='CPU-free fixture RAM size')
+    parser.add_argument('--save-restore-only', action='store_true',
+                        help='Only fresh save/restore; skip rejection/interrupt cases')
+    parser.add_argument('--test-startup-delay-seconds', type=int, default=0,
+                        help='TEST ONLY: inject pre-startup delay in the first restore')
+    parser.add_argument('--bootstrap-seconds', type=int,
+                        help='NIC BOOT budget (omit to test the plain flag/default 600)')
+    parser.add_argument('--timeout-seconds', type=int, default=60,
+                        help='Per-case harness timeout, not a protocol deadline')
     args = parser.parse_args()
+    if not 0 <= args.test_startup_delay_seconds <= 3600:
+        parser.error('--test-startup-delay-seconds must be 0..3600')
+    if args.bootstrap_seconds is not None and not 1 <= args.bootstrap_seconds <= 3600:
+        parser.error('--bootstrap-seconds must be 1..3600')
+    if args.timeout_seconds < 1:
+        parser.error('--timeout-seconds must be positive')
+    if args.save_restore_only and args.interrupts:
+        parser.error('--save-restore-only does not run --interrupts')
     args.out.mkdir(parents=True, exist_ok=False)
     pcap = args.out / 'input.pcap'
     # One valid minimum Ethernet/IPv4/UDP frame accepted by the deferred source.
@@ -38,7 +55,8 @@ def main():
             nic = subprocess.Popen([str(args.nic.resolve()),
                 f'listen:{pci.resolve()}:{shm.resolve()}:sync=true',
                 f'listen:{eth.resolve()}:{shm.resolve()}:sync=true', '0',
-                '029000000001', '/dev/null', '--initialized-checkpoint'],
+                '029000000001', '/dev/null', '--initialized-checkpoint' +
+                (f'={args.bootstrap_seconds}' if args.bootstrap_seconds is not None else '')],
                 stdout=log, stderr=subprocess.STDOUT)
             try:
                 end = time.monotonic() + 30
@@ -51,7 +69,7 @@ def main():
                 command = [str(args.gem5.resolve()), '-d', str(work / 'gem5'),
                     str(Path(__file__).with_name('probe.py')), '--pci', str(pci.resolve()),
                     '--eth', str(eth.resolve()), '--pcap', str(pcap.resolve()),
-                    '--checkpoint', str(state.resolve())]
+                    '--checkpoint', str(state.resolve()), '--mem-size', args.mem_size]
                 if restore:
                     command.append('--restore')
                 command.extend(extra)
@@ -59,7 +77,7 @@ def main():
                     command.extend(['--stall-peer', str(nic.pid)])
                 started = time.monotonic()
                 result = subprocess.run(command, stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, text=True, timeout=60)
+                    stderr=subprocess.STDOUT, text=True, timeout=args.timeout_seconds)
                 (work / 'gem5.log').write_text(result.stdout)
                 if expected:
                     assert result.returncode == 0 and expected in result.stdout, result.stdout
@@ -80,7 +98,13 @@ def main():
         print('PASS', name, flush=True)
 
     run('save', checkpoint, False, 'INITIALIZED_NIC_GEM5_SAVE_OK')
-    run('restore', checkpoint, True, 'INITIALIZED_NIC_GEM5_RESTORE_OK')
+    run('restore', checkpoint, True, 'INITIALIZED_NIC_GEM5_RESTORE_OK',
+        ['--test-startup-delay-seconds', str(args.test_startup_delay_seconds)])
+    if args.test_startup_delay_seconds:
+        assert (f'TEST_ONLY_BEFORE_STARTUP_DELAY seconds={args.test_startup_delay_seconds}'
+                in (args.out / 'restore' / 'gem5.log').read_text())
+    if args.save_restore_only:
+        return
     run('destination-exists', checkpoint, False, None)
     run('geometry-mismatch', checkpoint, True, None, ['--latency', '750ns'])
     run('pcap-settings', checkpoint, True, None, ['--rate', '2000000'],

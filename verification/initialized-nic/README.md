@@ -12,8 +12,11 @@ This is not support for initialized active rings or arbitrary live migration.
 
 - Set `initialized_checkpoint=True` on both `SimBricksPci` and its
   `SimBricksEthernet`; set PCI's `checkpoint_ethernet` to that Ethernet object.
-- Append `--initialized-checkpoint` to the model command line. Its initial wire
-  tick must be zero. Multiple models in one process are not supported.
+- Append `--initialized-checkpoint[=SECONDS]` to the model command line. The plain
+  flag retains opt-in behavior and uses a 600-second BOOT wait budget; an explicit
+  value must be decimal digits in 1..3600 (no sign, whitespace or suffix).
+  Its initial wire tick must be zero. Multiple models in one process are not
+  supported.
 - Keep `LoadGeneratorPcap(deferred_start=True)` never started before saving.
 - At the guest's post-EAL/pre-configuration exit, use ordinary `m5.checkpoint()`
   with a **new destination directory**. No parent orchestration is installed.
@@ -40,9 +43,17 @@ a per-process nonce verifies that both adapters connect to the same NIC.
 
 Barrier advancement is bounded by 1 billion ticks (1 ms), in 1-million-tick
 steps, and a 30-second wall deadline. Blocking adapter waits also check the wall
-clock. Bootstrap/state socket transfers and initial introductions are bounded;
-the single-NIC model uses a 30-second process alarm around the legacy blocking
-introduction helper. No frozen-tick handshake or drain bypass is used.
+clock. The NIC's BOOT wait is a **separate host-initialization budget**, default
+600 seconds: it starts after both READY sends and covers both BOOT frames and
+bodies with one absolute monotonic deadline, never a fresh budget per channel.
+This permits gem5's `m5.instantiate()` to deserialize RAM/device state before
+`Adapter.startup()` sends BOOT. Calibrate with `--initialized-checkpoint=SECONDS`
+when needed; a stalled or partial peer still expires. This does not extend a
+simulated freeze: READY/ACK framing, freeze/ACK/snapshot deadlines and the
+30-second legacy introduction process alarm are unchanged. No frozen-tick
+handshake or drain bypass is used. State format, identity, token, epoch and hash
+validation are unchanged. Build matching binaries and create a fresh checkpoint
+for integration validation; do not reuse an old checkpoint or relax compatibility.
 
 State is bounded, versioned, explicitly little-endian and pointer-free. It
 preserves registers, idle admin cursor/geometry, HMC mappings, RSS key/LUT,
@@ -68,8 +79,14 @@ SIMBRICKS_LIB_DIR=/tmp/new-simbricks-build/lib \
 ```
 
 The Runner check covers codecs, gates, DMA/timer rejection and absolute/wire event
-translation. The real i40e process test performs admin DMA, freezes both real
-transports, saves initialized state, exits the original peer, and restores fresh
+translation. It also exercises plain/default and explicit BOOT budget CLI parsing
+(including bounds, overflow and junk rejection), a 31-second BOOT delay with the
+plain flag, and short-budget expiry with stalled/partial PCI and Ethernet frames.
+A late PCI BOOT followed by missing/partial Ethernet BOOT must not restart the
+budget; a withheld PCI body must also expire. The existing post-ACK freeze
+request/response deadline tests remain enabled. The real i40e process test performs
+admin DMA, freezes both real transports, saves initialized state, exits the original
+peer, and restores fresh
 peers into all seven rings (64–4096). It checks retained admin/MAC/HMC/RSS/PTP,
 fresh RX/TX queue setup, actual RX payload DMA, delayed MSI-X, and rejection of pending DMA, armed timers,
 configured queues, traffic history, late future messages and invalid state.
@@ -92,6 +109,36 @@ no overwrite, frozen-source resume rejection, and stalled-peer initialization
 and barrier deadlines. It deliberately has **no CPU, Linux or DPDK**. The O3
 wakeup regression is separate. Full Linux post-EAL checkpoints and 500 ms sweeps
 remain integration validation, not claims established by these focused probes.
+
+### BOOT deserialization regression (CPU-free)
+
+The same fixture accepts `--mem-size` (default `16MiB`) for a fresh large-RAM
+save/restore without Linux. Use a newly built matching gem5/NIC pair, not B2 or
+an existing Linux checkpoint:
+
+```sh
+python3 verification/initialized-nic/run.py \
+  --gem5 /tmp/new-gem5-build/build/NIC_PROBE/gem5.opt \
+  --nic /tmp/new-i40e-build/simb_i40e_bm --out /tmp/new-large-ram-probe \
+  --save-restore-only --mem-size 16GiB --timeout-seconds 900 \
+  --test-startup-delay-seconds 31
+```
+
+`--test-startup-delay-seconds` is **test-only fault injection**, after
+`m5.instantiate()` returns and before the first `m5.simulate()` invokes adapter
+startup. It is applied only to the first restore by `run.py`, logs
+`TEST_ONLY_BEFORE_STARTUP_DELAY`, and defaults to zero: no production sleep or
+runtime workaround. The ordinary native test also delays BOOT beyond the old
+30-second limit without requiring a gem5 build. `--bootstrap-seconds N` passes
+`--initialized-checkpoint=N` to the NIC; omitting it tests the plain flag.
+`--timeout-seconds` controls only the test subprocess watchdog, not protocol
+budgets. `--save-restore-only` skips the corruption/barrier/interrupt suite and
+rejects combination with `--interrupts` rather than silently omitting it.
+
+Even with 16 GiB, this is a **CPU-free synthetic RAM/device save/restore**, not a
+Linux/EAL/DPDK validation, nor a reproduction of nonzero guest RAM contents or
+the exact host deserialization cost of the accepted Linux checkpoint. Full
+Linux validation must follow with fresh matching binaries and a new save.
 
 ### Drained timing-interrupt fence regression
 

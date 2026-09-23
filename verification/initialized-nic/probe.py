@@ -2,6 +2,7 @@
 import argparse
 import os
 import signal
+import time
 import m5
 from m5.objects import *
 
@@ -11,6 +12,9 @@ parser.add_argument('--eth', required=True)
 parser.add_argument('--pcap', required=True)
 parser.add_argument('--checkpoint', required=True)
 parser.add_argument('--restore', action='store_true')
+parser.add_argument('--mem-size', default='16MiB')
+parser.add_argument('--test-startup-delay-seconds', type=int, default=0,
+                    help='TEST ONLY: delay after instantiate, before Adapter.startup')
 parser.add_argument('--latency', default='500ns')
 parser.add_argument('--rate', type=int, default=1_000_000)
 parser.add_argument('--stall-peer', type=int)
@@ -18,8 +22,10 @@ parser.add_argument('--start-before-save', action='store_true')
 parser.add_argument('--resume-frozen', action='store_true')
 parser.add_argument('--interrupt-case', choices=['idle', 'queued', 'delivered', 'writeback'])
 args = parser.parse_args()
+if not 0 <= args.test_startup_delay_seconds <= 3600:
+    parser.error('--test-startup-delay-seconds must be 0..3600')
 
-system = System(mem_mode='timing' if args.interrupt_case else 'atomic', mem_ranges=[AddrRange(0x80000000, size='16MiB')])
+system = System(mem_mode='timing' if args.interrupt_case else 'atomic', mem_ranges=[AddrRange(0x80000000, size=args.mem_size)])
 system.voltage_domain = VoltageDomain()
 system.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=system.voltage_domain)
 system.bus = SystemXBar()
@@ -55,6 +61,11 @@ if args.interrupt_case:
     system.pit.int_pin = system.ioapic.inputs
     system.ioapic.int_requestor = system.irqprobe.interrupt
 m5.instantiate(args.checkpoint if args.restore else None)
+if args.test_startup_delay_seconds:
+    # Fault injection only: keep the NIC waiting for BOOT before startup runs.
+    # This is not a runtime workaround or simulated-time advancement.
+    print(f'TEST_ONLY_BEFORE_STARTUP_DELAY seconds={args.test_startup_delay_seconds}', flush=True)
+    time.sleep(args.test_startup_delay_seconds)
 event = m5.simulate(100_000_000)
 assert event.getCause() == 'INITIALIZED_NIC_PROBE_READY', event.getCause()
 if args.restore:
