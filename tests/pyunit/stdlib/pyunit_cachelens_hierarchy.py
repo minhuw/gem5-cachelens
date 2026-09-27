@@ -25,7 +25,6 @@ if CoherenceProtocol.CHI not in get_supported_protocols():
 
 from gem5.isas import ISA
 from gem5.components.processors.cpu_types import CPUTypes
-from gem5.components.processors.simple_processor import SimpleProcessor
 from gem5.prebuilt import cachelens
 from gem5.prebuilt.cachelens.cache_hierarchy import CacheLensCHIHierarchy
 from gem5.prebuilt.cachelens.topology import SimpleCrossbar
@@ -91,6 +90,7 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
     def test_cache_stashing_controller_wiring(self) -> None:
         if ISA.ARM not in get_supported_isas():
             self.skipTest("Requires ARM cores for the controller graph")
+        from gem5.components.processors.simple_processor import SimpleProcessor
         for mode in ("off", "hnf"):
             for inclusion in ("noninclusive", "inclusive"):
                 with self.subTest(mode=mode, inclusion=inclusion):
@@ -135,9 +135,7 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
                         self.assertEqual(-1, int(hnf.cache.ddio_way_part))
                         self.assertEqual(8, int(hnf.cache.assoc))
                     for requestor in hierarchy.dma_requestors:
-                        self.assertEqual(
-                            mode == "hnf", bool(requestor.emit_rx_write_stash)
-                        )
+                        self.assertFalse(hasattr(requestor, "emit_rx_write_stash"))
 
     def test_hnf_count_validation(self) -> None:
         CacheLensCHIHierarchy(num_hnfs=1)

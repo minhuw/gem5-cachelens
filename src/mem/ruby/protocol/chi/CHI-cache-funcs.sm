@@ -417,12 +417,20 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.delayNextAction := intToTick(0);
 
   tbe.is_stale := false;
-  tbe.nic_merge_read_profiled := false;
   tbe.is_write_stash := false;
 }
 
 bool acceptedWriteStash(TBE tbe) {
   return is_HN && tbe.is_write_stash && accept_write_stash;
+}
+
+bool sparseWriteThrough(TBE tbe) {
+  // Memory writes describe a contiguous extent, not sparse byte enables.
+  // Non-retaining sparse requests must merge before writing a full line.
+  return is_HN && tbe.reqType == CHIRequestType:WriteUniquePtl &&
+      !acceptedWriteStash(tbe) &&
+      !(tbe.is_ddio_write && cache.getDDIOWayPart() > 0) &&
+      !tbe.wuAccessMask.isEmpty() && tbe.wuAccessMask.count() < tbe.accSize;
 }
 
 TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes" {
@@ -484,54 +492,6 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
        tbe.reqType == CHIRequestType:ReadNotSharedDirty ||
        tbe.reqType == CHIRequestType:ReadUnique ||
        tbe.reqType == CHIRequestType:MakeReadUnique);
-  // Optional source/category profiling remains independent of eligibility.
-  tbe.is_ddio_payload := is_HN && in_msg.isSeqReqValid &&
-      cache.isNicRxPayloadWriteReq(in_msg.seqReq);
-  tbe.is_ddio_header := is_HN && in_msg.isSeqReqValid &&
-      cache.isNicRxHeaderWriteReq(in_msg.seqReq);
-  tbe.is_tx_payload := is_HN && in_msg.isSeqReqValid &&
-      cache.isNicTxPayloadReadReq(in_msg.seqReq);
-  tbe.is_pvrdma := is_HN && in_msg.isSeqReqValid &&
-      cache.isNicPvrdmaReq(in_msg.seqReq);
-  tbe.is_nic_desc := is_HN && in_msg.isSeqReqValid &&
-      cache.isNicDescDmaReq(in_msg.seqReq);
-  tbe.is_nic_read := is_HN && in_msg.isSeqReqValid &&
-      cache.isNicDdioReadReq(in_msg.seqReq);
-  // Profile NIC DMA at request acceptance, before protocol actions can change
-  // tag state. Source comes only from Request flags. Sparse TLM writes use the
-  // exact access-mask population; contiguous requests use the original gem5
-  // Request size preserved in seqReq: RNI forwarding expands CHI accSize to
-  // a block without replacing seqReq. Rejected requests never allocate a TBE;
-  // downstream retries reuse this TBE and do not repeat profiling.
-  if (is_HN && in_msg.isSeqReqValid &&
-      (cache.isNicDdioWriteReq(in_msg.seqReq) || tbe.is_nic_read)) {
-    int nic_dma_bytes := cache.getNicDmaRequestSize(in_msg.seqReq);
-    if (!in_msg.accessMask.isEmpty()) {
-      nic_dma_bytes := in_msg.accessMask.count();
-    }
-    assert((nic_dma_bytes > 0) && (nic_dma_bytes <= blockSize));
-
-    bool write_partial := false;
-    if (cache.isNicDdioWriteReq(in_msg.seqReq)) {
-      // NIC device writes must state their extent explicitly. In particular,
-      // a classified WriteUniqueZero is malformed and must not be projected
-      // into either write class.
-      assert(tbe.is_nic_read == false);
-      assert((tbe.reqType == CHIRequestType:WriteUniquePtl) ||
-             (tbe.reqType == CHIRequestType:WriteUniqueFull));
-      write_partial := tbe.reqType == CHIRequestType:WriteUniquePtl;
-      if (write_partial == false) {
-        assert(nic_dma_bytes == blockSize);
-      }
-    } else {
-      assert(tbe.is_nic_read);
-      assert((tbe.reqType != CHIRequestType:WriteUniquePtl) &&
-             (tbe.reqType != CHIRequestType:WriteUniqueFull) &&
-             (tbe.reqType != CHIRequestType:WriteUniqueZero));
-    }
-    cache.profileNicDma(
-        addr, in_msg.seqReq, write_partial, nic_dma_bytes);
-  }
   tbe.ddio_access_profiled := false;
   tbe.stale_wb_path := false;
 
@@ -1303,21 +1263,6 @@ bool isWriteReqType(CHIRequestType type) {
     return true;
   }
   return false;
-}
-
-// DDIO source classes for the per-way, per-source accounting.
-int ddioSrcClass(TBE tbe) {
-  if (tbe.is_ddio_payload) {
-    return 0;
-  } else if (tbe.is_tx_payload) {
-    return 1;
-  } else if (tbe.is_nic_desc) {
-    return 2;
-  } else if (tbe.is_ddio_header) {
-    return 4;
-  } else {
-    return 3;
-  }
 }
 
 bool isStashReqType(CHIRequestType type) {

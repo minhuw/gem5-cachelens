@@ -1,3 +1,9 @@
+> **Historical evidence only; semantic API tests retired.** The metadata/CSV
+> runner has been removed. The remaining `dma-test.py` accepts a plain DMA
+> peer socket and checks fragmentation, direction and data via DmaChecker;
+> it no longer requests or validates semantic metadata or adapter statistics.
+> Prior results below do not verify the cleaned wire protocol.
+
 # Accuracy transport verification — completed (not workload accuracy)
 
 All paths below are relative to `gem5/work/sources/simbricks-accuracy`.

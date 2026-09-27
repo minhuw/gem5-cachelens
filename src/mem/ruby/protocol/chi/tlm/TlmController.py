@@ -43,12 +43,3 @@ class TlmController(CHIGenericController):
     cxx_class = "gem5::tlm::chi::CacheController"
 
     ddio_eligible = Param.Bool(False, "Explicit DDIO requestor eligibility")
-
-    test_nic_rx_payload_write = Param.Bool(
-        False,
-        "Attach a synthetic NIC RX payload Request (legacy test option)",
-    )
-    test_nic_dma_category = Param.String(
-        "",
-        "Synthetic NIC DMA category for CHI-TLM tests",
-    )

@@ -62,8 +62,7 @@ class AccuracyBoard(CacheLensX86Board):
             host=self.pc.pci_host, pci_bus=0, pci_dev=2, pci_func=0,
             InterruptLine=17, InterruptPin=1,
             uxsocket_path=self._accuracy_pci_socket, listen=False, sync=True,
-            link_latency="500ns", sync_tx_interval="500ns", semantic_dma=True,
-            semantic_dma_trace="semantic-dma.csv",
+            link_latency="500ns", sync_tx_interval="500ns",
         )
         nic.pio = self.iobus.mem_side_ports
         self.nics = [nic]

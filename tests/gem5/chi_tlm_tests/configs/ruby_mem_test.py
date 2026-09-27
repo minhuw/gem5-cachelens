@@ -68,18 +68,14 @@ class TLM_RNF(CHI_Node):
         self,
         ruby_system,
         parent,
-        classify_ddio=False,
         ddio_eligible=False,
-        nic_dma_category="",
     ):
         super().__init__(ruby_system)
 
         self._cntrl = TlmController(
             version=Versions.getVersion(CHI_Cache_Controller),
             ruby_system=ruby_system,
-            test_nic_rx_payload_write=classify_ddio,
             ddio_eligible=ddio_eligible,
-            test_nic_dma_category=nic_dma_category,
         )
 
         parent.chi_controller = self._cntrl
@@ -99,21 +95,11 @@ def rnf_gen(options, ruby_system, cpus):
     eligible = getattr(suite, "ddio_eligible", [False] * len(system.cpu))
     if len(eligible) != len(system.cpu):
         raise ValueError("ddio_eligible must match --num-cpus")
-    classify_ddio = getattr(suite, "classify_ddio", False)
-    default_category = getattr(suite, "nic_dma_category", "")
-    categories = getattr(suite, "nic_dma_categories", None)
-    if categories is not None and len(categories) != len(system.cpu):
-        raise ValueError("nic_dma_categories must match --num-cpus")
     return [
         TLM_RNF(
             ruby_system,
             cpu,
-            classify_ddio=classify_ddio,
             ddio_eligible=eligible[index],
-            nic_dma_category=(
-                categories[index] if categories is not None
-                else default_category
-            ),
         )
         for index, cpu in enumerate(system.cpu)
     ]
@@ -260,6 +246,10 @@ if hasattr(suite, "nic_read_no_allocate"):
 if hasattr(suite, "hnf_enable_dmt"):
     for hnf in system.ruby.hnf:
         hnf._cntrl.enable_DMT = suite.hnf_enable_dmt
+
+if hasattr(suite, "accept_write_stash"):
+    for hnf in system.ruby.hnf:
+        hnf._cntrl.accept_write_stash = suite.accept_write_stash
 
 # Create a top-level voltage domain and clock domain
 system.voltage_domain = VoltageDomain(voltage=args.sys_voltage)

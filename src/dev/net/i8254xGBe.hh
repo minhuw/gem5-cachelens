@@ -183,45 +183,44 @@ class IGbE : public EtherDevice
     Tick rxWriteDelay, txReadDelay;
 
     void
-    dmaWriteCategorized(Addr addr, int size, Event *event, uint8_t *data,
-                        Tick delay, Request::Flags category)
+    descWrite(Addr addr, int size, Event *event, uint8_t *data, Tick delay=0)
     {
-        assert(Request::isValidNicDmaWriteFlags(category));
-        dmaPort.dmaAction(MemCmd::WriteReq, addr, size, event, data, delay,
-                          category);
+        etherDeviceStats.descDmaWrites++;
+        etherDeviceStats.descDmaWrBytes += size;
+        dmaWrite(addr, size, event, data, delay);
     }
 
     void
-    dmaReadCategorized(Addr addr, int size, Event *event, uint8_t *data,
-                       Tick delay, Request::Flags category)
+    descRead(Addr addr, int size, Event *event, uint8_t *data, Tick delay=0)
     {
-        assert(Request::isValidNicDmaReadFlags(category));
-        dmaPort.dmaAction(MemCmd::ReadReq, addr, size, event, data, delay,
-                          category);
+        etherDeviceStats.descDmaReads++;
+        etherDeviceStats.descDmaRdBytes += size;
+        dmaRead(addr, size, event, data, delay);
     }
 
     void
     rxPayloadWrite(Addr addr, int size, Event *event, uint8_t *data,
                    Tick delay=0)
     {
-        dmaWriteCategorized(addr, size, event, data, delay,
-                            Request::NIC_RX_PAYLOAD_WRITE);
+        igbeStats.payloadDmaWrites++;
+        igbeStats.payloadDmaWrBytes += size;
+        dmaWrite(addr, size, event, data, delay);
     }
 
     void
     rxHeaderWrite(Addr addr, int size, Event *event, uint8_t *data,
                   Tick delay=0)
     {
-        dmaWriteCategorized(addr, size, event, data, delay,
-                            Request::NIC_RX_HEADER_WRITE);
+        rxPayloadWrite(addr, size, event, data, delay);
     }
 
     void
     txPayloadRead(Addr addr, int size, Event *event, uint8_t *data,
                   Tick delay=0)
     {
-        dmaReadCategorized(addr, size, event, data, delay,
-                           Request::NIC_TX_PAYLOAD_READ);
+        igbeStats.payloadDmaReads++;
+        igbeStats.payloadDmaRdBytes += size;
+        dmaRead(addr, size, event, data, delay);
     }
 
     // Event and function to deal with RDTR timer expiring
@@ -320,10 +319,6 @@ class IGbE : public EtherDevice
         virtual void enableSm() = 0;
         virtual void actionAfterWb() {}
         virtual void fetchAfterWb() = 0;
-
-        /** NIC DMA categories for descriptor fetches and writebacks. */
-        virtual Request::Flags descFetchCategory() const { return 0; }
-        virtual Request::Flags descWritebackCategory() const { return 0; }
 
         /** Descriptor lifecycle hooks, specialized by RX and TX caches. */
         virtual void noteFetched(int old_cp, int count) {}
@@ -482,14 +477,6 @@ class IGbE : public EtherDevice
       public:
         RxDescCache(IGbE *i, std::string n, int s);
 
-        Request::Flags descFetchCategory() const override
-        {
-            return Request::NIC_RX_DESC_READ;
-        }
-        Request::Flags descWritebackCategory() const override
-        {
-            return Request::NIC_RX_DESC_WRITEBACK;
-        }
         void noteFetched(int old_cp, int count) override;
         void noteWbComplete(int old_head, int count) override;
 
@@ -535,14 +522,6 @@ class IGbE : public EtherDevice
         long descHead() const override { return igbe->regs.tdh(); }
         long descTail() const override { return igbe->regs.tdt(); }
         long descLen() const override { return igbe->regs.tdlen() >> 4; }
-        Request::Flags descFetchCategory() const override
-        {
-            return Request::NIC_TX_DESC_READ;
-        }
-        Request::Flags descWritebackCategory() const override
-        {
-            return Request::NIC_TX_DESC_WRITEBACK;
-        }
         void updateHead(long h) override { igbe->regs.tdh(h); }
         void noteFetched(int old_cp, int count) override;
         void noteWbComplete(int old_head, int count) override;
@@ -677,6 +656,10 @@ class IGbE : public EtherDevice
         IGbEStats(IGbE &parent)
             : statistics::Group(&parent, "rxq"),
               igbe(parent),
+              ADD_STAT(payloadDmaReads, statistics::units::Count::get(), "Payload DMA read operations issued"),
+              ADD_STAT(payloadDmaWrites, statistics::units::Count::get(), "Payload DMA write operations issued"),
+              ADD_STAT(payloadDmaRdBytes, statistics::units::Byte::get(), "Payload DMA read bytes issued"),
+              ADD_STAT(payloadDmaWrBytes, statistics::units::Byte::get(), "Payload DMA write bytes issued"),
               ADD_STAT(rxQueue, statistics::units::Count::get(),
                        "Time-weighted RX_WAITING queue length"),
               ADD_STAT(rxReplenishQueue, statistics::units::Count::get(),
@@ -726,6 +709,8 @@ class IGbE : public EtherDevice
 
         IGbE &igbe;
 
+        statistics::Scalar payloadDmaReads, payloadDmaWrites;
+        statistics::Scalar payloadDmaRdBytes, payloadDmaWrBytes;
         statistics::Distribution rxQueue;
         statistics::Distribution rxReplenishQueue;
         statistics::Distribution rxInFlightQueue;

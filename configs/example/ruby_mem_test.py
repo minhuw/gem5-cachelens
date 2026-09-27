@@ -66,12 +66,6 @@ parser.add_argument(
 )
 parser.add_argument("--num-dmas", type=int, default=0, help="# of dma testers")
 parser.add_argument(
-    "--num-nic-dmas",
-    type=int,
-    default=0,
-    help="# of DMA testers whose requests carry NIC DMA categories",
-)
-parser.add_argument(
     "--tester-size",
     type=int,
     default=65536,
@@ -133,8 +127,6 @@ if args.num_cpus > block_size:
 #
 # Currently ruby does not support atomic or uncacheable accesses
 #
-if args.num_nic_dmas < 0 or args.num_nic_dmas > args.num_dmas:
-    parser.error("--num-nic-dmas must be between zero and --num-dmas")
 
 cpus = [
     MemTest(
@@ -169,7 +161,6 @@ if args.num_dmas > 0:
             percent_uncacheable=0,
             progress_interval=args.progress,
             suppress_func_errors=not args.suppress_func_errors,
-            nic_dma=i < args.num_nic_dmas,
         )
         for i in range(args.num_dmas)
     ]

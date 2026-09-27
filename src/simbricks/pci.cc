@@ -53,22 +53,10 @@ Device::Device(const Params &p)
     adapter(*this, *this, p.sync),
     overridePort(name() + ".pio", *this),
     sync(p.sync),
-    writesPosted(true),
-    semanticStats(this)
+    writesPosted(true)
 {
     DPRINTF(SimBricksPci, "simbricks-pci: device constructed\n");
 
-    fatal_if(!p.semantic_dma && !p.semantic_dma_trace.empty(),
-             "semantic_dma_trace requires semantic_dma");
-    if (!p.semantic_dma_trace.empty()) {
-        semanticTrace.open(simout.resolve(p.semantic_dma_trace));
-        fatal_if(!semanticTrace, "Cannot open semantic DMA trace");
-        registerExitCallback([this]() {
-            semanticTrace.flush();
-            fatal_if(!semanticTrace, "Failed flushing semantic DMA trace");
-        });
-        semanticTrace << "op_id,timestamp_ps,request_id,kind,queue_id,port_id,packet_id,packet_offset,packet_length,pci_address,physical_address,length,write\n";
-    }
     fatal_if(p.initialized_checkpoint != bool(p.checkpoint_ethernet),
              "Initialized NIC checkpoint requires its explicit Ethernet peer");
     adapter.cfgCheckpoint(p.initialized_checkpoint);
@@ -79,54 +67,6 @@ Device::Device(const Params &p)
         adapter.connect(p.uxsocket_path);
 }
 
-Device::SemanticStats::SemanticStats(statistics::Group *parent)
-    : statistics::Group(parent, "semanticDma"),
-      ADD_STAT(descReadOps, statistics::units::Count::get(), "RX descriptor reads per queue"),
-      ADD_STAT(descReadBytes, statistics::units::Byte::get(), "RX descriptor bytes per queue"),
-      ADD_STAT(payloadWriteOps, statistics::units::Count::get(), "RX payload writes per queue"),
-      ADD_STAT(payloadWriteBytes, statistics::units::Byte::get(), "RX payload bytes per queue"),
-      ADD_STAT(untaggedReadBytes, statistics::units::Byte::get(), "Untagged DMA read bytes"),
-      ADD_STAT(untaggedWriteBytes, statistics::units::Byte::get(), "Untagged DMA write bytes"),
-      ADD_STAT(traceDropped, statistics::units::Count::get(), "DMA rows beyond CSV bound")
-{
-    for (auto *v : {&descReadOps, &descReadBytes, &payloadWriteOps, &payloadWriteBytes})
-        v->init(SIMBRICKS_PCIE_DMA_QUEUES).flags(statistics::total | statistics::nozero);
-}
-
-Request::Flags
-Device::semanticFlags(const volatile uint8_t *pad, bool write,
-                      uint64_t rid, Addr addr, uint64_t len)
-{
-    if (!params().semantic_dma) return 0;
-    uint8_t bytes[30];
-    for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = pad[i];
-    SimbricksPcieDmaMetadata m;
-    panic_if(!SimbricksPcieDmaDecode(bytes, sizeof(bytes), write, len, &m),
-             "Invalid PCI semantic DMA metadata");
-    Request::Flags flags = 0;
-    if (m.kind == SIMBRICKS_PCIE_DMA_RX_DESC) {
-        flags = Request::NIC_RX_DESC_READ;
-        ++semanticStats.descReadOps[m.queue];
-        semanticStats.descReadBytes[m.queue] += len;
-    } else if (m.kind == SIMBRICKS_PCIE_DMA_RX_PAYLOAD) {
-        flags = Request::NIC_RX_PAYLOAD_WRITE;
-        ++semanticStats.payloadWriteOps[m.queue];
-        semanticStats.payloadWriteBytes[m.queue] += len;
-    } else if (write) semanticStats.untaggedWriteBytes += len;
-    else semanticStats.untaggedReadBytes += len;
-    const uint64_t id = ++semanticOpId;
-    if (semanticTrace.is_open()) {
-        if (id <= params().semantic_dma_trace_limit) {
-            semanticTrace << id << ',' << curTick() / sim_clock::as_int::ps << ','
-                << rid << ',' << unsigned(m.kind) << ',' << m.queue << ','
-                << m.port << ',' << m.packet << ',' << m.offset << ',' << m.total
-                << ',' << addr << ',' << pciToDma(addr) << ',' << len << ',' << write << '\n';
-            panic_if(!semanticTrace, "Failed writing semantic DMA trace");
-        } else ++semanticStats.traceDropped;
-    }
-    return flags;
-}
-
 Device::~Device()
 {
 }
@@ -134,13 +74,9 @@ Device::~Device()
 size_t
 Device::introOutPrepare(void *data, size_t maxlen)
 {
-    size_t introlen = sizeof(struct SimbricksProtoPcieHostIntro) +
-        (params().semantic_dma ? SIMBRICKS_PCIE_SEMANTIC_INTRO_SIZE : 0);
+    size_t introlen = sizeof(struct SimbricksProtoPcieHostIntro);
     assert(introlen <= maxlen);
     memset(data, 0, introlen);
-    if (params().semantic_dma)
-        SimbricksPcieSemanticIntro(static_cast<uint8_t *>(data) +
-                                  sizeof(SimbricksProtoPcieHostIntro));
     return introlen;
 }
 
@@ -149,9 +85,7 @@ Device::introInReceived(const void *data, size_t len)
 {
     struct SimbricksProtoPcieDevIntro *di =
         (struct SimbricksProtoPcieDevIntro *) data;
-    panic_if(!SimbricksPcieSemanticIntroValid(data, len, sizeof(*di),
-                                            params().semantic_dma),
-             "PCI semantic DMA handshake mismatch");
+    panic_if(len != sizeof(*di), "Invalid PCI introduction size");
 
     panic_if(!validIntro(*di), "Invalid SimBricks PCI introduction");
     MSICAP_BASE = MSIXCAP_BASE = 0;
@@ -533,8 +467,7 @@ Device::handleInMsg(volatile union SimbricksProtoPcieD2H *msg)
                      !validDma(pciToDma(addr), len, adapter.outPayload()),
                      "Invalid SimBricks DMA range/length");
             dc = new DMACompl(this, rid, len, DMACompl::READ, name());
-            dmaPort.dmaAction(MemCmd::ReadReq, pciToDma(addr), len, dc, dc->buf, 0,
-                    semanticFlags(read->pad, false, rid, addr, len));
+            dmaPort.dmaAction(MemCmd::ReadReq, pciToDma(addr), len, dc, dc->buf, 0);
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_WRITE:
@@ -552,8 +485,7 @@ Device::handleInMsg(volatile union SimbricksProtoPcieD2H *msg)
                      "Invalid SimBricks DMA range/length");
             dc = new DMACompl(this, rid, len, DMACompl::WRITE, name());
             memcpy(dc->buf, (void *) write->data, len);
-            dmaPort.dmaAction(MemCmd::WriteReq, pciToDma(addr), len, dc, dc->buf, 0,
-                     semanticFlags(write->pad, true, rid, addr, len));
+            dmaPort.dmaAction(MemCmd::WriteReq, pciToDma(addr), len, dc, dc->buf, 0);
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_INTERRUPT:
@@ -846,7 +778,6 @@ Device::serialize(CheckpointOut &cp) const
     fatal_if(::close(fd) != 0, "Cannot close NIC state sidecar");
     SERIALIZE_SCALAR(nextRequest);
     SERIALIZE_SCALAR(writesPosted);
-    SERIALIZE_SCALAR(semanticOpId);
     PciDevice::serialize(cp);
 }
 
@@ -891,7 +822,6 @@ Device::unserialize(CheckpointIn &cp)
     paramIn(cp, "writesPosted", posted);
     fatal_if(posted != writesPosted, "NIC checkpoint posted-write mode mismatch");
     UNSERIALIZE_SCALAR(nextRequest);
-    UNSERIALIZE_SCALAR(semanticOpId);
     fatal_if(!nextRequest, "NIC checkpoint request ID invalid");
     PciDevice::unserialize(cp);
     checkInitializedCheckpoint();

@@ -47,7 +47,7 @@ class DDIOEligibilityTest(unittest.TestCase):
         for func in ("allocateRequestTBE", "prepareRequest", "prepareRequestRetry"):
             body = re.split(rf"\b{func}\(", funcs, maxsplit=1)[1].split("\n}", 1)[0]
             self.assertIn("ddioEligible :=", body)
-        policy = funcs.split("tbe.is_ddio_write :=", 1)[1].split("// Optional", 1)[0]
+        policy = funcs.split("tbe.is_ddio_write :=", 1)[1].split("tbe.ddio_access_profiled", 1)[0]
         self.assertNotIn("isNic", policy)
         self.assertNotIn("seqReq", policy)
         for opcode in ("WriteUniqueFull", "WriteUniquePtl", "ReadOnce", "ReadShared", "ReadUnique"):
@@ -56,10 +56,9 @@ class DDIOEligibilityTest(unittest.TestCase):
         fill = actions.split("action(CheckCacheFill", 1)[1].split("\naction(", 1)[0]
         self.assertIn("tbe.is_ddio_read && is_invalid(cache_entry)", fill)
         merge = actions.split("action(Prepare_DDIOWrite", 1)[1].split("\naction(", 1)[0]
-        self.assertIn("cache.isNicDdioWriteReq(tbe.seqReq)", merge)
-        profiling = funcs.split("// Profile NIC DMA", 1)[1].split("tbe.ddio_access_profiled", 1)[0]
-        self.assertNotIn("tbe.is_ddio_write", profiling)
-
+        self.assertNotIn("isNic", merge)
+        self.assertIn("cache.ddioWriteNeedsRead", merge)
+        self.assertNotIn("profileNic", funcs)
 
 if __name__ == "__main__":
     unittest.main()

@@ -72,9 +72,6 @@ class SimBricksPci(PciDevice):
         "initializedCheckpointFrozen",
     )]
 
-    semantic_dma = Param.Bool(False, "Require accuracy DMA v1 on both peers")
-    semantic_dma_trace = Param.String("", "Optional DMA CSV filename")
-    semantic_dma_trace_limit = Param.Unsigned(2000000, "Maximum DMA CSV rows")
 
     listen = Param.Bool(False, "Open listening instead of connecting")
     uxsocket_path = Param.String("unix socket path")

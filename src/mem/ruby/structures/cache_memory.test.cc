@@ -28,12 +28,9 @@
 
 #include <gtest/gtest.h>
 
-#include <array>
-#include <fstream>
-#include <iterator>
 #include <memory>
 
-#include "base/gtest/serialization_fixture.hh"
+#include "sim/cur_tick.hh"
 #include "mem/cache/replacement_policies/lru_rp.hh"
 #include "mem/ruby/structures/CacheMemory.hh"
 #include "mem/ruby/system/RubyPort.hh"
@@ -58,7 +55,7 @@ class TestEntry : public AbstractCacheEntry
     void print(std::ostream &out) const override { out << m_Address; }
 };
 
-class CacheMemoryTest : public SerializationFixture
+class CacheMemoryTest : public ::testing::Test
 {
   protected:
     static constexpr Addr SameSetStride = 256;
@@ -68,28 +65,27 @@ class CacheMemoryTest : public SerializationFixture
 
     void SetUp() override
     {
-        SerializationFixture::SetUp();
         Gem5Internal::_curTickPtr = &tick;
     }
     void TearDown() override
     {
         cache.reset();
         Gem5Internal::_curTickPtr = nullptr;
-        SerializationFixture::TearDown();
     }
 
     void
     makeCache(int ddioWays, bool addrHash = false)
     {
-        LRURPParams lruParams;
+        LRURPParams lruParams{};
         lruParams.eventq_index = 0;
         auto *lru = new replacement_policy::LRU(lruParams);
-        RubyCacheParams params;
+        RubyCacheParams params{};
         params.name = "cache_memory_test";
         params.eventq_index = 0;
         params.size = 1024;
         params.assoc = 4;
         params.block_size = 64;
+        params.dataArrayBanks = params.tagArrayBanks = params.atomicALUs = 1;
         params.start_index_bit = 6;
         params.replacement_policy = lru;
         params.ddio_way_part = ddioWays;
@@ -115,29 +111,9 @@ class CacheMemoryTest : public SerializationFixture
     }
     void setNextWay(int set, int way) { cache->m_next_invalid_way[set] = way; }
     size_t tagCount(Addr address) const { return cache->m_tag_index.count(address); }
-    Counter payloadAllocAt(int way) const
-    {
-        return cache->cacheMemoryStats.rxPayloadAllocWays[way].value();
-    }
     Counter ddioAllocAt(int way) const
     {
         return cache->cacheMemoryStats.ddioAllocWays[way].value();
-    }
-    Counter payloadRequests() const
-    {
-        return cache->cacheMemoryStats.rxPayloadRequests.value();
-    }
-    Counter headerRequests() const
-    {
-        return cache->cacheMemoryStats.rxHeaderRequests.value();
-    }
-    Counter payloadMisses() const
-    {
-        return cache->cacheMemoryStats.rxPayloadMisses.value();
-    }
-    Counter headerMisses() const
-    {
-        return cache->cacheMemoryStats.rxHeaderMisses.value();
     }
     Counter dmaRoutingProxies() const
     {
@@ -146,118 +122,6 @@ class CacheMemoryTest : public SerializationFixture
     Counter dmaRoutingRecycles() const
     {
         return cache->cacheMemoryStats.dmaRoutingTransientRecycles.value();
-    }
-    Counter rdmaRxRequests() const
-    {
-        return cache->cacheMemoryStats.rdmaRxPayloadRequests.value();
-    }
-    Counter rdmaRxHits() const
-    {
-        return cache->cacheMemoryStats.rdmaRxPayloadHits.value();
-    }
-    Counter rdmaTxRequests() const
-    {
-        return cache->cacheMemoryStats.rdmaTxPayloadRequests.value();
-    }
-    Counter rdmaCpuAccessAt(int way) const
-    {
-        return cache->cacheMemoryStats.rdmaRxPayloadCpuAccessWays[way].value();
-    }
-    Counter rdmaCpuFillAt(int way) const
-    {
-        return cache->cacheMemoryStats.rdmaRxPayloadCpuFillWays[way].value();
-    }
-    Counter rdmaCpuUnique() const
-    {
-        return cache->cacheMemoryStats.rdmaRxPayloadCpuUniqueLines.value();
-    }
-    struct NicDmaStats
-    {
-        statistics::Counter readRequests;
-        statistics::Counter readHits;
-        statistics::Counter readMisses;
-        statistics::Counter writeRequests;
-        statistics::Counter writeHits;
-        statistics::Counter writeMisses;
-        statistics::Counter descReadRequests;
-        statistics::Counter descReadHits;
-        statistics::Counter descReadMisses;
-        statistics::Counter descWriteRequests;
-        statistics::Counter descWriteHits;
-        statistics::Counter descWriteMisses;
-        statistics::Counter txPayloadRequests;
-        statistics::Counter txPayloadHits;
-        statistics::Counter rxHeaderHits;
-    };
-    NicDmaStats nicDmaStats() const
-    {
-        const auto &stats = cache->cacheMemoryStats;
-        return {
-            stats.nicDmaReadRequests.value(),
-            stats.nicDmaReadHits.value(),
-            stats.nicDmaReadMisses.value(),
-            stats.nicDmaWriteRequests.value(),
-            stats.nicDmaWriteHits.value(),
-            stats.nicDmaWriteMisses.value(),
-            stats.nicDescReadRequests.value(),
-            stats.nicDescReadHits.value(),
-            stats.nicDescReadMisses.value(),
-            stats.nicDescWriteRequests.value(),
-            stats.nicDescWriteHits.value(),
-            stats.nicDescWriteMisses.value(),
-            stats.txPayloadRequests.value(),
-            stats.txPayloadHits.value(),
-            stats.rxHeaderHits.value(),
-        };
-    }
-    static constexpr int NicDmaStatCount =
-        static_cast<int>(CacheMemory::NicDmaSource::NumSources) *
-        static_cast<int>(CacheMemory::NicDmaOperation::NumOperations);
-    struct GenericNicDmaStats
-    {
-        std::array<statistics::Counter, NicDmaStatCount> requests;
-        std::array<statistics::Counter, NicDmaStatCount> hits;
-        std::array<statistics::Counter, NicDmaStatCount> misses;
-        std::array<statistics::Counter, NicDmaStatCount> requestedBytes;
-        std::array<statistics::Counter, NicDmaStatCount> mergeReads;
-        std::array<statistics::Counter, NicDmaStatCount> mergeReadBytes;
-        statistics::Counter rxPayloadRequests;
-        statistics::Counter rxPayloadHits;
-        statistics::Counter rxPayloadMisses;
-        statistics::Counter rxHeaderRequests;
-        statistics::Counter rxHeaderHits;
-        statistics::Counter rxHeaderMisses;
-        statistics::Counter txPayloadRequests;
-        statistics::Counter txPayloadHits;
-        statistics::Counter txPayloadMisses;
-        NicDmaStats compatibility;
-    };
-    GenericNicDmaStats genericNicDmaStats()
-    {
-        auto &stats = cache->cacheMemoryStats;
-        GenericNicDmaStats result{};
-        for (int index = 0; index < NicDmaStatCount; ++index) {
-            result.requests[index] = stats.nicDmaRequests[index].value();
-            result.hits[index] = stats.nicDmaHits[index].value();
-            result.misses[index] = stats.nicDmaMisses[index].value();
-            result.requestedBytes[index] =
-                stats.nicDmaRequestedBytes[index].value();
-            result.mergeReads[index] =
-                stats.nicDmaMergeReads[index].value();
-            result.mergeReadBytes[index] =
-                stats.nicDmaMergeReadBytes[index].value();
-        }
-        result.rxPayloadRequests = stats.rxPayloadRequests.value();
-        result.rxPayloadHits = stats.rxPayloadHits.value();
-        result.rxPayloadMisses = stats.rxPayloadMisses.value();
-        result.rxHeaderRequests = stats.rxHeaderRequests.value();
-        result.rxHeaderHits = stats.rxHeaderHits.value();
-        result.rxHeaderMisses = stats.rxHeaderMisses.value();
-        result.txPayloadRequests = stats.txPayloadRequests.value();
-        result.txPayloadHits = stats.txPayloadHits.value();
-        result.txPayloadMisses = stats.txPayloadMisses.value();
-        result.compatibility = nicDmaStats();
-        return result;
     }
     void makePresent(Addr address)
     {
@@ -270,34 +134,7 @@ class CacheMemoryTest : public SerializationFixture
         cache->m_cache[set][way] = entry;
     }
     void setTag(Addr address, int way) { cache->m_tag_index[address] = way; }
-    size_t rxProvenanceCount() const
-    {
-        return cache->rxPayloadEverAddrs.size();
-    }
-    size_t rdmaProvenanceCount() const
-    {
-        return cache->rdmaRxPayloadEverAddrs.size();
-    }
-    void saveCheckpoint() const
-    {
-        std::ofstream cp(getCptPath());
-        Serializable::ScopedCheckpointSection section(cp, "cache");
-        cache->serialize(cp);
-    }
-    void restoreCheckpoint()
-    {
-        CheckpointIn cp(getDirName());
-        Serializable::ScopedCheckpointSection section(cp, "cache");
-        cache->unserialize(cp);
-    }
-    std::string checkpointContents() const
-    {
-        std::ifstream cp(getCptPath());
-        return {std::istreambuf_iterator<char>(cp), {}};
-    }
 };
-
-using CacheMemoryDeathTest = CacheMemoryTest;
 
 TEST_F(CacheMemoryTest, ReuseRemovesOnlyStaleTagMapping)
 {
@@ -471,513 +308,17 @@ TEST_F(CacheMemoryTest, AddressHashAvalanchesFullLineAddress)
         EXPECT_EQ(setOf(line * 64), expected[line]);
 }
 
-TEST_F(CacheMemoryTest, RxHeaderIsClassifiedAsDDIOWrite)
+TEST_F(CacheMemoryTest, EligibleDmaWayAccountingHasNoSourceDimension)
 {
     makeCache(2);
-    auto header = std::make_shared<Request>(
-        0, 64, Request::NIC_RX_HEADER_WRITE, 0);
-    auto payload = std::make_shared<Request>(
-        0, 64, Request::NIC_RX_PAYLOAD_WRITE, 0);
-    auto unrelated = std::make_shared<Request>(0, 64, Request::UNCACHEABLE, 0);
-    auto descriptor = std::make_shared<Request>(
-        0, 64, Request::NIC_RX_DESC_WRITEBACK, 0);
-    EXPECT_TRUE(cache->isNicRxWriteReq(header));
-    EXPECT_TRUE(cache->isNicRxWriteReq(payload));
-    EXPECT_TRUE(cache->isNicDdioWriteReq(descriptor));
-    EXPECT_FALSE(cache->isNicDdioReadReq(descriptor));
-    EXPECT_FALSE(cache->isNicDdioWriteReq(unrelated));
-}
-
-TEST_F(CacheMemoryTest, PayloadAndHeaderTelemetryAreSeparate)
-{
-    makeCache(2);
-    cache->profileRxPayload(0);
-    cache->profileRxHeader(64);
-    EXPECT_EQ(payloadRequests(), 1);
-    EXPECT_EQ(headerRequests(), 1);
-    EXPECT_EQ(payloadMisses(), 1);
-    EXPECT_EQ(headerMisses(), 1);
-}
-
-TEST_F(CacheMemoryTest, PvrdmaProfilesAggregateAndDedicatedTelemetry)
-{
-    makeCache(2);
-    auto *entry = new TestEntry;
-    cache->allocateInWays(0, entry, 2);
-    entry->m_Permission = AccessPermission_Read_Write;
-    const int way = wayOf(0);
-
-    auto rdma = std::make_shared<Request>(
-        0, 64, Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA, 0);
-    auto generic = std::make_shared<Request>(
-        0, 64, Request::NIC_RX_PAYLOAD_WRITE, 0);
-    EXPECT_TRUE(cache->isNicRxPayloadWriteReq(rdma));
-    EXPECT_TRUE(cache->isNicPvrdmaReq(rdma));
-    EXPECT_FALSE(cache->isNicPvrdmaReq(generic));
-
-    auto tx = std::make_shared<Request>(
-        0, 16, Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA, 0);
-    cache->profileNicDma(0, rdma, false, 64);
-    cache->profileNicDma(0, generic, true, 8);
-    cache->profileNicDma(0, tx, false, 16);
-    auto control = std::make_shared<Request>(
-        64, 8, Request::NIC_PVRDMA | Request::UNCACHEABLE, 0);
-    cache->profileNicDma(64, control, false, 8);
-    cache->profileNicDma(64, nullptr, false, 8);
-    const auto stats = genericNicDmaStats();
-    EXPECT_EQ(stats.requests[1], 1); // RX full
-    EXPECT_EQ(stats.requests[2], 1); // RX partial
-    EXPECT_EQ(stats.requests[9], 1); // TX read
-    EXPECT_EQ(stats.requestedBytes[1], 64);
-    EXPECT_EQ(stats.requestedBytes[2], 8);
-    EXPECT_EQ(stats.requestedBytes[9], 16);
-    EXPECT_EQ(stats.compatibility.readRequests, 1);
-    EXPECT_EQ(stats.compatibility.writeRequests, 2);
-    EXPECT_EQ(rdmaProvenanceCount(), 1);
-    EXPECT_EQ(payloadRequests(), 2);
-    EXPECT_EQ(rdmaRxRequests(), 1);
-    EXPECT_EQ(rdmaRxHits(), 1);
-    EXPECT_EQ(rdmaTxRequests(), 1);
-
-    cache->profileDdioWayAccess(3, way, 0);
-    EXPECT_EQ(rdmaCpuAccessAt(way), 1);
-    EXPECT_EQ(rdmaCpuUnique(), 1);
-
-    cache->resetStats();
-    for (const auto count : genericNicDmaStats().requests)
-        EXPECT_EQ(count, 0);
-    cache->profileDdioWayFill(3, way, 0);
-    EXPECT_EQ(rdmaCpuAccessAt(way), 0);
-    EXPECT_EQ(rdmaCpuFillAt(way), 1);
-    EXPECT_EQ(rdmaCpuUnique(), 1);
-}
-
-TEST_F(CacheMemoryTest, PvrdmaProvenanceSurvivesCheckpointAndStatsReset)
-{
-    makeCache(2);
-    constexpr Addr address = 256;
-    cache->profileRxPayload(address);
-    cache->profileRdmaRxPayload(address);
-    saveCheckpoint();
-
-    makeCache(2);
-    restoreCheckpoint();
-
-    cache->resetStats();
-    cache->profileDdioWayAccess(3, 0, address);
-    cache->profileDdioWayFill(3, 1, address);
-    EXPECT_EQ(rdmaCpuAccessAt(0), 1);
-    EXPECT_EQ(rdmaCpuFillAt(1), 1);
-    EXPECT_EQ(rdmaCpuUnique(), 1);
-}
-
-TEST_F(CacheMemoryTest, ProvenanceSerializationIsSorted)
-{
-    makeCache(2);
-    cache->profileRxPayload(256);
-    cache->profileRdmaRxPayload(192);
-    cache->profileRxPayload(64);
-    cache->profileRdmaRxPayload(128);
-    saveCheckpoint();
-
-    EXPECT_EQ(checkpointContents(),
-              "\n[cache]\n"
-              "rxPayloadEverAddrs=64 128 192 256\n"
-              "rdmaRxPayloadEverAddrs=128 192\n");
-}
-
-TEST_F(CacheMemoryTest, MissingProvenanceRestoresEmpty)
-{
-    makeCache(2);
-    cache->profileRdmaRxPayload(64);
-    simulateSerialization("\n[cache]\n");
-    restoreCheckpoint();
-
-    EXPECT_EQ(rxProvenanceCount(), 0);
-    EXPECT_EQ(rdmaProvenanceCount(), 0);
-}
-
-TEST_F(CacheMemoryDeathTest, RejectsUnalignedRxProvenance)
-{
-    makeCache(2);
-    simulateSerialization("\n[cache]\nrxPayloadEverAddrs=65\n");
-    ASSERT_ANY_THROW(restoreCheckpoint());
-}
-
-TEST_F(CacheMemoryDeathTest, RejectsUnalignedRdmaProvenance)
-{
-    makeCache(2);
-    simulateSerialization(
-        "\n[cache]\nrxPayloadEverAddrs=64\nrdmaRxPayloadEverAddrs=65\n");
-    ASSERT_ANY_THROW(restoreCheckpoint());
-}
-
-TEST_F(CacheMemoryDeathTest, RejectsRdmaOutsideRxProvenance)
-{
-    makeCache(2);
-    simulateSerialization(
-        "\n[cache]\nrxPayloadEverAddrs=64\nrdmaRxPayloadEverAddrs=128\n");
-    ASSERT_ANY_THROW(restoreCheckpoint());
-}
-
-TEST_F(CacheMemoryTest, NicDmaTelemetryClassifiesDirectionAndDescriptors)
-{
-    makeCache(2);
-    constexpr Addr rxDescHit = 0;
-    constexpr Addr txPayloadHit = 64;
-    constexpr Addr rxDescWriteHit = 128;
-    constexpr Addr rxHeaderHit = 192;
-    makePresent(rxDescHit);
-    makePresent(txPayloadHit);
-    makePresent(rxDescWriteHit);
-    makePresent(rxHeaderHit);
-
-    auto profile = [this](Addr address, Request::Flags flags) {
-        auto req = std::make_shared<Request>(address, 64, flags, 0);
-        cache->profileNicDma(address, req, false, 64);
-    };
-
-    profile(rxDescHit, Request::NIC_RX_DESC_READ);
-    profile(sameSetAddress(rxDescHit), Request::NIC_TX_DESC_READ);
-    profile(txPayloadHit, Request::NIC_TX_PAYLOAD_READ);
-    profile(rxDescWriteHit, Request::NIC_RX_DESC_WRITEBACK);
-    profile(sameSetAddress(rxDescWriteHit),
-            Request::NIC_TX_DESC_WRITEBACK);
-    profile(sameSetAddress(rxDescHit, 2), Request::NIC_RX_PAYLOAD_WRITE);
-    profile(rxHeaderHit, Request::NIC_RX_HEADER_WRITE);
-    profile(1024, Request::UNCACHEABLE);
-
-    const auto stats = nicDmaStats();
-    EXPECT_EQ(stats.readRequests, 3);
-    EXPECT_EQ(stats.readHits, 2);
-    EXPECT_EQ(stats.readMisses, 1);
-    EXPECT_EQ(stats.descReadRequests, 2);
-    EXPECT_EQ(stats.descReadHits, 1);
-    EXPECT_EQ(stats.descReadMisses, 1);
-
-    EXPECT_EQ(stats.writeRequests, 4);
-    EXPECT_EQ(stats.writeHits, 2);
-    EXPECT_EQ(stats.writeMisses, 2);
-    EXPECT_EQ(stats.descWriteRequests, 2);
-    EXPECT_EQ(stats.descWriteHits, 1);
-    EXPECT_EQ(stats.descWriteMisses, 1);
-
-    // Payload/header categories contribute to the aggregate direction totals,
-    // but never to the descriptor-only subsets. Existing telemetry remains
-    // category-specific and observes the same acceptance-time tag state.
-    EXPECT_EQ(stats.txPayloadRequests, 1);
-    EXPECT_EQ(stats.txPayloadHits, 1);
-    EXPECT_EQ(payloadRequests(), 1);
-    EXPECT_EQ(payloadMisses(), 1);
-    EXPECT_EQ(headerRequests(), 1);
-    EXPECT_EQ(stats.rxHeaderHits, 1);
-}
-
-TEST_F(CacheMemoryTest, NicDmaGenericAxesCoverSourcesOperationsAndBytes)
-{
-    makeCache(2);
-    constexpr Addr hitAddress = 0;
-    constexpr Addr missAddress = 64;
-    makePresent(hitAddress);
-
-    using Source = CacheMemory::NicDmaSource;
-    using Operation = CacheMemory::NicDmaOperation;
-    struct ProfileCase
-    {
-        Request::Flags flags;
-        Source source;
-        Operation operation;
-        int hitBytes;
-        int missBytes;
-    };
-    const ProfileCase cases[] = {
-        {Request::NIC_RX_PAYLOAD_WRITE, Source::RxPayload,
-         Operation::WriteFull, 64, 64},
-        {Request::NIC_RX_PAYLOAD_WRITE, Source::RxPayload,
-         Operation::WritePartial, 9, 17},
-        {Request::NIC_RX_HEADER_WRITE, Source::RxHeader,
-         Operation::WriteFull, 64, 64},
-        {Request::NIC_RX_HEADER_WRITE, Source::RxHeader,
-         Operation::WritePartial, 7, 19},
-        {Request::NIC_RX_DESC_READ, Source::RxDescriptor,
-         Operation::Read, 8, 24},
-        {Request::NIC_RX_DESC_WRITEBACK, Source::RxDescriptor,
-         Operation::WriteFull, 64, 64},
-        {Request::NIC_RX_DESC_WRITEBACK, Source::RxDescriptor,
-         Operation::WritePartial, 5, 23},
-        {Request::NIC_TX_PAYLOAD_READ, Source::TxPayload,
-         Operation::Read, 12, 28},
-        {Request::NIC_TX_DESC_READ, Source::TxDescriptor,
-         Operation::Read, 16, 32},
-        {Request::NIC_TX_DESC_WRITEBACK, Source::TxDescriptor,
-         Operation::WriteFull, 64, 64},
-        {Request::NIC_TX_DESC_WRITEBACK, Source::TxDescriptor,
-         Operation::WritePartial, 3, 31},
-    };
-
-    constexpr int NumStats =
-        static_cast<int>(Source::NumSources) *
-        static_cast<int>(Operation::NumOperations);
-    std::array<int, NumStats> expectedRequests{};
-    std::array<int, NumStats> expectedBytes{};
-    for (const auto &profileCase : cases) {
-        const int index = CacheMemory::nicDmaStatIndex(
-            profileCase.source, profileCase.operation);
-        const bool partial =
-            profileCase.operation == Operation::WritePartial;
-        auto hitReq = std::make_shared<Request>(
-            hitAddress, 64, profileCase.flags, 0);
-        auto missReq = std::make_shared<Request>(
-            missAddress, 64, profileCase.flags, 0);
-        cache->profileNicDma(
-            hitAddress, hitReq, partial, profileCase.hitBytes);
-        cache->profileNicDma(
-            missAddress, missReq, partial, profileCase.missBytes);
-        expectedRequests[index] += 2;
-        expectedBytes[index] +=
-            profileCase.hitBytes + profileCase.missBytes;
-    }
-
-    const auto stats = genericNicDmaStats();
-    for (int index = 0; index < NumStats; ++index) {
-        EXPECT_EQ(stats.requests[index], expectedRequests[index]);
-        EXPECT_EQ(stats.requestedBytes[index], expectedBytes[index]);
-        if (expectedRequests[index] == 0) {
-            EXPECT_EQ(stats.hits[index], 0);
-            EXPECT_EQ(stats.misses[index], 0);
-        } else {
-            EXPECT_EQ(stats.hits[index], 1);
-            EXPECT_EQ(stats.misses[index], 1);
-        }
-        EXPECT_EQ(stats.requests[index],
-                  stats.hits[index] + stats.misses[index]);
-    }
-
-    statistics::Counter readRequests = 0;
-    statistics::Counter readHits = 0;
-    statistics::Counter readMisses = 0;
-    statistics::Counter writeRequests = 0;
-    statistics::Counter writeHits = 0;
-    statistics::Counter writeMisses = 0;
-    statistics::Counter descReadRequests = 0;
-    statistics::Counter descReadHits = 0;
-    statistics::Counter descReadMisses = 0;
-    statistics::Counter descWriteRequests = 0;
-    statistics::Counter descWriteHits = 0;
-    statistics::Counter descWriteMisses = 0;
-    for (int sourceIndex = 0;
-         sourceIndex < static_cast<int>(Source::NumSources); ++sourceIndex) {
-        const Source source = static_cast<Source>(sourceIndex);
-        const bool descriptor = source == Source::RxDescriptor ||
-                                source == Source::TxDescriptor;
-        for (int operationIndex = 0;
-             operationIndex < static_cast<int>(Operation::NumOperations);
-             ++operationIndex) {
-            const Operation operation =
-                static_cast<Operation>(operationIndex);
-            const int index =
-                CacheMemory::nicDmaStatIndex(source, operation);
-            const auto requests = stats.requests[index];
-            const auto hits = stats.hits[index];
-            const auto misses = stats.misses[index];
-            if (operation == Operation::Read) {
-                readRequests += requests;
-                readHits += hits;
-                readMisses += misses;
-                if (descriptor) {
-                    descReadRequests += requests;
-                    descReadHits += hits;
-                    descReadMisses += misses;
-                }
-            } else {
-                writeRequests += requests;
-                writeHits += hits;
-                writeMisses += misses;
-                if (descriptor) {
-                    descWriteRequests += requests;
-                    descWriteHits += hits;
-                    descWriteMisses += misses;
-                }
-            }
-        }
-    }
-
-    EXPECT_EQ(stats.compatibility.readRequests, readRequests);
-    EXPECT_EQ(stats.compatibility.readHits, readHits);
-    EXPECT_EQ(stats.compatibility.readMisses, readMisses);
-    EXPECT_EQ(stats.compatibility.writeRequests, writeRequests);
-    EXPECT_EQ(stats.compatibility.writeHits, writeHits);
-    EXPECT_EQ(stats.compatibility.writeMisses, writeMisses);
-    EXPECT_EQ(stats.compatibility.descReadRequests, descReadRequests);
-    EXPECT_EQ(stats.compatibility.descReadHits, descReadHits);
-    EXPECT_EQ(stats.compatibility.descReadMisses, descReadMisses);
-    EXPECT_EQ(stats.compatibility.descWriteRequests, descWriteRequests);
-    EXPECT_EQ(stats.compatibility.descWriteHits, descWriteHits);
-    EXPECT_EQ(stats.compatibility.descWriteMisses, descWriteMisses);
-
-    auto sourceProjection = [&](const auto &vector, Source source) {
-        statistics::Counter total = 0;
-        for (int operation = 0;
-             operation < static_cast<int>(Operation::NumOperations);
-             ++operation) {
-            total += vector[CacheMemory::nicDmaStatIndex(
-                source, static_cast<Operation>(operation))];
-        }
-        return total;
-    };
-    EXPECT_EQ(stats.rxPayloadRequests,
-              sourceProjection(stats.requests, Source::RxPayload));
-    EXPECT_EQ(stats.rxPayloadHits,
-              sourceProjection(stats.hits, Source::RxPayload));
-    EXPECT_EQ(stats.rxPayloadMisses,
-              sourceProjection(stats.misses, Source::RxPayload));
-    EXPECT_EQ(stats.rxHeaderRequests,
-              sourceProjection(stats.requests, Source::RxHeader));
-    EXPECT_EQ(stats.rxHeaderHits,
-              sourceProjection(stats.hits, Source::RxHeader));
-    EXPECT_EQ(stats.rxHeaderMisses,
-              sourceProjection(stats.misses, Source::RxHeader));
-    EXPECT_EQ(stats.txPayloadRequests,
-              sourceProjection(stats.requests, Source::TxPayload));
-    EXPECT_EQ(stats.txPayloadHits,
-              sourceProjection(stats.hits, Source::TxPayload));
-    EXPECT_EQ(stats.txPayloadMisses,
-              sourceProjection(stats.misses, Source::TxPayload));
-}
-
-TEST_F(CacheMemoryTest, NicDmaIndexMappingAndSourceClassificationAreStable)
-{
-    using Source = CacheMemory::NicDmaSource;
-    using Operation = CacheMemory::NicDmaOperation;
-    EXPECT_EQ(CacheMemory::nicDmaStatIndex(
-                  Source::RxPayload, Operation::Read), 0);
-    EXPECT_EQ(CacheMemory::nicDmaStatIndex(
-                  Source::RxDescriptor, Operation::WritePartial), 8);
-    EXPECT_EQ(CacheMemory::nicDmaStatIndex(
-                  Source::TxDescriptor, Operation::WritePartial), 14);
-
-    auto classify = [](Request::Flags flags) {
-        auto req = std::make_shared<Request>(0, 64, flags, 0);
-        const auto source = CacheMemory::classifyNicDmaSource(req);
-        req->setFlags(Request::NIC_PVRDMA);
-        EXPECT_TRUE(Request::hasOneNicDmaCategory(req->getFlags()));
-        EXPECT_EQ(CacheMemory::classifyNicDmaSource(req), source);
-        return source;
-    };
-    EXPECT_EQ(classify(Request::NIC_RX_PAYLOAD_WRITE), Source::RxPayload);
-    EXPECT_EQ(classify(Request::NIC_RX_HEADER_WRITE), Source::RxHeader);
-    EXPECT_EQ(classify(Request::NIC_RX_DESC_READ), Source::RxDescriptor);
-    EXPECT_EQ(classify(Request::NIC_RX_DESC_WRITEBACK),
-              Source::RxDescriptor);
-    EXPECT_EQ(classify(Request::NIC_TX_PAYLOAD_READ), Source::TxPayload);
-    EXPECT_EQ(classify(Request::NIC_TX_DESC_READ), Source::TxDescriptor);
-    EXPECT_EQ(classify(Request::NIC_TX_DESC_WRITEBACK),
-              Source::TxDescriptor);
-}
-
-TEST_F(CacheMemoryTest, NicDmaRequestSizePreservesSubLineReads)
-{
-    makeCache(2);
-    using Source = CacheMemory::NicDmaSource;
-    using Operation = CacheMemory::NicDmaOperation;
-
-    auto payload = std::make_shared<Request>(
-        0, 16, Request::NIC_TX_PAYLOAD_READ, 0);
-    EXPECT_EQ(CacheMemory::classifyNicDmaSource(payload),
-              Source::TxPayload);
-    EXPECT_EQ(CacheMemory::classifyNicDmaOperation(payload, false),
-              Operation::Read);
-    EXPECT_EQ(cache->getNicDmaRequestSize(payload), 16);
-
-    auto descriptor = std::make_shared<Request>(
-        0, 8, Request::NIC_RX_DESC_READ, 0);
-    EXPECT_EQ(CacheMemory::classifyNicDmaSource(descriptor),
-              Source::RxDescriptor);
-    EXPECT_EQ(CacheMemory::classifyNicDmaOperation(descriptor, false),
-              Operation::Read);
-    EXPECT_EQ(cache->getNicDmaRequestSize(descriptor), 8);
-}
-
-TEST_F(CacheMemoryTest, NicDmaRequestSizeRejectsInvalidRequests)
-{
-    makeCache(2);
-    EXPECT_ANY_THROW(cache->getNicDmaRequestSize(nullptr));
-
-    auto unrelated = std::make_shared<Request>(
-        0, 16, Request::UNCACHEABLE, 0);
-    EXPECT_ANY_THROW(cache->getNicDmaRequestSize(unrelated));
-
-    auto combined = std::make_shared<Request>(
-        0, 16,
-        Request::NIC_RX_DESC_READ | Request::NIC_TX_PAYLOAD_READ, 0);
-    EXPECT_ANY_THROW(cache->getNicDmaRequestSize(combined));
-
-    auto noSize = std::make_shared<Request>();
-    noSize->setPaddr(0);
-    noSize->setFlags(Request::NIC_TX_PAYLOAD_READ);
-    ASSERT_FALSE(noSize->hasSize());
-    EXPECT_ANY_THROW(cache->getNicDmaRequestSize(noSize));
-}
-
-TEST_F(CacheMemoryTest, NicDmaMergeReadsUsePartialWriteSourceClass)
-{
-    makeCache(2);
-    using Source = CacheMemory::NicDmaSource;
-    using Operation = CacheMemory::NicDmaOperation;
-    struct MergeCase
-    {
-        Request::Flags flags;
-        Source source;
-    };
-    const MergeCase cases[] = {
-        {Request::NIC_RX_PAYLOAD_WRITE, Source::RxPayload},
-        {Request::NIC_RX_HEADER_WRITE, Source::RxHeader},
-        {Request::NIC_RX_DESC_WRITEBACK, Source::RxDescriptor},
-        {Request::NIC_TX_DESC_WRITEBACK, Source::TxDescriptor},
-    };
-    for (const auto &mergeCase : cases) {
-        auto req = std::make_shared<Request>(0, 64, mergeCase.flags, 0);
-        cache->profileNicDma(0, req, true, 8);
-        cache->profileNicDmaMergeRead(req);
-        const int index = CacheMemory::nicDmaStatIndex(
-            mergeCase.source, Operation::WritePartial);
-        const auto stats = genericNicDmaStats();
-        EXPECT_EQ(stats.mergeReads[index], 1);
-        EXPECT_EQ(stats.mergeReadBytes[index], 64);
-    }
-}
-
-TEST_F(CacheMemoryTest, NicDmaRejectsMalformedCategoriesAndByteCounts)
-{
-    makeCache(2);
-    auto combined = std::make_shared<Request>(
-        0, 64,
-        Request::NIC_RX_DESC_READ | Request::NIC_TX_PAYLOAD_READ, 0);
-    EXPECT_ANY_THROW(cache->profileNicDma(0, combined, false, 8));
-
-    auto partial = std::make_shared<Request>(
-        0, 64, Request::NIC_RX_DESC_WRITEBACK, 0);
-    EXPECT_ANY_THROW(cache->profileNicDma(0, partial, true, 0));
-    EXPECT_ANY_THROW(cache->profileNicDma(0, partial, true, 65));
-    EXPECT_ANY_THROW(cache->profileNicDma(0, partial, false, 32));
-
-    auto read = std::make_shared<Request>(
-        0, 64, Request::NIC_TX_PAYLOAD_READ, 0);
-    EXPECT_ANY_THROW(cache->profileNicDma(0, read, true, 8));
-    EXPECT_ANY_THROW(cache->profileNicDmaMergeRead(read));
-}
-
-TEST_F(CacheMemoryTest, PayloadAllocationHistogramIsPayloadOnly)
-{
-    makeCache(2);
-    auto *entry = new TestEntry;
-    cache->allocateInWays(0, entry, 2);
-    cache->profileDdioWayFill(2, wayOf(0), 0);
-    // The descriptor source updates general DDIO accounting, not payload-only
-    // allocation accounting. The source-agnostic way is checked indirectly by
-    // exercising the source-specific request classification above.
-    EXPECT_EQ(payloadAllocAt(wayOf(0)), 0);
-    EXPECT_EQ(ddioAllocAt(wayOf(0)), 1);
+    cache->profileDdioWayFill(0);
+    cache->profileDdioWayFill(1);
+    cache->profileDdioWayFill(3);
+    cache->profileDdioWayAccess(3);
+    cache->profileDdioWayAccess(-1);
+    EXPECT_EQ(ddioAllocAt(0), 1);
+    EXPECT_EQ(ddioAllocAt(1), 1);
+    EXPECT_EQ(ddioAllocAt(3), 0);
 }
 
 TEST_F(CacheMemoryTest, DMARoutingTelemetryIsIndependentAndResettable)
@@ -989,8 +330,6 @@ TEST_F(CacheMemoryTest, DMARoutingTelemetryIsIndependentAndResettable)
 
     EXPECT_EQ(dmaRoutingProxies(), 2);
     EXPECT_EQ(dmaRoutingRecycles(), 1);
-    EXPECT_EQ(payloadRequests(), 0);
-    EXPECT_EQ(headerRequests(), 0);
 
     cache->resetStats();
     EXPECT_EQ(dmaRoutingProxies(), 0);

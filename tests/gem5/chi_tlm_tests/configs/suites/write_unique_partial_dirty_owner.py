@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""A descriptor write merges with a dirty upstream owner's full line."""
+"""An eligible DMA write merges with a dirty upstream owner's full line."""
 
 from m5.stats.gem5stats import get_simstat
 from m5.tlm_chi import (
@@ -33,7 +33,6 @@ UPDATE = bytes((0xA0 + index) & 0xFF for index in range(16))
 REQUEST_DATA = bytes(OFFSET) + UPDATE + bytes(64 - OFFSET - len(UPDATE))
 EXPECTED = DIRTY_OWNER[:OFFSET] + UPDATE + DIRTY_OWNER[OFFSET + 16 :]
 
-nic_dma_categories = ["", "rx_desc_writeback", ""]
 ddio_eligible = [False, True, False]
 hnf_alloc_on_writeback = False
 ddio_way_part = 2
@@ -105,23 +104,9 @@ def test_generators(generators):
 
 
 def check(system):
+    # Data bytes, masks, snoops and completion ordering are checked above.
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
     allocations = vector_values(find_stat(stats, "ddioAllocWays"))
-    requests = vector_values(find_stat(stats, "nicDmaRequests"))
-    requested_bytes = vector_values(
-        find_stat(stats, "nicDmaRequestedBytes")
-    )
-    merge_reads = vector_values(find_stat(stats, "nicDmaMergeReads"))
-    merge_read_bytes = vector_values(
-        find_stat(stats, "nicDmaMergeReadBytes")
-    )
-    assert requests[8] == 1, requests
-    assert requested_bytes[8] == 16, requested_bytes
-    # Dirty owner data is authoritative, so no memory merge read is issued.
-    assert merge_reads[8] == 0, merge_reads
-    assert merge_read_bytes[8] == 0, merge_read_bytes
     assert sum(allocations) == 1, allocations
-    assert all(
-        value == 0 for value in allocations[ddio_way_part:]
-    ), allocations
-    print("Partial dirty-owner merge and coherent data readback passed")
+    assert all(v == 0 for v in allocations[ddio_way_part:]), allocations
+    print("Untagged CHI data/coherence and aggregate accounting passed")

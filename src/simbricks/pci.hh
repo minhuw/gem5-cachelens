@@ -38,7 +38,6 @@ namespace simbricks {
 namespace pci {
 extern "C" {
 #include <simbricks/pcie/proto.h>
-#include <simbricks/pcie/semantic.h>
 
 }
 
@@ -194,15 +193,6 @@ private:
     bool sync;
     bool writesPosted;
 
-    struct SemanticStats : public statistics::Group {
-        SemanticStats(statistics::Group *parent);
-        statistics::Vector descReadOps, descReadBytes, payloadWriteOps, payloadWriteBytes;
-        statistics::Scalar untaggedReadBytes, untaggedWriteBytes, traceDropped;
-    } semanticStats;
-    std::ofstream semanticTrace;
-    uint64_t semanticOpId = 0;
-    Request::Flags semanticFlags(const volatile uint8_t *pad, bool write,
-                                 uint64_t rid, Addr addr, uint64_t len);
     void dmaDone(DMACompl &comp);
 };
 

@@ -133,7 +133,6 @@ class MemTest : public ClockedObject
     const unsigned percentFunctional;
     const unsigned percentUncacheable;
     const unsigned percentAtomic;
-    const bool nicDma;
 
     /** Request id for all generated traffic */
     RequestorID requestorId;

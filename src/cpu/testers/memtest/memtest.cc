@@ -94,7 +94,6 @@ MemTest::MemTest(const Params &p)
       percentFunctional(p.percent_functional),
       percentUncacheable(p.percent_uncacheable),
       percentAtomic(p.percent_atomic),
-      nicDma(p.nic_dma),
       requestorId(p.system->getRequestorId(this)),
       blockSize(p.system->cacheLineSize()),
       blockAddrMask(blockSize - 1),
@@ -112,11 +111,6 @@ MemTest::MemTest(const Params &p)
     id = TESTER_ALLOCATOR++;
     fatal_if(id >= blockSize, "Too many testers, only %d allowed\n",
              blockSize - 1);
-    fatal_if(nicDma &&
-             (atomic || percentFunctional != 0 || percentUncacheable != 0 ||
-              percentAtomic != 0),
-             "NIC DMA MemTest traffic requires timing system mode and must "
-             "be cacheable and non-atomic\n");
 
     // set up counters
     numReads = 0;
@@ -254,10 +248,6 @@ MemTest::tick()
                      !uncacheable;
     unsigned base = rng->random(0, 1);
     Request::Flags flags;
-    if (nicDma) {
-        flags.set(is_read ? Request::NIC_TX_PAYLOAD_READ :
-                            Request::NIC_RX_PAYLOAD_WRITE);
-    }
     Addr paddr;
 
     // halt until we clear outstanding requests, otherwise it won't be able to

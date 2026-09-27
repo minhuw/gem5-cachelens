@@ -265,6 +265,10 @@ reqOpcode(ReqOpcode req)
         { REQ_OPCODE_WRITE_NO_SNP_FULL, CHIRequestType_WriteUniqueFull },
         { REQ_OPCODE_WRITE_UNIQUE_PTL, CHIRequestType_WriteUniquePtl },
         { REQ_OPCODE_WRITE_UNIQUE_FULL, CHIRequestType_WriteUniqueFull },
+        { REQ_OPCODE_WRITE_UNIQUE_FULL_STASH,
+          CHIRequestType_WriteUniqueFullStash },
+        { REQ_OPCODE_WRITE_UNIQUE_PTL_STASH,
+          CHIRequestType_WriteUniquePtlStash },
         { REQ_OPCODE_WRITE_UNIQUE_ZERO, CHIRequestType_WriteUniqueZero },
         { REQ_OPCODE_WRITE_BACK_FULL, CHIRequestType_WriteBackFull },
         { REQ_OPCODE_WRITE_EVICT_OR_EVICT, CHIRequestType_WriteEvictFull }, // TODO

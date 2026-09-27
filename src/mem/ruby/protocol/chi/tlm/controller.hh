@@ -117,7 +117,6 @@ class CacheController : public ruby::CHIGenericController
 
     void pCreditGrant(const CHIResponseMsg *msg);
 
-    const Request::FlagsType testNicDmaCategory;
     const bool ddioEligible;
 
     struct Transaction

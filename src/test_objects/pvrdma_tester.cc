@@ -2408,14 +2408,9 @@ PvrdmaTester::observeDmaRequest(
         return packet.addr >= base &&
             packet.addr + packet.size <= base + size;
     };
-    const Request::FlagsType classification = packet.flags &
-        (Request::NIC_DMA_CATEGORY_MASK | Request::NIC_PVRDMA);
     const Addr payload = receiver ? PairReceiverPayload : PairSenderPayload;
     if (inRange(payload, 64 * pvrdma::PageSize)) {
-        const Request::FlagsType expected = receiver ?
-            Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA :
-            Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA;
-        panic_if(classification != expected ||
+        panic_if(packet.flags ||
                      packet.cmd != (receiver ? MemCmd::WriteReq :
                                                MemCmd::ReadReq),
                  "PVRDMA %s payload request %#x+%u has flags %#x",
@@ -2425,7 +2420,7 @@ PvrdmaTester::observeDmaRequest(
         return;
     }
 
-    panic_if(classification,
+    panic_if(packet.flags,
              "PVRDMA non-payload request %#x+%u has flags %#x",
              packet.addr, packet.size, packet.flags);
     if (packet.cmd == MemCmd::ReadReq &&
@@ -2508,6 +2503,15 @@ PvrdmaTester::runRequestObservationPair()
              txPayloadRequests, rxPayloadRequests,
              unclassifiedWqeRequests, unclassifiedCqeRequests,
              unclassifiedConsumerRequests, unclassifiedControlRequests);
+    panic_if(rdma->dmaStats.payloadDmaReads.value() != 1 ||
+                 rdma->dmaStats.payloadDmaRdBytes.value() != Length ||
+                 peerRdma->dmaStats.payloadDmaWrites.value() != 1 ||
+                 peerRdma->dmaStats.payloadDmaWrBytes.value() != Length ||
+                 !rdma->dmaStats.descDmaReads.value() ||
+                 !rdma->dmaStats.descDmaWrites.value() ||
+                 !peerRdma->dmaStats.descDmaRdBytes.value() ||
+                 !peerRdma->dmaStats.descDmaWrBytes.value(),
+             "PVRDMA device-local DMA operation/byte accounting mismatch");
     inform("PVRDMA transport DMA request observation passed");
     exitSimLoop("PVRDMA request observation test passed");
 }

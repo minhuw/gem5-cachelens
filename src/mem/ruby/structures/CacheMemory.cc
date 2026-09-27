@@ -129,63 +129,15 @@ CacheMemory::init()
     replacement_data.resize(m_cache_num_sets,
                                std::vector<ReplData>(m_cache_assoc, nullptr));
 
-    // Size the DDIO way-histogram stats now that the associativity is known
-    cacheMemoryStats.rxPayloadHitWays.init(m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.rdmaRxPayloadHitWays.init(m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.rxPayloadAllocWays.init(m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.ddioAllocWays.init(m_cache_assoc).flags(
-        statistics::total);
-
-    // Per-way, per-source accounting vectors ([src][way] flattened). Keep
-    // zero-valued way entries visible so runtime contracts can distinguish a
-    // real zero from a missing statistic.
-    static const char *ddio_src_names[5] = {
-        "nic_rx_payload", "nic_tx_payload", "nic_desc", "cpu_other",
-        "nic_rx_header"};
-    cacheMemoryStats.ddioWayAccess.init(5 * m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.ddioWayFill.init(5 * m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.wayDeallocations.init(m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.rxPayloadCpuAccessWays.init(m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.rxPayloadCpuFillWays.init(m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.rdmaRxPayloadCpuAccessWays.init(m_cache_assoc).flags(
-        statistics::total);
-    cacheMemoryStats.rdmaRxPayloadCpuFillWays.init(m_cache_assoc).flags(
-        statistics::total);
-    for (int s = 0; s < 5; s++) {
-        for (int w = 0; w < m_cache_assoc; w++) {
-            cacheMemoryStats.ddioWayAccess.subname(
-                s * m_cache_assoc + w,
-                csprintf("%s_way%d", ddio_src_names[s], w));
-            cacheMemoryStats.ddioWayFill.subname(
-                s * m_cache_assoc + w,
-                csprintf("%s_way%d", ddio_src_names[s], w));
-        }
+    cacheMemoryStats.ddioAllocWays.init(m_cache_assoc).flags(statistics::total);
+    cacheMemoryStats.ddioWayAccess.init(m_cache_assoc).flags(statistics::total);
+    cacheMemoryStats.ddioWayFill.init(m_cache_assoc).flags(statistics::total);
+    cacheMemoryStats.wayDeallocations.init(m_cache_assoc).flags(statistics::total);
+    for (int way = 0; way < m_cache_assoc; ++way) {
+        cacheMemoryStats.ddioWayAccess.subname(way, csprintf("way%d", way));
+        cacheMemoryStats.ddioWayFill.subname(way, csprintf("way%d", way));
+        cacheMemoryStats.wayDeallocations.subname(way, csprintf("way%d", way));
     }
-    for (int w = 0; w < m_cache_assoc; w++) {
-        cacheMemoryStats.wayDeallocations.subname(w, csprintf("way%d", w));
-        cacheMemoryStats.rxPayloadCpuAccessWays.subname(
-            w, csprintf("way%d", w));
-        cacheMemoryStats.rxPayloadCpuFillWays.subname(
-            w, csprintf("way%d", w));
-        cacheMemoryStats.rdmaRxPayloadCpuAccessWays.subname(
-            w, csprintf("way%d", w));
-        cacheMemoryStats.rdmaRxPayloadCpuFillWays.subname(
-            w, csprintf("way%d", w));
-    }
-
-    // Per-set payload access counters
-    cacheMemoryStats.rxPayloadSetHits.init(m_cache_num_sets).flags(
-        statistics::nozero | statistics::total);
-    cacheMemoryStats.rxPayloadSetMisses.init(m_cache_num_sets).flags(
-        statistics::nozero | statistics::total);
     // instantiate all the replacement_data here
     for (int i = 0; i < m_cache_num_sets; i++) {
         for ( int j = 0; j < m_cache_assoc; j++) {
@@ -203,71 +155,6 @@ CacheMemory::~CacheMemory()
         for (int j = 0; j < m_cache_assoc; j++) {
             delete m_cache[i][j];
         }
-    }
-}
-
-void
-CacheMemory::resetStats()
-{
-    SimObject::resetStats();
-    rxPayloadUniqueAddrs.clear();
-    txPayloadUniqueAddrs.clear();
-    rdmaRxPayloadUniqueAddrs.clear();
-    rdmaTxPayloadUniqueAddrs.clear();
-    rxPayloadCpuUniqueAddrs.clear();
-    rdmaRxPayloadCpuUniqueAddrs.clear();
-}
-
-void
-CacheMemory::serialize(CheckpointOut &cp) const
-{
-    std::vector<Addr> rx_addrs(rxPayloadEverAddrs.begin(),
-                               rxPayloadEverAddrs.end());
-    std::vector<Addr> rdma_addrs(rdmaRxPayloadEverAddrs.begin(),
-                                 rdmaRxPayloadEverAddrs.end());
-    for (const Addr addr : rx_addrs) {
-        fatal_if(addr != makeLineAddress(addr),
-                 "Unaligned RX payload provenance address %#x", addr);
-    }
-    for (const Addr addr : rdma_addrs) {
-        fatal_if(addr != makeLineAddress(addr),
-                 "Unaligned RDMA RX payload provenance address %#x", addr);
-        fatal_if(!rxPayloadEverAddrs.count(addr),
-                 "RDMA RX payload provenance address %#x is not RX payload",
-                 addr);
-    }
-    std::sort(rx_addrs.begin(), rx_addrs.end());
-    std::sort(rdma_addrs.begin(), rdma_addrs.end());
-    arrayParamOut(cp, "rxPayloadEverAddrs", rx_addrs);
-    arrayParamOut(cp, "rdmaRxPayloadEverAddrs", rdma_addrs);
-}
-
-void
-CacheMemory::unserialize(CheckpointIn &cp)
-{
-    std::vector<Addr> rx_addrs;
-    std::vector<Addr> rdma_addrs;
-    const auto &section = Serializable::currentSection();
-
-    if (cp.entryExists(section, "rxPayloadEverAddrs"))
-        arrayParamIn(cp, "rxPayloadEverAddrs", rx_addrs);
-    if (cp.entryExists(section, "rdmaRxPayloadEverAddrs"))
-        arrayParamIn(cp, "rdmaRxPayloadEverAddrs", rdma_addrs);
-
-    rxPayloadEverAddrs.clear();
-    rdmaRxPayloadEverAddrs.clear();
-    for (const Addr addr : rx_addrs) {
-        fatal_if(addr != makeLineAddress(addr),
-                 "Unaligned RX payload provenance address %#x", addr);
-        rxPayloadEverAddrs.insert(addr);
-    }
-    for (const Addr addr : rdma_addrs) {
-        fatal_if(addr != makeLineAddress(addr),
-                 "Unaligned RDMA RX payload provenance address %#x", addr);
-        fatal_if(!rxPayloadEverAddrs.count(addr),
-                 "RDMA RX payload provenance address %#x is not RX payload",
-                 addr);
-        rdmaRxPayloadEverAddrs.insert(addr);
     }
 }
 
@@ -970,11 +857,11 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
                m_prefetch_hits + m_prefetch_misses),
       ADD_STAT(m_accessModeType, ""),
       ADD_STAT(dmaRoutingProxyRequests,
-               "Classified DMA requests proxied through this cache bank"),
+               "Eligible DMA requests proxied through this cache bank"),
       ADD_STAT(dmaRoutingTransientRecycles,
-               "Classified DMA requests recycled in a transient cache state"),
+               "Eligible DMA requests recycled in a transient cache state"),
       ADD_STAT(ddioReplacementStalls,
-               "Classified DMA writes stalled for DDIO subset replacement"),
+               "Eligible DMA writes stalled for DDIO subset replacement"),
       ADD_STAT(writeStashRequests, "No-target write-stash requests at HN"),
       ADD_STAT(writeStashAccepted, "Write-stash hints accepted by HN policy"),
       ADD_STAT(writeStashDeclined, "Write-stash hints declined by HN policy"),
@@ -984,176 +871,14 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
                "Retained DDIO ownership requests sent to the directory"),
       ADD_STAT(ddioOwnershipAcks,
                "Retained DDIO ownership acknowledgements received"),
-      ADD_STAT(rxPayloadRequests,
-               "Number of NIC RX data DMA write line transactions"),
-      ADD_STAT(rxPayloadHits,
-               "Number of NIC RX data DMA writes hitting a present line"),
-      ADD_STAT(rxPayloadMisses,
-               "Number of NIC RX data DMA writes missing at acceptance"),
-      ADD_STAT(rxPayloadHitRate, "NIC RX data DMA write hit rate",
-               rxPayloadHits / (rxPayloadHits + rxPayloadMisses)),
-      ADD_STAT(rxPayloadHitWays, "Way histogram of RX data hits"),
-      ADD_STAT(rxPayloadAllocWays, "Way histogram of RX payload allocations"),
-      ADD_STAT(ddioAllocWays, "Way histogram of all NIC DDIO allocations"),
-      ADD_STAT(rdmaRxPayloadRequests,
-               "Number of PVRDMA RX payload write line transactions"),
-      ADD_STAT(rdmaRxPayloadHits,
-               "Number of PVRDMA RX payload writes hitting a present line"),
-      ADD_STAT(rdmaRxPayloadMisses,
-               "Number of PVRDMA RX payload writes missing at acceptance"),
-      ADD_STAT(rdmaRxPayloadHitRate, "PVRDMA RX payload write hit rate",
-               rdmaRxPayloadHits /
-                   (rdmaRxPayloadHits + rdmaRxPayloadMisses)),
-      ADD_STAT(rdmaRxPayloadHitWays,
-               "Way histogram of PVRDMA RX payload hits"),
-      ADD_STAT(rxHeaderRequests, "Number of NIC RX header DMA write line transactions"),
-      ADD_STAT(rxHeaderHits, "Number of NIC RX header DMA writes hitting a present line"),
-      ADD_STAT(rxHeaderMisses, "Number of NIC RX header DMA writes missing at acceptance"),
-      ADD_STAT(rxHeaderHitRate, "NIC RX header DMA write hit rate",
-               rxHeaderHits / (rxHeaderHits + rxHeaderMisses)),
-      ADD_STAT(txPayloadRequests,
-               "Number of NIC TX payload DMA read line transactions"),
-      ADD_STAT(txPayloadHits,
-               "Number of NIC TX payload DMA reads hitting a present line"),
-      ADD_STAT(txPayloadMisses,
-               "Number of NIC TX payload DMA reads missing"),
-      ADD_STAT(txPayloadHitRate, "NIC TX payload DMA read hit rate",
-               txPayloadHits / (txPayloadHits + txPayloadMisses)),
-      ADD_STAT(rdmaTxPayloadRequests,
-               "Number of PVRDMA TX payload read line transactions"),
-      ADD_STAT(rdmaTxPayloadHits,
-               "Number of PVRDMA TX payload reads hitting a present line"),
-      ADD_STAT(rdmaTxPayloadMisses,
-               "Number of PVRDMA TX payload reads missing"),
-      ADD_STAT(rdmaTxPayloadHitRate, "PVRDMA TX payload read hit rate",
-               rdmaTxPayloadHits /
-                   (rdmaTxPayloadHits + rdmaTxPayloadMisses)),
-      ADD_STAT(nicDmaRequests,
-               "NIC DMA requests by semantic source and operation "
-               "(CHI HNF only; unsupported in MESI)"),
-      ADD_STAT(nicDmaHits,
-               "NIC DMA hits by semantic source and operation"),
-      ADD_STAT(nicDmaMisses,
-               "NIC DMA misses by semantic source and operation"),
-      ADD_STAT(nicDmaRequestedBytes,
-               statistics::units::Byte::get(),
-               "NIC DMA requested bytes by semantic source and operation"),
-      ADD_STAT(nicDmaMergeReads,
-               "NIC DMA partial-write merge reads by semantic source and "
-               "operation"),
-      ADD_STAT(nicDmaMergeReadBytes,
-               statistics::units::Byte::get(),
-               "NIC DMA partial-write merge-read bytes by semantic source "
-               "and operation"),
-      ADD_STAT(nicDmaReadRequests,
-               "Number of NIC DMA read line transactions"),
-      ADD_STAT(nicDmaReadHits,
-               "Number of NIC DMA reads hitting a present line"),
-      ADD_STAT(nicDmaReadMisses,
-               "Number of NIC DMA reads missing at acceptance"),
-      ADD_STAT(nicDmaReadHitRate, "NIC DMA read hit rate",
-               nicDmaReadHits / (nicDmaReadHits + nicDmaReadMisses)),
-      ADD_STAT(nicDmaWriteRequests,
-               "Number of NIC DMA write line transactions"),
-      ADD_STAT(nicDmaWriteHits,
-               "Number of NIC DMA writes hitting a present line"),
-      ADD_STAT(nicDmaWriteMisses,
-               "Number of NIC DMA writes missing at acceptance"),
-      ADD_STAT(nicDmaWriteHitRate, "NIC DMA write hit rate",
-               nicDmaWriteHits / (nicDmaWriteHits + nicDmaWriteMisses)),
-      ADD_STAT(nicDescReadRequests,
-               "Number of NIC descriptor DMA read line transactions"),
-      ADD_STAT(nicDescReadHits,
-               "Number of NIC descriptor DMA reads hitting a present line"),
-      ADD_STAT(nicDescReadMisses,
-               "Number of NIC descriptor DMA reads missing at acceptance"),
-      ADD_STAT(nicDescReadHitRate, "NIC descriptor DMA read hit rate",
-               nicDescReadHits / (nicDescReadHits + nicDescReadMisses)),
-      ADD_STAT(nicDescWriteRequests,
-               "Number of NIC descriptor DMA write line transactions"),
-      ADD_STAT(nicDescWriteHits,
-               "Number of NIC descriptor DMA writes hitting a present line"),
-      ADD_STAT(nicDescWriteMisses,
-               "Number of NIC descriptor DMA writes missing at acceptance"),
-      ADD_STAT(nicDescWriteHitRate, "NIC descriptor DMA write hit rate",
-               nicDescWriteHits / (nicDescWriteHits + nicDescWriteMisses)),
+      ADD_STAT(ddioAllocWays, "Eligible DMA allocations in DDIO ways"),
       ADD_STAT(ddioWayAccess,
-               "Accesses per way by requester class (src x way)"),
+               "Eligible DMA accesses per way"),
       ADD_STAT(ddioWayFill,
-               "Allocations per way by requester class (src x way)"),
+               "Eligible DMA allocations per way"),
       ADD_STAT(wayDeallocations,
-               "Cache-entry deallocations per way (all causes)"),
-      ADD_STAT(rxPayloadCpuAccessWays,
-               "CPU/general hits to prior RX payload addresses by way"),
-      ADD_STAT(rxPayloadCpuFillWays,
-               "CPU/general fills of prior RX payload addresses by way"),
-      ADD_STAT(rxPayloadCpuUniqueLines,
-               "Prior RX payload lines touched by CPU/general requests"),
-      ADD_STAT(rdmaRxPayloadCpuAccessWays,
-               "CPU/general hits to prior PVRDMA RX payload addresses by way"),
-      ADD_STAT(rdmaRxPayloadCpuFillWays,
-               "CPU/general fills of prior PVRDMA RX payload addresses by way"),
-      ADD_STAT(rdmaRxPayloadCpuUniqueLines,
-               "Prior PVRDMA RX payload lines touched by CPU/general requests"),
-      ADD_STAT(rxPayloadSetHits, "RX payload hits per cache set"),
-      ADD_STAT(rxPayloadSetMisses, "RX payload misses per cache set"),
-      ADD_STAT(rxPayloadUniqueLines, "Unique RX payload line addresses"),
-      ADD_STAT(txPayloadUniqueLines, "Unique TX payload line addresses"),
-      ADD_STAT(rdmaRxPayloadUniqueLines,
-               "Unique PVRDMA RX payload line addresses"),
-      ADD_STAT(rdmaTxPayloadUniqueLines,
-               "Unique PVRDMA TX payload line addresses")
+               "Cache-entry deallocations per way (all causes)")
 {
-    static constexpr const char *SourceNames[] = {
-        "rx_payload", "rx_header", "rx_descriptor", "tx_payload",
-        "tx_descriptor"
-    };
-    static constexpr const char *OperationNames[] = {
-        "read", "write_full", "write_partial"
-    };
-    constexpr int NumSources =
-        static_cast<int>(NicDmaSource::NumSources);
-    constexpr int NumOperations =
-        static_cast<int>(NicDmaOperation::NumOperations);
-    static_assert(sizeof(SourceNames) / sizeof(SourceNames[0]) == NumSources);
-    static_assert(sizeof(OperationNames) / sizeof(OperationNames[0]) ==
-                  NumOperations);
-
-    constexpr int NumNicDmaStats = NumSources * NumOperations;
-    nicDmaRequests.init(NumNicDmaStats).flags(
-        statistics::nozero | statistics::total);
-    nicDmaHits.init(NumNicDmaStats).flags(
-        statistics::nozero | statistics::total);
-    nicDmaMisses.init(NumNicDmaStats).flags(
-        statistics::nozero | statistics::total);
-    nicDmaRequestedBytes.init(NumNicDmaStats).flags(
-        statistics::nozero | statistics::total);
-    nicDmaMergeReads.init(NumNicDmaStats).flags(
-        statistics::nozero | statistics::total);
-    nicDmaMergeReadBytes.init(NumNicDmaStats).flags(
-        statistics::nozero | statistics::total);
-    for (int source = 0; source < NumSources; ++source) {
-        for (int operation = 0; operation < NumOperations; ++operation) {
-            const int index = source * NumOperations + operation;
-            const std::string subname = csprintf(
-                "%s_%s", SourceNames[source], OperationNames[operation]);
-            nicDmaRequests.subname(index, subname);
-            nicDmaHits.subname(index, subname);
-            nicDmaMisses.subname(index, subname);
-            nicDmaRequestedBytes.subname(index, subname);
-            nicDmaMergeReads.subname(index, subname);
-            nicDmaMergeReadBytes.subname(index, subname);
-        }
-    }
-
-    rxPayloadHitRate.flags(statistics::nonan);
-    txPayloadHitRate.flags(statistics::nonan);
-    nicDmaReadHitRate.flags(statistics::nonan);
-    nicDmaWriteHitRate.flags(statistics::nonan);
-    nicDescReadHitRate.flags(statistics::nonan);
-    nicDescWriteHitRate.flags(statistics::nonan);
-    rdmaRxPayloadHitRate.flags(statistics::nonan);
-    rdmaTxPayloadHitRate.flags(statistics::nonan);
     numDataArrayReads
         .flags(statistics::nozero);
 
@@ -1218,10 +943,6 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
             ;
     }
 
-    // NOTE: the way-histogram vectors are sized in CacheMemory::init(),
-    // since m_cache_assoc is not yet set when this constructor runs. DDIO
-    // scalar zeros intentionally remain printable for strict test contracts.
-    rxHeaderHitRate.flags(statistics::nonan);
 }
 
 // assumption: SLICC generated files will only call this function
@@ -1390,229 +1111,6 @@ void
 CacheMemory::profileDemandMiss()
 {
     cacheMemoryStats.m_demand_misses++;
-}
-
-int
-CacheMemory::getNicDmaRequestSize(const RequestPtr &req) const
-{
-    classifyNicDmaSource(req);
-    panic_if(!req->hasSize(), "NIC DMA request must carry a valid size");
-    return req->getSize();
-}
-
-CacheMemory::NicDmaSource
-CacheMemory::classifyNicDmaSource(const RequestPtr &req)
-{
-    panic_if(!req, "Cannot classify a null NIC DMA request");
-    panic_if(!Request::hasOneNicDmaCategory(req->getFlags()),
-             "NIC DMA request must carry exactly one category flag");
-
-    if (req->isNicRxPayloadWrite())
-        return NicDmaSource::RxPayload;
-    if (req->isNicRxHeaderWrite())
-        return NicDmaSource::RxHeader;
-    if (req->isNicRxDescRead() || req->isNicRxDescWriteback())
-        return NicDmaSource::RxDescriptor;
-    if (req->isNicTxPayloadRead())
-        return NicDmaSource::TxPayload;
-    if (req->isNicTxDescRead() || req->isNicTxDescWriteback())
-        return NicDmaSource::TxDescriptor;
-
-    panic("Unsupported NIC DMA category");
-}
-
-CacheMemory::NicDmaOperation
-CacheMemory::classifyNicDmaOperation(const RequestPtr &req,
-                                     bool write_partial)
-{
-    const NicDmaSource source = classifyNicDmaSource(req);
-    const bool is_read = req->isNicDmaRead();
-    const bool is_write = req->isNicDmaWrite();
-    panic_if(is_read == is_write,
-             "NIC DMA category must be exclusively read or write");
-
-    if (is_read) {
-        panic_if(write_partial,
-                 "NIC DMA read cannot be classified as a partial write");
-        panic_if(source == NicDmaSource::RxPayload ||
-                     source == NicDmaSource::RxHeader,
-                 "RX payload/header categories only support writes");
-        return NicDmaOperation::Read;
-    }
-
-    panic_if(source == NicDmaSource::TxPayload,
-             "TX payload category only supports reads");
-    return write_partial ? NicDmaOperation::WritePartial
-                         : NicDmaOperation::WriteFull;
-}
-
-void
-CacheMemory::profileNicDma(Addr address, const RequestPtr &req,
-                           bool write_partial, int bytes)
-{
-    if (!req || (!req->isNicDmaRead() && !req->isNicDmaWrite()))
-        return;
-
-    const NicDmaSource source = classifyNicDmaSource(req);
-    const NicDmaOperation operation =
-        classifyNicDmaOperation(req, write_partial);
-    panic_if(bytes < 1 || bytes > m_block_size,
-             "NIC DMA requested bytes must be in [1, %d], got %d",
-             m_block_size, bytes);
-    panic_if(operation == NicDmaOperation::WriteFull &&
-                 bytes != m_block_size,
-             "Full NIC DMA write must request one block (%d bytes), got %d",
-             m_block_size, bytes);
-
-    const int index = nicDmaStatIndex(source, operation);
-    const bool hit = isTagPresent(address);
-    cacheMemoryStats.nicDmaRequests[index]++;
-    cacheMemoryStats.nicDmaRequestedBytes[index] += bytes;
-    if (hit) {
-        cacheMemoryStats.nicDmaHits[index]++;
-    } else {
-        cacheMemoryStats.nicDmaMisses[index]++;
-    }
-
-    // Preserve the compatibility direction and descriptor projections at the
-    // same acceptance-time tag state as before.
-    const bool is_read = operation == NicDmaOperation::Read;
-    const bool is_desc = source == NicDmaSource::RxDescriptor ||
-                         source == NicDmaSource::TxDescriptor;
-    if (is_read) {
-        cacheMemoryStats.nicDmaReadRequests++;
-        if (hit) {
-            cacheMemoryStats.nicDmaReadHits++;
-        } else {
-            cacheMemoryStats.nicDmaReadMisses++;
-        }
-        if (is_desc) {
-            cacheMemoryStats.nicDescReadRequests++;
-            if (hit) {
-                cacheMemoryStats.nicDescReadHits++;
-            } else {
-                cacheMemoryStats.nicDescReadMisses++;
-            }
-        }
-    } else {
-        cacheMemoryStats.nicDmaWriteRequests++;
-        if (hit) {
-            cacheMemoryStats.nicDmaWriteHits++;
-        } else {
-            cacheMemoryStats.nicDmaWriteMisses++;
-        }
-        if (is_desc) {
-            cacheMemoryStats.nicDescWriteRequests++;
-            if (hit) {
-                cacheMemoryStats.nicDescWriteHits++;
-            } else {
-                cacheMemoryStats.nicDescWriteMisses++;
-            }
-        }
-    }
-
-    // Preserve existing category-specific payload/header telemetry.
-    if (source == NicDmaSource::RxPayload) {
-        profileRxPayload(address);
-        if (req->isNicPvrdma())
-            profileRdmaRxPayload(address);
-    } else if (source == NicDmaSource::RxHeader) {
-        profileRxHeader(address);
-    } else if (source == NicDmaSource::TxPayload) {
-        profileTxPayload(address);
-        if (req->isNicPvrdma())
-            profileRdmaTxPayload(address);
-    }
-}
-
-void
-CacheMemory::profileNicDmaMergeRead(const RequestPtr &req)
-{
-    const NicDmaSource source = classifyNicDmaSource(req);
-    const NicDmaOperation operation =
-        classifyNicDmaOperation(req, true);
-    panic_if(operation != NicDmaOperation::WritePartial,
-             "NIC DMA merge read requires a partial write");
-
-    const int index = nicDmaStatIndex(source, operation);
-    cacheMemoryStats.nicDmaMergeReads[index]++;
-    cacheMemoryStats.nicDmaMergeReadBytes[index] += m_block_size;
-}
-
-void
-CacheMemory::profileRxPayload(Addr address)
-{
-    cacheMemoryStats.rxPayloadRequests++;
-    int64_t cacheSet = addressToCacheSet(address);
-    int loc = findTagInSet(cacheSet, address);
-    if (loc >= 0) {
-        cacheMemoryStats.rxPayloadHits++;
-        cacheMemoryStats.rxPayloadHitWays[loc]++;
-        cacheMemoryStats.rxPayloadSetHits[cacheSet]++;
-    } else {
-        cacheMemoryStats.rxPayloadMisses++;
-        cacheMemoryStats.rxPayloadSetMisses[cacheSet]++;
-    }
-    if (rxPayloadUniqueAddrs.insert(address).second)
-        cacheMemoryStats.rxPayloadUniqueLines++;
-    rxPayloadEverAddrs.insert(makeLineAddress(address));
-}
-
-void
-CacheMemory::profileRdmaRxPayload(Addr address)
-{
-    cacheMemoryStats.rdmaRxPayloadRequests++;
-    const int64_t cache_set = addressToCacheSet(address);
-    const int loc = findTagInSet(cache_set, address);
-    if (loc >= 0) {
-        cacheMemoryStats.rdmaRxPayloadHits++;
-        cacheMemoryStats.rdmaRxPayloadHitWays[loc]++;
-    } else {
-        cacheMemoryStats.rdmaRxPayloadMisses++;
-    }
-    if (rdmaRxPayloadUniqueAddrs.insert(address).second)
-        cacheMemoryStats.rdmaRxPayloadUniqueLines++;
-    const Addr line_address = makeLineAddress(address);
-    rxPayloadEverAddrs.insert(line_address);
-    rdmaRxPayloadEverAddrs.insert(line_address);
-}
-
-void
-CacheMemory::profileRxHeader(Addr address)
-{
-    cacheMemoryStats.rxHeaderRequests++;
-    const int64_t cacheSet = addressToCacheSet(address);
-    if (findTagInSet(cacheSet, address) >= 0) {
-        cacheMemoryStats.rxHeaderHits++;
-    } else {
-        cacheMemoryStats.rxHeaderMisses++;
-    }
-}
-
-void
-CacheMemory::profileTxPayload(Addr address)
-{
-    cacheMemoryStats.txPayloadRequests++;
-    if (isTagPresent(address)) {
-        cacheMemoryStats.txPayloadHits++;
-    } else {
-        cacheMemoryStats.txPayloadMisses++;
-    }
-    if (txPayloadUniqueAddrs.insert(address).second)
-        cacheMemoryStats.txPayloadUniqueLines++;
-}
-
-void
-CacheMemory::profileRdmaTxPayload(Addr address)
-{
-    cacheMemoryStats.rdmaTxPayloadRequests++;
-    if (isTagPresent(address)) {
-        cacheMemoryStats.rdmaTxPayloadHits++;
-    } else {
-        cacheMemoryStats.rdmaTxPayloadMisses++;
-    }
-    if (rdmaTxPayloadUniqueAddrs.insert(address).second)
-        cacheMemoryStats.rdmaTxPayloadUniqueLines++;
 }
 
 void

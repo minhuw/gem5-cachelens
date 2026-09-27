@@ -45,7 +45,6 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "base/statistics.hh"
@@ -76,41 +75,10 @@ class CacheMemory : public SimObject
   public:
     typedef RubyCacheParams Params;
     typedef std::shared_ptr<replacement_policy::ReplacementData> ReplData;
-    /** Semantic NIC DMA source, independent of transfer operation. */
-    enum class NicDmaSource : uint8_t
-    {
-        RxPayload = 0,
-        RxHeader,
-        RxDescriptor,
-        TxPayload,
-        TxDescriptor,
-        NumSources
-    };
-
-    /** NIC DMA operation classified from the accepted CHI request type. */
-    enum class NicDmaOperation : uint8_t
-    {
-        Read = 0,
-        WriteFull,
-        WritePartial,
-        NumOperations
-    };
-
-    static constexpr int
-    nicDmaStatIndex(NicDmaSource source, NicDmaOperation operation)
-    {
-        return static_cast<int>(source) *
-                   static_cast<int>(NicDmaOperation::NumOperations) +
-               static_cast<int>(operation);
-    }
-
     CacheMemory(const Params &p);
     ~CacheMemory();
 
     void init();
-    void resetStats() override;
-    void serialize(CheckpointOut &cp) const override;
-    void unserialize(CheckpointIn &cp) override;
 
     // Public Methods
     // perform a cache access and see if we hit or not.  Return true on a hit.
@@ -130,8 +98,7 @@ class CacheMemory : public SimObject
     bool cacheAvail(Addr address) const;
 
     // DDIO way-partitioned variants: like cacheAvail/allocate/cacheProbe,
-    // but only consider ways [0, ways). Used for NIC RX data fills so packet
-    // lines, including split headers, are confined to the DDIO way subset.
+    // but only consider ways [0, ways) for eligible DMA write fills.
     bool cacheAvailInWays(Addr address, int ways) const;
     AbstractCacheEntry* allocateInWays(Addr address,
                                        AbstractCacheEntry* new_entry,
@@ -328,119 +295,12 @@ class CacheMemory : public SimObject
           statistics::Scalar ddioOwnershipRequests;
           statistics::Scalar ddioOwnershipAcks;
 
-          // DDIO (NIC RX data DMA write) accounting. A request is a packet
-          // data line transaction seen by this cache; a hit means the line
-          // was already present at acceptance.
-          statistics::Scalar rxPayloadRequests;
-          statistics::Scalar rxPayloadHits;
-          statistics::Scalar rxPayloadMisses;
-          statistics::Formula rxPayloadHitRate;
-          statistics::Vector rxPayloadHitWays;
-          statistics::Vector rxPayloadAllocWays;
+          // Aggregate eligible DMA way accounting, without source metadata.
           statistics::Vector ddioAllocWays;
-
-          // PVRDMA subset of the aggregate RX payload accounting.
-          statistics::Scalar rdmaRxPayloadRequests;
-          statistics::Scalar rdmaRxPayloadHits;
-          statistics::Scalar rdmaRxPayloadMisses;
-          statistics::Formula rdmaRxPayloadHitRate;
-          statistics::Vector rdmaRxPayloadHitWays;
-
-          // RX header writes retain separate request/hit/miss telemetry.
-          statistics::Scalar rxHeaderRequests;
-          statistics::Scalar rxHeaderHits;
-          statistics::Scalar rxHeaderMisses;
-          statistics::Formula rxHeaderHitRate;
-
-          // NIC TX payload DMA read line-transaction accounting
-          statistics::Scalar txPayloadRequests;
-          statistics::Scalar txPayloadHits;
-          statistics::Scalar txPayloadMisses;
-          statistics::Formula txPayloadHitRate;
-
-          // PVRDMA subset of the aggregate TX payload accounting.
-          statistics::Scalar rdmaTxPayloadRequests;
-          statistics::Scalar rdmaTxPayloadHits;
-          statistics::Scalar rdmaTxPayloadMisses;
-          statistics::Formula rdmaTxPayloadHitRate;
-
-          // CHI HNF only; unsupported in MESI (zero is not a measurement).
-          // Generic NIC DMA accounting has orthogonal semantic-source and
-          // operation axes. The flattened index is source * 3 + operation,
-          // with sources RX payload, RX header, RX descriptor, TX payload,
-          // TX descriptor and operations read, write_full, write_partial.
-          // Subnames are <source>_<operation>. Hits/misses observe tag
-          // presence at HNF acceptance; requested bytes are exact enabled
-          // bytes in that line transaction. Merge reads count only memory
-          // ReadNoSnp operations needed to complete partial NIC writes.
-          statistics::Vector nicDmaRequests;
-          statistics::Vector nicDmaHits;
-          statistics::Vector nicDmaMisses;
-          statistics::Vector nicDmaRequestedBytes;
-          statistics::Vector nicDmaMergeReads;
-          statistics::Vector nicDmaMergeReadBytes;
-
-          // Compatibility NIC DMA counters retain their original names and
-          // semantics. Descriptor-only counters are subsets of the
-          // corresponding total read/write counters.
-          statistics::Scalar nicDmaReadRequests;
-          statistics::Scalar nicDmaReadHits;
-          statistics::Scalar nicDmaReadMisses;
-          statistics::Formula nicDmaReadHitRate;
-          statistics::Scalar nicDmaWriteRequests;
-          statistics::Scalar nicDmaWriteHits;
-          statistics::Scalar nicDmaWriteMisses;
-          statistics::Formula nicDmaWriteHitRate;
-          statistics::Scalar nicDescReadRequests;
-          statistics::Scalar nicDescReadHits;
-          statistics::Scalar nicDescReadMisses;
-          statistics::Formula nicDescReadHitRate;
-          statistics::Scalar nicDescWriteRequests;
-          statistics::Scalar nicDescWriteHits;
-          statistics::Scalar nicDescWriteMisses;
-          statistics::Formula nicDescWriteHitRate;
-
-          // Per-way, per-source accounting to understand eviction
-          // pressure on the DDIO ways.  Source classes:
-          //   0 = NIC RX payload write, 1 = NIC TX payload read,
-          //   2 = NIC descriptor DMA, 3 = CPU/other, 4 = NIC RX header.
-          // Each vector is [src][way] flattened (src*assoc + way).
           statistics::Vector ddioWayAccess;
           statistics::Vector ddioWayFill;
           statistics::Vector wayDeallocations;
-
-          // CPU/general transactions to addresses previously written as RX
-          // payload. These parameterize the processor-touch phase of the
-          // RX-only DDIO residency model without using RX hit outcomes.
-          statistics::Vector rxPayloadCpuAccessWays;
-          statistics::Vector rxPayloadCpuFillWays;
-          statistics::Scalar rxPayloadCpuUniqueLines;
-          statistics::Vector rdmaRxPayloadCpuAccessWays;
-          statistics::Vector rdmaRxPayloadCpuFillWays;
-          statistics::Scalar rdmaRxPayloadCpuUniqueLines;
-
-          // Per-set payload access counters (set-index imbalance of the
-          // payload stream on the DDIO ways).
-          statistics::Vector rxPayloadSetHits;
-          statistics::Vector rxPayloadSetMisses;
-
-          // Unique payload line addresses seen in the current stats window.
-          statistics::Scalar rxPayloadUniqueLines;
-          statistics::Scalar txPayloadUniqueLines;
-          statistics::Scalar rdmaRxPayloadUniqueLines;
-          statistics::Scalar rdmaTxPayloadUniqueLines;
       } cacheMemoryStats;
-
-      std::unordered_set<Addr> rxPayloadUniqueAddrs;
-      std::unordered_set<Addr> txPayloadUniqueAddrs;
-      std::unordered_set<Addr> rdmaRxPayloadUniqueAddrs;
-      std::unordered_set<Addr> rdmaTxPayloadUniqueAddrs;
-      std::unordered_set<Addr> rxPayloadCpuUniqueAddrs;
-      std::unordered_set<Addr> rdmaRxPayloadCpuUniqueAddrs;
-      // Unlike the per-window uniqueness sets, retain these across a stats
-      // reset so post-reset CPU touches to warmed payload buffers are visible.
-      std::unordered_set<Addr> rxPayloadEverAddrs;
-      std::unordered_set<Addr> rdmaRxPayloadEverAddrs;
 
     public:
       // These function increment the number of demand hits/misses by one
@@ -471,106 +331,23 @@ class CacheMemory : public SimObject
           cacheMemoryStats.ddioOwnershipAcks++;
       }
 
-      // DDIO accounting hooks (called from the CHI home node).
-      // profileNicDma classifies and counts one line transaction at request
-      // acceptance. Source comes only from Request flags; write extent and
-      // exact requested bytes come from the accepted CHI transaction.
-      // Compatibility payload/header/direction counters are updated at the
-      // same point. Allocation ways are recorded by profileDdioWayFill().
-      void profileNicDma(Addr address, const RequestPtr &req,
-                         bool write_partial, int bytes);
-      void profileNicDmaMergeRead(const RequestPtr &req);
       void profileWriteStash(bool accepted);
       void profileWriteStashAllocation();
-      int getNicDmaRequestSize(const RequestPtr &req) const;
-      static NicDmaSource classifyNicDmaSource(const RequestPtr &req);
-      static NicDmaOperation classifyNicDmaOperation(
-          const RequestPtr &req, bool write_partial);
-      void profileRxPayload(Addr address);
-      void profileRdmaRxPayload(Addr address);
-      void profileRxHeader(Addr address);
-      void profileTxPayload(Addr address);
-      void profileRdmaTxPayload(Addr address);
-
-      // Per-way, per-source accounting hooks (see CacheMemoryStats for
-      // the source classes).
-      void profileDdioWayAccess(int src, int way, Addr address)
+      void profileDdioWayAccess(int way)
       {
-          if (way >= 0) {
-              cacheMemoryStats.ddioWayAccess[src * m_cache_assoc + way]++;
-              if (src == 3 && rxPayloadEverAddrs.count(address)) {
-                  cacheMemoryStats.rxPayloadCpuAccessWays[way]++;
-                  if (rxPayloadCpuUniqueAddrs.insert(address).second)
-                      cacheMemoryStats.rxPayloadCpuUniqueLines++;
-              }
-              if (src == 3 && rdmaRxPayloadEverAddrs.count(address)) {
-                  cacheMemoryStats.rdmaRxPayloadCpuAccessWays[way]++;
-                  if (rdmaRxPayloadCpuUniqueAddrs.insert(address).second)
-                      cacheMemoryStats.rdmaRxPayloadCpuUniqueLines++;
-              }
-          }
+          if (way >= 0) cacheMemoryStats.ddioWayAccess[way]++;
       }
-      void profileDdioWayFill(int src, int way, Addr address)
+      void profileDdioWayFill(int way)
       {
           if (way >= 0) {
-              cacheMemoryStats.ddioWayFill[src * m_cache_assoc + way]++;
-              if (m_ddio_way_part > 0 && way < m_ddio_way_part &&
-                  (src == 0 || src == 2 || src == 4)) {
+              cacheMemoryStats.ddioWayFill[way]++;
+              if (m_ddio_way_part > 0 && way < m_ddio_way_part)
                   cacheMemoryStats.ddioAllocWays[way]++;
-                  if (src == 0)
-                      cacheMemoryStats.rxPayloadAllocWays[way]++;
-              }
-              if (src == 3 && rxPayloadEverAddrs.count(address)) {
-                  cacheMemoryStats.rxPayloadCpuFillWays[way]++;
-                  if (rxPayloadCpuUniqueAddrs.insert(address).second)
-                      cacheMemoryStats.rxPayloadCpuUniqueLines++;
-              }
-              if (src == 3 && rdmaRxPayloadEverAddrs.count(address)) {
-                  cacheMemoryStats.rdmaRxPayloadCpuFillWays[way]++;
-                  if (rdmaRxPayloadCpuUniqueAddrs.insert(address).second)
-                      cacheMemoryStats.rdmaRxPayloadCpuUniqueLines++;
-              }
           }
-      }
-
-      // NIC DMA classification helpers (SLICC-visible; the gem5 Request
-      // carries the NIC category flags end-to-end as seqReq).
-      bool isNicRxWriteReq(const RequestPtr &req) const
-      {
-          return req &&
-              (req->isNicRxPayloadWrite() || req->isNicRxHeaderWrite());
-      }
-      bool isNicDdioWriteReq(const RequestPtr &req) const
-      {
-          return req && req->isNicDmaWrite();
-      }
-      bool isNicRxPayloadWriteReq(const RequestPtr &req) const
-      {
-          return req && req->isNicRxPayloadWrite();
-      }
-      bool isNicRxHeaderWriteReq(const RequestPtr &req) const
-      {
-          return req && req->isNicRxHeaderWrite();
-      }
-      bool isNicDdioReadReq(const RequestPtr &req) const
-      {
-          return req && req->isNicDmaRead();
-      }
-      bool isNicTxPayloadReadReq(const RequestPtr &req) const
-      {
-          return req && req->isNicTxPayloadRead();
-      }
-      bool isNicPvrdmaReq(const RequestPtr &req) const
-      {
-          return req && req->isNicPvrdma();
       }
       bool ddioWriteNeedsRead(bool partial, bool data_valid) const
       {
           return partial && !data_valid;
-      }
-      bool isNicDescDmaReq(const RequestPtr &req) const
-      {
-          return req && req->isNicDescDma();
       }
 };
 

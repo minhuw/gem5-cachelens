@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Eligible CHI requests need neither category tags nor a seqReq pointer."""
+"""Eligible CHI requests need neither semantic tags."""
 from m5.stats.gem5stats import get_simstat
 from m5.tlm_chi import ReqOpcode, Size
 
@@ -32,14 +32,11 @@ def test_generators(generators):
 
 
 def check(system):
+    # Data bytes, masks, snoops and completion ordering are checked above.
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
     fills = vector_values(find_stat(stats, "ddioWayFill"))
     accesses = vector_values(find_stat(stats, "ddioWayAccess"))
-    assoc = len(fills) // 5
-    untagged = fills[3 * assoc : 4 * assoc]
-    assert sum(fills) == sum(untagged) == 2, fills
-    assert all(v == 0 for v in untagged[ddio_way_part:]), untagged
+    assert sum(fills) == 2, fills
+    assert all(v == 0 for v in fills[ddio_way_part:]), fills
     assert sum(accesses) == 2, accesses
-    assert sum(vector_values(find_stat(stats, "nicDmaRequests"))) == 0
-    assert sum(vector_values(find_stat(stats, "nicDmaMergeReads"))) == 0
-    print("Untagged full/partial retention and read no-allocation passed")
+    print("Untagged CHI data/coherence and aggregate accounting passed")

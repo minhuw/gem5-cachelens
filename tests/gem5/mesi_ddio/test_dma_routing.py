@@ -77,19 +77,13 @@ class DMARoutingStatsVerifier(verifier.Verifier):
 
     def _check_classified(self, stats):
         per_bank = {
-            "dmaRoutingProxyRequests": 0,
-            "dmaRoutingTransientRecycles": 0,
-            "ddioReplacementStalls": 0,
-            "ddioOwnershipRequests": 1,
-            "ddioOwnershipAcks": 1,
-            "rxPayloadRequests": 1,
-            "rxPayloadHits": 0,
-            "rxPayloadMisses": 1,
-            "txPayloadRequests": 1,
-            "txPayloadHits": 1,
-            "txPayloadMisses": 0,
-            "ddioWayFill::nic_rx_payload_way0": 1,
-            "ddioWayAccess::nic_tx_payload_way0": 1,
+            'dmaRoutingProxyRequests': 0,
+            'dmaRoutingTransientRecycles': 0,
+            'ddioReplacementStalls': 0,
+            'ddioOwnershipRequests': 1,
+            'ddioOwnershipAcks': 1,
+            'ddioWayFill::way0': 1,
+            'ddioWayAccess::way0': 1,
         }
         for bank in range(self._l2_banks):
             prefix = f"system.ruby.l2_cntrl{bank}.L2cache."
@@ -158,8 +152,6 @@ class DMARoutingStatsVerifier(verifier.Verifier):
                 "ddioReplacementStalls",
                 "ddioOwnershipRequests",
                 "ddioOwnershipAcks",
-                "rxPayloadRequests",
-                "txPayloadRequests",
             ):
                 observed = self._integer_stat(stats, prefix + suffix)
                 if observed != 0:
@@ -228,8 +220,7 @@ def _register_generic(name, l2_banks):
         config_args=(
             "--num-cpus=2",
             "--num-dmas=1",
-            "--num-nic-dmas=0",
-            f"--num-l2caches={l2_banks}",
+                        f"--num-l2caches={l2_banks}",
             "--maxloads=0",
             f"--dma-maxloads={max_reads}",
             "--tester-size=64",

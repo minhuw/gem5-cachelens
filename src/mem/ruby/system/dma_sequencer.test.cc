@@ -83,7 +83,7 @@ TEST(DMASequencerFragmentTest, SplitsCrossLineAccessExactly)
     constexpr Addr Start = 0x103c;
     constexpr int Length = 70;
     constexpr int BlockSize = 64;
-    auto request = makeRequest(Start, Request::NIC_RX_PAYLOAD_WRITE);
+    auto request = makeRequest(Start, 0);
     const auto byte_enable = allEnabled(Length);
 
     auto first = makeDMARequestFragment(
@@ -172,56 +172,20 @@ TEST(DMASequencerFragmentTest, MapsCrossLineSparseDataToPhysicalOffsets)
     expectMask(second.accessMask, {1, 5});
 }
 
-TEST(DMASequencerFragmentTest, PreservesNicAndGenericProvenance)
+TEST(DMASequencerFragmentTest, PreservesRequestPointerAndFlags)
 {
-    constexpr Addr Address = 0x2003;
-    constexpr int Length = 80;
-    constexpr int BlockSize = 64;
-    const auto byte_enable = allEnabled(Length);
-
-    auto payload = makeRequest(
-        Address, Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA);
-    auto payload_fragment = makeDMARequestFragment(
-        Address, Length, 61, BlockSize, payload, byte_enable);
-    ASSERT_EQ(payload_fragment.seqReq, payload);
-    EXPECT_TRUE(payload_fragment.seqReq->isNicRxPayloadWrite());
-    EXPECT_TRUE(payload_fragment.seqReq->isNicPvrdma());
-    EXPECT_TRUE(Request::hasOneNicDmaCategory(
-        payload_fragment.seqReq->getFlags()));
-
-    auto header = makeRequest(Address, Request::NIC_RX_HEADER_WRITE);
-    auto header_fragment = makeDMARequestFragment(
-        Address, Length, 61, BlockSize, header, byte_enable);
-    ASSERT_EQ(header_fragment.seqReq, header);
-    EXPECT_TRUE(header_fragment.seqReq->isNicRxHeaderWrite());
-
-    auto tx_payload = makeRequest(
-        Address, Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA);
-    auto tx_fragment = makeDMARequestFragment(
-        Address, Length, 61, BlockSize, tx_payload, byte_enable);
-    ASSERT_EQ(tx_fragment.seqReq, tx_payload);
-    EXPECT_TRUE(tx_fragment.seqReq->isNicTxPayloadRead());
-    EXPECT_TRUE(tx_fragment.seqReq->isNicPvrdma());
-    EXPECT_TRUE(Request::hasOneNicDmaCategory(
-        tx_fragment.seqReq->getFlags()));
-
-    auto descriptor = makeRequest(Address, Request::NIC_TX_DESC_WRITEBACK);
-    auto descriptor_fragment = makeDMARequestFragment(
-        Address, Length, 61, BlockSize, descriptor, byte_enable);
-    ASSERT_EQ(descriptor_fragment.seqReq, descriptor);
-    EXPECT_TRUE(descriptor_fragment.seqReq->isNicDescDma());
-
-    auto generic = makeRequest(Address, Request::UNCACHEABLE);
-    auto generic_fragment = makeDMARequestFragment(
-        Address, Length, 61, BlockSize, generic, byte_enable);
-    ASSERT_EQ(generic_fragment.seqReq, generic);
-    EXPECT_FALSE(generic_fragment.seqReq->isNicDmaRead());
-    EXPECT_FALSE(generic_fragment.seqReq->isNicDmaWrite());
-
-    auto no_provenance = makeDMARequestFragment(
-        Address, Length, 0, BlockSize, nullptr, byte_enable);
-    EXPECT_EQ(no_provenance.seqReq, nullptr);
-    expectContiguousMask(no_provenance.accessMask, 3, 61);
+    for (const Request::Flags flags : {Request::Flags(0),
+                                      Request::Flags(Request::UNCACHEABLE)}) {
+        auto request = makeRequest(0x2003, flags);
+        auto fragment = makeDMARequestFragment(
+            0x2003, 80, 61, 64, request, allEnabled(80));
+        ASSERT_EQ(fragment.seqReq, request);
+        EXPECT_EQ(fragment.seqReq->getFlags(), flags);
+    }
+    auto fragment = makeDMARequestFragment(
+        0x2003, 80, 0, 64, nullptr, allEnabled(80));
+    EXPECT_EQ(fragment.seqReq, nullptr);
+    expectContiguousMask(fragment.accessMask, 3, 61);
 }
 
 TEST(DMASequencerReservationTest, MapsEveryLineAndRejectsLaterOverlap)

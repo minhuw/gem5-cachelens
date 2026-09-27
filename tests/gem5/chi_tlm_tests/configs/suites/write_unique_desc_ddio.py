@@ -19,7 +19,6 @@ UPDATE = bytes(0xD0 + index for index in range(16))
 REQUEST_DATA = bytes(OFFSET) + UPDATE + bytes(64 - OFFSET - len(UPDATE))
 EXPECTED = ORIGINAL[:OFFSET] + UPDATE + ORIGINAL[OFFSET + len(UPDATE) :]
 
-nic_dma_categories = ["", "rx_desc_writeback", ""]
 ddio_eligible = [False, True, False]
 hnf_alloc_on_writeback = False
 ddio_way_part = 2
@@ -27,7 +26,7 @@ ddio_way_part = 2
 
 def test_generators(generators):
     seeder, writer, reader = generators
-    # This unclassified, no-allocation full write seeds backing memory without
+    # This noneligible, no-allocation full write seeds backing memory without
     # leaving an HNF copy for the partial DDIO write to merge against.
     schedule_write(
         seeder,
@@ -57,23 +56,9 @@ def test_generators(generators):
 
 
 def check(system):
+    # Data bytes, masks, snoops and completion ordering are checked above.
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
     allocations = vector_values(find_stat(stats, "ddioAllocWays"))
-    requests = vector_values(find_stat(stats, "nicDmaRequests"))
-    requested_bytes = vector_values(
-        find_stat(stats, "nicDmaRequestedBytes")
-    )
-    merge_reads = vector_values(find_stat(stats, "nicDmaMergeReads"))
-    merge_read_bytes = vector_values(
-        find_stat(stats, "nicDmaMergeReadBytes")
-    )
-    # Source 2 (RX descriptor), operation 2 (write_partial): 2 * 3 + 2.
-    assert requests[8] == 1, requests
-    assert requested_bytes[8] == 16, requested_bytes
-    assert merge_reads[8] == 1, merge_reads
-    assert merge_read_bytes[8] == 64, merge_read_bytes
     assert sum(allocations) == 1, allocations
-    assert all(
-        value == 0 for value in allocations[ddio_way_part:]
-    ), allocations
-    print("Partial clean-memory DDIO merge passed", allocations)
+    assert all(v == 0 for v in allocations[ddio_way_part:]), allocations
+    print("Untagged CHI data/coherence and aggregate accounting passed")

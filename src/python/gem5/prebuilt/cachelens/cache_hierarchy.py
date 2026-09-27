@@ -9,7 +9,7 @@ This module preserves the experiment topology used by the legacy CacheLens
 configuration: split L1 caches, a private L2 per core, cached HNFs, direct CHI
 requestors for every DMA port, and a simple-network crossbar. Checkpoint
 restores intentionally start with empty caches because Ruby cache traces do not
-preserve CacheLens provenance, placement, replacement, or telemetry state.
+preserve CacheLens placement or replacement state.
 """
 
 import math
@@ -483,7 +483,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             "ddio_way_part": self._ddio_way_part,
             "cache_stashing": self._cache_stashing,
             "cache_stashing_scope": (
-                "ARM CHI HNF only, all normal ways; RX payload writes only; "
+                "ARM CHI HNF acceptance only, all normal ways; explicit opcodes; "
                 "WriteUniqueFullStash/WriteUniquePtlStash without target; "
                 "no private target, DataPull, or StashOnce"
                 if self._cache_stashing == "hnf" else "disabled"
@@ -520,8 +520,8 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
     @overrides(AbstractCacheHierarchy)
     def incorporate_cache(self, board: AbstractBoard) -> None:
         super().incorporate_cache(board)
-        # Cache traces cannot reproduce CacheLens-specific NIC provenance,
-        # exact cache level/way/replacement state, or rxPayloadEverAddrs.
+        # Cache traces cannot reproduce CacheLens-specific placement,
+        # exact cache level/way/replacement state.
         # Checkpoint writeback has already published authoritative data to
         # backing memory, so restore an empty hierarchy and reset telemetry.
         self.ruby_system = RubySystem(cache_trace_warmup=False)
@@ -762,7 +762,6 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 board.get_clock_domain(),
             )
             controller.ddio_eligible = any(port is p for p in ddio_ports)
-            controller.emit_rx_write_stash = self._cache_stashing == "hnf"
             controller.sequencer = RubySequencer(
                 version=sequence_base + index,
                 in_ports=port,

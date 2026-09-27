@@ -29,10 +29,9 @@ complete set of hardware capabilities or model a particular DSU.
 
 **Native Ruby CHI, write-with-stash, no peer target, cached HNF/system cache.**
 
-The synthetic I/O bridge emits `WriteUniqueFullStash` or `WriteUniquePtlStash`
-for classified NIC RX payload writes. It does not add hints to descriptor,
-header, TX-read, or ordinary CPU requests. This is an explicit simulation
-policy, not a claim that an E1000 has architectural Arm stash registers.
+Only explicit `WriteUniqueFullStash` and `WriteUniquePtlStash` requests carry
+hints. Native NIC DMA and the SimBricks adapter issue ordinary reads/writes;
+there is no automatic payload-only emission or Request semantic classification.
 
 An accepting Home allocates through the normal coherent write/merge and cache
 fill/replacement paths. Full writes need no memory read for untouched bytes.
@@ -40,9 +39,9 @@ Partial writes preserve bytes outside the write, including newer data held by
 a dirty CPU owner. Existing coherence transactions invalidate conflicting
 private copies. No direct tag insertion bypasses the protocol.
 
-Stashed data uses **ordinary HNF cache ways**, not a DDIO-reserved subset. The
-source categorization and existing NIC/RDMA counters remain intact, but they
-do not turn Arm stashing into Intel DDIO. Acceptance is a placement policy,
+Stashed data uses **ordinary HNF cache ways**, not a DDIO-reserved subset.
+No source classification or NIC/RDMA cache counters are retained. Acceptance
+is a placement policy,
 not a guarantee that a line remains resident until a later CPU access.
 
 A declining Home processes the write normally. Independent `StashOnce` handling
@@ -62,9 +61,9 @@ partitioning disabled. The default is `cache_stashing="off"`. The prebuilt
 rejects stashing with x86 or MESI, or with positive `ddio_way_part`.
 Configuration metadata records the selected policy and supported scope.
 
-At controller level, `emit_rx_write_stash` controls bridge emission and
-`accept_write_stash` controls Home acceptance; both default to false. Setting
-Home acceptance false while leaving emission enabled tests legal hint decline.
+At controller level, `accept_write_stash` controls Home acceptance and defaults
+to false. `cache_stashing="hnf"` enables acceptance only; it does not cause a
+NIC to generate stash requests. `emit_rx_write_stash` has been removed.
 
 ## Observability
 
@@ -79,47 +78,12 @@ HNF `RubyCache` statistics:
 
 Requests equal accepted plus declined. Allocation is not incremented for a hit,
 a later CPU demand fill, or a retried message that has not been admitted.
-Existing NIC write-extent, merge-read, payload, and provenance counters provide
-additional checks; their legacy DDIO-related names are not hardware claims.
-
 ## Validation
 
-For an existing configured ARM/CHI build, enable the directed tester and run
-an asset-free clean-owner regression:
-
-```sh
-scons setconfig build/ARM_CHI USE_TEST_OBJECTS=y
-scons build/ARM_CHI/gem5.opt --without-tcmalloc -j16
-build/ARM_CHI/gem5.opt -d m5out-stash \
-  tests/gem5/cachelens/configs/chi_dma_directed.py \
-  --scenario stash_clean_owner --cache-stashing hnf
-```
-
-The 23 registered stash cases in `tests/gem5/cachelens/test_cachelens.py`
-passed with the production CacheLens hierarchy: full and partial writes,
-cold and dirty/clean-owner merges, sharer invalidation, all-way replacement,
-accepted/declined/off policies, excluded traffic, and synthetic RDMA provenance.
-Both inclusive and noninclusive HNF settings have runtime coverage. The
-clean-owner case enables the existing `fwd_unique_on_readshared` controller
-option to exercise retained `UC_RU` state; default shared-read behavior would
-not expose that corner case. Masks remain explicitly rejected, and hitting the
-simulation time limit must not be reported as success.
-
-These tests supplement, rather than replace, the existing ARM graph, MESI
-three-level, and hierarchy/runner unit regressions. They use data-port adapters,
-not instruction execution or a booted guest.
-
-## Explicit limits
-
-- No peer `StashNID`/`StashLPID` targets or private L1/L2 placement.
-- No stash snoops, DataPull, independent-stash ordering implementation, or
-  `StashOnceSep`/`StashDone` extension.
-- No TLM adapter or CHI wire-level conformance claim. This is a bounded native
-  Ruby protocol model, not merely a renamed DDIO setting.
-- Native RubySequencer still rejects byte-enabled sparse/zero-mask writes;
-  contiguous partial writes are supported.
-- No new ARM guest image, NIC driver ABI, ARM-board PVRDMA attachment, or
-  full-system accuracy result is implied. Synthetic RDMA-marked traffic can
-  test provenance without establishing ARM guest RDMA support.
-- Defaults preserve existing profiles. The implementation is opt-in; it does
-  not retroactively change old experiment results or packaged binaries.
+The native sequencer's historical synthetic auto-stash scenarios are retired.
+They are **not** preserved by sending hints for all writes. CHI-TLM suites
+`write_stash_explicit.py` and `write_stash_declined.py` inject actual full/partial
+stash opcodes and check written/untouched bytes and all four stash counters.
+They require the optional Arm TLM dependency; adding these suites is not a
+claim that a TLM runtime or a full-system NIC stash path has been verified.
+Ordinary native DMA regressions require zero stash requests.

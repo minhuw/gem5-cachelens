@@ -9,6 +9,6 @@ test -x "$binary"
 mkdir "$output" # Refuse to mix evidence with an existing run.
 output=$(realpath "$output")
 "$binary" -d "$output/configuration" "$root/configs/simbricks/i40e_accuracy.py" --mode configuration
-for scenario in hit_update nic_cpu_nic stash_unclassified; do
-    "$binary" -d "$output/$scenario" "$root/verification/accuracy/chi_payload_directed.py" --scenario "$scenario"
+for scenario in hit_update nic_cpu_nic eligible_untagged noneligible_dma; do
+    "$binary" -d "$output/$scenario" "$root/tests/gem5/cachelens/configs/chi_dma_directed.py" --scenario "$scenario"
 done

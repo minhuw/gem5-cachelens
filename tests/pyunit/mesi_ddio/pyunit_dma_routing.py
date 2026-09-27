@@ -415,27 +415,10 @@ class MESIDMARoutingTest(unittest.TestCase):
         implementation = _compact(
             _CACHE_MEMORY_CC.read_text(encoding="utf-8")
         )
-        for stat in (
-            "rxPayloadRequests",
-            "rxPayloadHits",
-            "rxPayloadMisses",
-            "rxHeaderRequests",
-            "rxHeaderHits",
-            "rxHeaderMisses",
-            "txPayloadRequests",
-            "txPayloadHits",
-            "txPayloadMisses",
-        ):
-            self.assertNotIn(
-                f"{stat}.flags(statistics::nozero);", implementation
-            )
-
         vector_sizes = {
-            "rxPayloadHitWays": "m_cache_assoc",
-            "rxPayloadAllocWays": "m_cache_assoc",
             "ddioAllocWays": "m_cache_assoc",
-            "ddioWayAccess": "5*m_cache_assoc",
-            "ddioWayFill": "5*m_cache_assoc",
+            "ddioWayAccess": "m_cache_assoc",
+            "ddioWayFill": "m_cache_assoc",
             "wayDeallocations": "m_cache_assoc",
         }
         for vector, size in vector_sizes.items():
@@ -443,14 +426,6 @@ class MESIDMARoutingTest(unittest.TestCase):
                 f"{vector}.init({size}).flags(statistics::total);",
                 implementation,
             )
-
-    def test_nic_dma_memtest_rejects_atomic_system_mode(self) -> None:
-        memtest = _compact(_MEMTEST.read_text(encoding="utf-8"))
-        self.assertIn(
-            "fatal_if(nicDma&&(atomic||percentFunctional!=0||"
-            "percentUncacheable!=0||percentAtomic!=0)",
-            memtest,
-        )
 
     def test_directory_responses_target_original_dma_and_line_address(
         self,

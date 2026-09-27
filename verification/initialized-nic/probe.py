@@ -37,7 +37,7 @@ system.host = GenericPciHost(platform=system.platform, conf_base=0x20000000,
 system.eth = SimBricksEthernet(uxsocket_path=args.eth, shm_path='', sync=True,
                                initialized_checkpoint=True, link_latency=args.latency)
 system.dev = SimBricksCheckpointTester(host=system.host, pci_bus=0, pci_dev=1,
-    pci_func=0, uxsocket_path=args.pci, sync=True, semantic_dma=True, initialized_checkpoint=True,
+    pci_func=0, uxsocket_path=args.pci, sync=True, initialized_checkpoint=True,
     link_latency=args.latency,
     checkpoint_ethernet=system.eth, restore_probe=args.restore)
 system.dev.pio = system.bus.mem_side_ports

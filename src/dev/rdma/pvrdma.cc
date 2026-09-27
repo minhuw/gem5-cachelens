@@ -12,6 +12,19 @@
 namespace gem5
 {
 
+Pvrdma::DmaStats::DmaStats(statistics::Group *parent)
+    : statistics::Group(parent, "dma"),
+      ADD_STAT(descDmaReads, statistics::units::Count::get(), "descDmaReads issued by device"),
+      ADD_STAT(descDmaWrites, statistics::units::Count::get(), "descDmaWrites issued by device"),
+      ADD_STAT(descDmaRdBytes, statistics::units::Byte::get(), "descDmaRdBytes issued by device"),
+      ADD_STAT(descDmaWrBytes, statistics::units::Byte::get(), "descDmaWrBytes issued by device"),
+      ADD_STAT(payloadDmaReads, statistics::units::Count::get(), "payloadDmaReads issued by device"),
+      ADD_STAT(payloadDmaWrites, statistics::units::Count::get(), "payloadDmaWrites issued by device"),
+      ADD_STAT(payloadDmaRdBytes, statistics::units::Byte::get(), "payloadDmaRdBytes issued by device"),
+      ADD_STAT(payloadDmaWrBytes, statistics::units::Byte::get(), "payloadDmaWrBytes issued by device")
+{
+}
+
 Pvrdma::TransportStats::TransportStats(Pvrdma &parent)
     : statistics::Group(&parent, "transport"), device(parent),
       ADD_STAT(txDataFramesAccepted, statistics::units::Count::get(),
@@ -173,7 +186,7 @@ Pvrdma::Pvrdma(const Params &p)
       companionMacWordSwap(p.companion_mac_word_swap),
       controlCompletionLatency(p.control_completion_latency),
       transportWindowSegments(p.transport_window_segments),
-      transportStats(*this), queueStats(*this),
+      dmaStats(this), transportStats(*this), queueStats(*this),
       dsrReadEvent([this] { dsrReadDone(); }, name() + ".dsrRead"),
       capsWriteEvent([this] { capsWriteDone(); }, name() + ".capsWrite"),
       commandReadEvent([this] { commandReadDone(); }, name() + ".commandRead"),
@@ -545,7 +558,7 @@ Pvrdma::startObservation()
     }
 
     queueDma.ring = {};
-    dmaRead(pciToDma(queueDma.ringAddress), sizeof(queueDma.ring),
+    descRead(pciToDma(queueDma.ringAddress), sizeof(queueDma.ring),
             sys->isAtomicMode() ? nullptr : &queueDmaEvent,
             reinterpret_cast<uint8_t *>(&queueDma.ring));
     if (sys->isAtomicMode())
@@ -2248,17 +2261,30 @@ Pvrdma::startInbound()
 
 void
 Pvrdma::startTransportDma(bool write, uint64_t address, size_t size,
-                          uint8_t *data, Request::Flags flags)
+                          uint8_t *data, bool payload)
 {
     panic_if(transport.dmaBusy || dmaPending(),
              "PVRDMA overlapping transport DMA");
-    assert(!flags || (write ? Request::isValidNicDmaWriteFlags(flags) :
-                              Request::isValidNicDmaReadFlags(flags)));
+    if (payload) {
+        if (write) {
+            dmaStats.payloadDmaWrites++;
+            dmaStats.payloadDmaWrBytes += size;
+        } else {
+            dmaStats.payloadDmaReads++;
+            dmaStats.payloadDmaRdBytes += size;
+        }
+    } else if (write) {
+        dmaStats.descDmaWrites++;
+        dmaStats.descDmaWrBytes += size;
+    } else {
+        dmaStats.descDmaReads++;
+        dmaStats.descDmaRdBytes += size;
+    }
     transport.dmaBusy = true;
     dmaPort.dmaAction(write ? MemCmd::WriteReq : MemCmd::ReadReq,
                       pciToDma(address), size,
                       sys->isAtomicMode() ? nullptr : &transportDmaEvent,
-                      data, 0, flags);
+                      data, 0);
     if (sys->isAtomicMode())
         transportDmaDone();
 }
@@ -2303,7 +2329,7 @@ Pvrdma::startPayloadDma(bool write)
     startTransportDma(write, chunk.address + transport.chunkOffset,
                       transport.dmaChunkLength,
                       transport.payload.data() + transport.dmaPayloadOffset,
-                      pvrdma::payloadDmaFlags(write));
+                      true);
 }
 
 void
@@ -2942,7 +2968,7 @@ Pvrdma::transportDmaDone()
         startTransportDma(false, chunk.address + send.chunkOffset,
                           send.dmaChunkLength,
                           send.payload.data() + send.dmaPayloadOffset,
-                          pvrdma::payloadDmaFlags(false));
+                          true);
         return;
     }
     const auto receive_segment_done = [this] {
@@ -3222,7 +3248,7 @@ Pvrdma::startCompletion()
     const auto &cq = completionQueues.entries[completionDma.record.cqHandle];
     completionDma.stage = CompletionDmaState::Stage::ReadCqRing;
     completionDma.ring = {};
-    dmaRead(pciToDma(cq.pages[0] + offsetof(pvrdma::RingState, rx)),
+    descRead(pciToDma(cq.pages[0] + offsetof(pvrdma::RingState, rx)),
             sizeof(completionDma.ring),
             sys->isAtomicMode() ? nullptr : &completionDmaEvent,
             reinterpret_cast<uint8_t *>(&completionDma.ring));
@@ -3311,7 +3337,7 @@ Pvrdma::completionDmaDone()
         completionDma.cqe = pvrdma::encodeCompletion(completionDma.record);
         completionDma.stage = Stage::WriteCqe;
         const uint32_t offset = completionDma.cqSlot * pvrdma::CqeSize;
-        dmaWrite(pciToDma(cq.pages[1 + offset / pvrdma::PageSize] +
+        descWrite(pciToDma(cq.pages[1 + offset / pvrdma::PageSize] +
                           offset % pvrdma::PageSize),
                  sizeof(completionDma.cqe),
                  sys->isAtomicMode() ? nullptr : &completionDmaEvent,
@@ -3322,7 +3348,7 @@ Pvrdma::completionDmaDone()
       }
       case Stage::WriteCqe:
         completionDma.stage = Stage::PublishCqProducer;
-        dmaWrite(pciToDma(cq.pages[0] +
+        descWrite(pciToDma(cq.pages[0] +
                           offsetof(pvrdma::RingState, rx) +
                           offsetof(pvrdma::Ring, producerTail)),
                  sizeof(completionDma.cqProducerLe),
@@ -3362,7 +3388,7 @@ Pvrdma::startDsr()
     operationError.begin(regs.error);
     capabilities = pvrdma::makeCapabilities(regs.macLow, regs.macHigh);
     dsrDmaAddress = pciToDma(regs.dsrAddress);
-    dmaRead(dsrDmaAddress, sizeof(dsr),
+    descRead(dsrDmaAddress, sizeof(dsr),
             sys->isAtomicMode() ? nullptr : &dsrReadEvent,
             reinterpret_cast<uint8_t *>(&dsr));
     if (sys->isAtomicMode())
@@ -3387,7 +3413,7 @@ Pvrdma::dsrReadDone()
     responseSlotDmaAddress = pciToDma(responseSlotAddress);
     panic_if(!pvrdma::finishDsrRead(controlState, true),
              "PVRDMA completed DSR read in invalid state");
-    dmaWrite(dsrDmaAddress + offsetof(pvrdma::DeviceSharedRegion, caps),
+    descWrite(dsrDmaAddress + offsetof(pvrdma::DeviceSharedRegion, caps),
              sizeof(capabilities),
              sys->isAtomicMode() ? nullptr : &capsWriteEvent,
              reinterpret_cast<uint8_t *>(&capabilities));
@@ -3452,7 +3478,7 @@ Pvrdma::startCommand(uint32_t value)
     }
 
     operationError.begin(regs.error);
-    dmaRead(commandSlotDmaAddress, sizeof(command),
+    descRead(commandSlotDmaAddress, sizeof(command),
             sys->isAtomicMode() ? nullptr : &commandReadEvent,
             reinterpret_cast<uint8_t *>(&command));
     if (sys->isAtomicMode())
@@ -3499,7 +3525,7 @@ Pvrdma::commandReadDone()
             operationDone();
             return;
         }
-        dmaWrite(responseSlotDmaAddress, sizeof(response),
+        descWrite(responseSlotDmaAddress, sizeof(response),
                  sys->isAtomicMode() ? nullptr : &responseWriteEvent,
                  reinterpret_cast<uint8_t *>(&response));
         if (sys->isAtomicMode())
@@ -3593,7 +3619,7 @@ Pvrdma::commandReadDone()
         return;
     }
 
-    dmaWrite(responseSlotDmaAddress, sizeof(response),
+    descWrite(responseSlotDmaAddress, sizeof(response),
              sys->isAtomicMode() ? nullptr : &responseWriteEvent,
              reinterpret_cast<uint8_t *>(&response));
     if (sys->isAtomicMode())
@@ -3640,7 +3666,7 @@ Pvrdma::startObjectCreate(pvrdma::PendingCreateKind kind)
         objectTable = {};
         objectTables.clear();
         objectTableIndex = 0;
-        dmaWrite(responseSlotDmaAddress, sizeof(response),
+        descWrite(responseSlotDmaAddress, sizeof(response),
                  sys->isAtomicMode() ? nullptr : &responseWriteEvent,
                  reinterpret_cast<uint8_t *>(&response));
         if (sys->isAtomicMode())
@@ -3652,7 +3678,7 @@ Pvrdma::startObjectCreate(pvrdma::PendingCreateKind kind)
              "PVRDMA began object directory read in invalid state");
     objectDirectory = {};
     auto &build = pendingPageBuild();
-    dmaRead(pciToDma(build.pageDirectoryDma), sizeof(objectDirectory),
+    descRead(pciToDma(build.pageDirectoryDma), sizeof(objectDirectory),
             sys->isAtomicMode() ? nullptr : &objectDirectoryReadEvent,
             reinterpret_cast<uint8_t *>(objectDirectory.data()));
     if (sys->isAtomicMode())
@@ -3693,7 +3719,7 @@ Pvrdma::startObjectTableRead()
                  objectTableIndex >= objectTables.size(),
              "PVRDMA started invalid object table read");
     objectTable = {};
-    dmaRead(pciToDma(objectTables[objectTableIndex]), sizeof(objectTable),
+    descRead(pciToDma(objectTables[objectTableIndex]), sizeof(objectTable),
             sys->isAtomicMode() ? nullptr : &objectTableReadEvent,
             reinterpret_cast<uint8_t *>(objectTable.data()));
     if (sys->isAtomicMode())
@@ -3774,7 +3800,7 @@ Pvrdma::finishObjectCreate(bool success)
     objectTable = {};
     objectTables.clear();
     objectTableIndex = 0;
-    dmaWrite(responseSlotDmaAddress, sizeof(response),
+    descWrite(responseSlotDmaAddress, sizeof(response),
              sys->isAtomicMode() ? nullptr : &responseWriteEvent,
              reinterpret_cast<uint8_t *>(&response));
     if (sys->isAtomicMode())

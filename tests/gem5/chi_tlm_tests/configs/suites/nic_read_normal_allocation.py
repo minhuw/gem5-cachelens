@@ -14,7 +14,6 @@ from chi_tlm_test_utils import (
 ADDRESS = 0x80000000
 EXPECTED = bytes(64)
 
-nic_dma_categories = ["tx_payload_read"]
 ddio_eligible = [False]
 nic_read_no_allocate = True  # Must not opt a noneligible requestor into DDIO.
 hnf_enable_dmt = False
@@ -42,21 +41,9 @@ def test_generators(generators):
 
 
 def check(system):
+    # Data bytes, masks, snoops and completion ordering are checked above.
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
-    fills = vector_values(find_stat(stats, "ddioWayFill"))
-    accesses = vector_values(find_stat(stats, "ddioWayAccess"))
-    assoc = len(fills) // 5
-    tx_fills = fills[assoc : 2 * assoc]
-    tx_accesses = accesses[assoc : 2 * assoc]
-    requests = vector_values(find_stat(stats, "nicDmaRequests"))
-    requested_bytes = vector_values(
-        find_stat(stats, "nicDmaRequestedBytes")
-    )
-    assert sum(tx_fills) == 1, tx_fills
-    assert sum(tx_accesses) == 1, tx_accesses
-    assert requests[9] == 2, requests
-    assert requested_bytes[9] == 80, requested_bytes
-    # The direct TLM path preserves this size in seqReq. Real NIC requests
-    # rely on the RNI forwarding that original seqReq even when CHI accSize is
-    # expanded to a full block.
-    print("Normal generic NIC-read allocation, size, and data checks passed")
+    assert sum(vector_values(find_stat(stats, "ddioWayFill"))) == 0
+    assert find_stat(stats, "m_demand_misses") == 1
+    assert find_stat(stats, "m_demand_hits") == 1
+    print("Untagged CHI data/coherence and aggregate accounting passed")

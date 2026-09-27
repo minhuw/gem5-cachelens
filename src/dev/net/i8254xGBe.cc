@@ -1552,10 +1552,9 @@ IGbE::DescCache<T>::writeback1()
 
 
     assert(wbOut);
-    igbe->dmaWriteCategorized(pciToDma(descBase() + descHead() * sizeof(T)),
+    igbe->descWrite(pciToDma(descBase() + descHead() * sizeof(T)),
                               wbOut * sizeof(T), &wbEvent,
-                              (uint8_t *)wbBuf, igbe->wbCompDelay,
-                              descWritebackCategory());
+                              (uint8_t *)wbBuf, igbe->wbCompDelay);
 }
 
 template<class T>
@@ -1618,10 +1617,9 @@ IGbE::DescCache<T>::fetchDescriptors1()
             pciToDma(descBase() + cachePnt * sizeof(T)),
             curFetching * sizeof(T));
     assert(curFetching);
-    igbe->dmaReadCategorized(pciToDma(descBase() + cachePnt * sizeof(T)),
+    igbe->descRead(pciToDma(descBase() + cachePnt * sizeof(T)),
                              curFetching * sizeof(T), &fetchEvent,
-                             (uint8_t *)fetchBuf, igbe->fetchCompDelay,
-                             descFetchCategory());
+                             (uint8_t *)fetchBuf, igbe->fetchCompDelay);
 }
 
 template<class T>
@@ -2667,10 +2665,9 @@ IGbE::TxDescCache::actionAfterWb()
         DPRINTF(EthernetDesc,
                 "Completion writing back value: %d to addr: %#x\n", descEnd,
                 completionAddress);
-        igbe->dmaWriteCategorized(
+        igbe->descWrite(
             pciToDma(mbits(completionAddress, 63, 2)), sizeof(descEnd),
-            &nullEvent, (uint8_t *)&descEnd, 0,
-            Request::NIC_TX_DESC_WRITEBACK);
+            &nullEvent, (uint8_t *)&descEnd, 0);
     }
 }
 

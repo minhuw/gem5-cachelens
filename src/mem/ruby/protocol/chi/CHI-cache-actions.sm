@@ -263,12 +263,12 @@ action(Initiate_Request, desc="") {
   DirEntry dir_entry := getDirEntry(address);
   copyCacheAndDir(cache_entry, dir_entry, tbe, initial);
 
-  // Per-way, per-source accounting: record accesses that hit a line in a
+  // Aggregate eligible-DMA accounting: record accesses that hit a line in a
   // DDIO way (once per transaction).
-  if (is_HN && !tbe.ddio_access_profiled && is_valid(cache_entry)) {
+  if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.ddio_access_profiled && is_valid(cache_entry)) {
     tbe.ddio_access_profiled := true;
     cache.profileDdioWayAccess(
-        ddioSrcClass(tbe), cache_entry.getWay(), address);
+        cache_entry.getWay());
   }
 
   tbe.use_DMT := is_HN && enable_DMT;
@@ -323,10 +323,10 @@ action(Initiate_Request_Stale, desc="") {
 
   // Stale requests still access a physically present cache entry. Account for
   // that access with the same exactly-once semantics as ordinary requests.
-  if (is_HN && !tbe.ddio_access_profiled && is_valid(cache_entry)) {
+  if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.ddio_access_profiled && is_valid(cache_entry)) {
     tbe.ddio_access_profiled := true;
     cache.profileDdioWayAccess(
-        ddioSrcClass(tbe), cache_entry.getWay(), address);
+        cache_entry.getWay());
   }
 
   // usually we consider data locally invalid on RU states even if we
@@ -1123,7 +1123,7 @@ action(Initiate_WriteUnique_Writeback, desc="") {
       !acceptedWriteStash(tbe);
   bool ddio_fill := acceptedWriteStash(tbe) ||
       (tbe.is_ddio_write && cache.getDDIOWayPart() > 0);
-  if (no_ddio) {
+  if (no_ddio || sparseWriteThrough(tbe)) {
     tbe.use_DMT := false;
     tbe.doCacheFill := false;
     tbe.dataToBeInvalid := true;
@@ -1188,7 +1188,7 @@ action(Initiate_WriteUnique_PartialWrite, desc="") {
   bool ddio_fill := acceptedWriteStash(tbe) ||
       (tbe.is_ddio_write && cache.getDDIOWayPart() > 0);
 
-  if (no_ddio) {
+  if (no_ddio || sparseWriteThrough(tbe)) {
     tbe.use_DMT := false;
     tbe.doCacheFill := false;
     tbe.dataToBeInvalid := true;
@@ -1272,12 +1272,8 @@ action(Prepare_DDIOWrite, desc="") {
   bool needs_read := cache.ddioWriteNeedsRead(
       tbe.reqType == CHIRequestType:WriteUniquePtl, tbe.dataValid);
   if (needs_read) {
-    assert(tbe.is_ddio_write || acceptedWriteStash(tbe));
-    if (tbe.isSeqReqValid && cache.isNicDdioWriteReq(tbe.seqReq)) {
-      assert(tbe.nic_merge_read_profiled == false);
-      cache.profileNicDmaMergeRead(tbe.seqReq);
-      tbe.nic_merge_read_profiled := true;
-    }
+    assert(tbe.is_ddio_write || acceptedWriteStash(tbe) ||
+        (sparseWriteThrough(tbe) && !tbe.doCacheFill && tbe.dataToBeInvalid));
     tbe.dataUnique := false;
     tbe.actions.pushFront(Event:SendReadNoSnp);
   } else {
@@ -1991,9 +1987,7 @@ action(Send_WriteNoSnp_Partial, desc="") {
 
 action(Send_WriteUnique, desc="") {
   assert(is_valid(tbe));
-  bool stash := tbe.is_write_stash ||
-      (emit_rx_write_stash && tbe.isSeqReqValid &&
-       cache.isNicRxPayloadWriteReq(tbe.seqReq));
+  bool stash := tbe.is_write_stash;
 
   enqueue(reqOutPort, CHIRequestMsg, request_latency) {
     CHIRequestType req_type := CHIRequestType:WriteUniquePtl;
@@ -3836,7 +3830,7 @@ action(CheckCacheFill, desc="") {
     // NIC DDIO fill: allocate inside the DDIO way subset only.
     set_cache_entry(cache.allocateInWays(address, new CacheEntry, ddio_ways));
     cache.profileDdioWayFill(
-        ddioSrcClass(tbe), cache_entry.getWay(), address);
+        cache_entry.getWay());
     tbe.actions.pushFront(Event:DataArrayWriteOnFill);
     tbe.actions.pushFront(Event:FillPipe);
 
@@ -3846,9 +3840,9 @@ action(CheckCacheFill, desc="") {
     if (acceptedWriteStash(tbe)) {
       cache.profileWriteStashAllocation();
     }
-    if (is_HN) {
+    if (tbe.is_ddio_write || tbe.is_ddio_read) {
       cache.profileDdioWayFill(
-          ddioSrcClass(tbe), cache_entry.getWay(), address);
+          cache_entry.getWay());
     }
     tbe.actions.pushFront(Event:DataArrayWriteOnFill);
     tbe.actions.pushFront(Event:FillPipe);
@@ -3858,7 +3852,7 @@ action(CheckCacheFill, desc="") {
     // after the replacement
     execute_next := false;
 
-    // pick a victim to deallocate; DDIO payload fills only victimize the
+    // pick a victim to deallocate; Eligible DMA fills only victimize the
     // DDIO way subset
     Addr victim_addr;
     if (ddio_fill) {

@@ -35,7 +35,6 @@ EXPECTED[CROSS_OFFSET : CROSS_OFFSET + len(CROSS_UPDATE)] = CROSS_UPDATE
 for offset in SPARSE_OFFSETS:
     EXPECTED[offset] = SPARSE_DATA[offset]
 
-nic_dma_categories = ["", "rx_desc_writeback", "rx_desc_writeback", ""]
 ddio_eligible = [False, True, True, False]
 hnf_alloc_on_writeback = False
 ddio_way_part = 2
@@ -82,19 +81,11 @@ def test_generators(generators):
 
 
 def check(system):
+    # Data bytes, masks, snoops and completion ordering are checked above.
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
-    requests = vector_values(find_stat(stats, "nicDmaRequests"))
-    requested_bytes = vector_values(
-        find_stat(stats, "nicDmaRequestedBytes")
-    )
-    merge_reads = vector_values(find_stat(stats, "nicDmaMergeReads"))
-    merge_read_bytes = vector_values(
-        find_stat(stats, "nicDmaMergeReadBytes")
-    )
-    assert requests[8] == 2, requests
-    assert requested_bytes[8] == 20, requested_bytes
-    # The first partial write fetches memory; the second merges against the
-    # authoritative HNF line already produced by the first.
-    assert merge_reads[8] == 1, merge_reads
-    assert merge_read_bytes[8] == 64, merge_read_bytes
-    print("Cross-flit and sparse partial-write masks passed")
+    allocations = vector_values(find_stat(stats, "ddioAllocWays"))
+    assert sum(allocations) == 1, allocations
+    assert all(v == 0 for v in allocations[ddio_way_part:]), allocations
+    accesses = vector_values(find_stat(stats, "ddioWayAccess"))
+    assert sum(accesses) == 1, accesses
+    print("Untagged CHI data/coherence and aggregate accounting passed")

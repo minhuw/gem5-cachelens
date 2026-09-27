@@ -49,43 +49,8 @@ namespace tlm::chi {
 
 using namespace ruby::CHI;
 
-namespace
-{
-
-Request::FlagsType
-nicDmaCategory(const CacheController::Params &p)
-{
-    const std::string category = p.test_nic_dma_category;
-    if (category.empty()) {
-        return p.test_nic_rx_payload_write ?
-            Request::NIC_RX_PAYLOAD_WRITE : Request::FlagsType{0};
-    }
-    if (category == "rx_payload")
-        return Request::NIC_RX_PAYLOAD_WRITE;
-    if (category == "rdma_rx_payload")
-        return Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA;
-    if (category == "rx_header")
-        return Request::NIC_RX_HEADER_WRITE;
-    if (category == "rx_desc_read")
-        return Request::NIC_RX_DESC_READ;
-    if (category == "rx_desc_writeback")
-        return Request::NIC_RX_DESC_WRITEBACK;
-    if (category == "tx_payload_read")
-        return Request::NIC_TX_PAYLOAD_READ;
-    if (category == "rdma_tx_payload_read")
-        return Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA;
-    if (category == "tx_desc_read")
-        return Request::NIC_TX_DESC_READ;
-    if (category == "tx_desc_writeback")
-        return Request::NIC_TX_DESC_WRITEBACK;
-    fatal("Unknown synthetic NIC DMA category '%s'", category);
-}
-
-} // anonymous namespace
-
 CacheController::CacheController(const Params &p)
   : CHIGenericController(p),
-    testNicDmaCategory(nicDmaCategory(p)),
     ddioEligible(p.ddio_eligible)
 {
 }
@@ -310,6 +275,7 @@ CacheController::reqAddr(ARM::CHI::Payload &payload,
 {
     switch (phase.req_opcode) {
       case ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_PTL:
+      case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL_STASH:
       case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL:
         assert(payload.byte_enable != 0);
         return ruby::makeLineAddress(payload.address, cacheLineBits) +
@@ -325,6 +291,7 @@ CacheController::reqSize(ARM::CHI::Payload &payload,
 {
     switch (phase.req_opcode) {
       case ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_PTL:
+      case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL_STASH:
       case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL: {
         assert(payload.byte_enable != 0);
         const unsigned first = ctz64(payload.byte_enable);
@@ -353,7 +320,8 @@ CacheController::sendRequestMsg(ARM::CHI::Payload &payload,
     req_msg->m_accAddr = reqAddr(payload, phase);
     req_msg->m_accSize = reqSize(payload, phase);
     if (phase.req_opcode == ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_PTL ||
-        phase.req_opcode == ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL) {
+        phase.req_opcode == ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL ||
+        phase.req_opcode == ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL_STASH) {
         std::vector<bool> byte_enabled(cacheLineSize, false);
         for (unsigned bit = 0; bit < cacheLineSize; ++bit)
             byte_enabled[bit] = bits(payload.byte_enable, bit);
@@ -365,14 +333,9 @@ CacheController::sendRequestMsg(ARM::CHI::Payload &payload,
     req_msg->m_fwdRequestor = getMachineID();
     req_msg->m_dataToFwdRequestor = false;
     req_msg->m_type = tlm_to_ruby::reqOpcode(phase.req_opcode);
-    if (testNicDmaCategory) {
-        req_msg->m_seqReq = std::make_shared<Request>(
-            req_msg->m_accAddr, req_msg->m_accSize,
-            testNicDmaCategory, Request::invldRequestorId);
-        req_msg->m_isSeqReqValid = true;
-    } else {
-        req_msg->m_isSeqReqValid = false;
-    }
+    req_msg->m_seqReq = std::make_shared<Request>(
+        req_msg->m_accAddr, req_msg->m_accSize, 0, Request::invldRequestorId);
+    req_msg->m_isSeqReqValid = true;
     req_msg->m_is_local_pf = false;
     req_msg->m_is_remote_pf = false;
     req_msg->m_allowRetry = phase.allow_retry;
@@ -463,7 +426,9 @@ CacheController::Transaction::gen(CacheController *controller,
       case ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_PTL:
       case ARM::CHI::REQ_OPCODE_WRITE_NO_SNP_FULL:
       case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_ZERO:
+      case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL_STASH:
       case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_PTL:
+      case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_FULL_STASH:
       case ARM::CHI::REQ_OPCODE_WRITE_UNIQUE_FULL:
       case ARM::CHI::REQ_OPCODE_WRITE_BACK_FULL:
       // This is a write transaction for now. Will

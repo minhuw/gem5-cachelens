@@ -19,7 +19,6 @@ UPDATE = bytes((0xE0 + index) & 0xFF for index in range(16))
 REQUEST_DATA = ORIGINAL[:OFFSET] + UPDATE + ORIGINAL[OFFSET + 16 :]
 EXPECTED = ORIGINAL[:OFFSET] + UPDATE + ORIGINAL[OFFSET + 16 :]
 
-nic_dma_categories = ["", "rx_desc_writeback", ""]
 ddio_eligible = [False, True, False]
 hnf_alloc_on_writeback = True
 ddio_way_part = -1
@@ -55,13 +54,8 @@ def test_generators(generators):
 
 
 def check(system):
+    # Data bytes, masks, snoops and completion ordering are checked above.
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
-    accesses = vector_values(find_stat(stats, "ddioWayAccess"))
-    deallocations = vector_values(find_stat(stats, "wayDeallocations"))
-    assoc = len(deallocations)
-    descriptor_accesses = accesses[2 * assoc : 3 * assoc]
-    cpu_accesses = accesses[3 * assoc : 4 * assoc]
-    assert sum(descriptor_accesses) == 1, descriptor_accesses
-    assert sum(cpu_accesses) == 0, cpu_accesses
-    assert sum(deallocations) >= 1, deallocations
-    print("No-DDIO HNF-hit merge, write-through, and deallocation passed")
+    assert sum(vector_values(find_stat(stats, "ddioWayAccess"))) == 1
+    assert sum(vector_values(find_stat(stats, "wayDeallocations"))) >= 1
+    print("Untagged CHI data/coherence and aggregate accounting passed")

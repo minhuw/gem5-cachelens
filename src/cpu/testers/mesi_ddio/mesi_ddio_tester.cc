@@ -62,7 +62,6 @@ MESIDDIODirectedTester::MESIDDIODirectedTester(const Params &params)
       dmaPort(name() + ".dma_port", *this),
       dmaRacePort(name() + ".dma_race_port", *this),
       scenario(params.scenario),
-      coldReadIsTx(params.cold_read_is_tx),
       baseAddress(params.base_addr),
       setStride(params.set_stride),
       blockSize(params.block_size),
@@ -219,15 +218,6 @@ void
 MESIDDIODirectedTester::buildScenario()
 {
     const Request::Flags generic;
-    const Request::Flags rxPayload(Request::NIC_RX_PAYLOAD_WRITE);
-    const Request::Flags rxHeader(Request::NIC_RX_HEADER_WRITE);
-    const Request::Flags txPayload(Request::NIC_TX_PAYLOAD_READ);
-    const Request::Flags rdmaRxPayload(
-        Request::NIC_RX_PAYLOAD_WRITE | Request::NIC_PVRDMA);
-    const Request::Flags rdmaTxPayload(
-        Request::NIC_TX_PAYLOAD_READ | Request::NIC_PVRDMA);
-    const Request::Flags rxDescRead(Request::NIC_RX_DESC_READ);
-    const Request::Flags rxDescWrite(Request::NIC_RX_DESC_WRITEBACK);
 
     const Addr a = baseAddress;
     const Addr b = baseAddress + setStride;
@@ -240,115 +230,49 @@ MESIDDIODirectedTester::buildScenario()
     const auto fourth = pattern(0xa0);
     const auto fifth = pattern(0xd0);
 
-    // Port 0 explicitly opts into DDIO; port 1 is generic, even with tags.
+    // Port 0 explicitly opts into DDIO; port 1 is generic, without semantic tags.
     if (scenario == "eligible_untagged") {
         auto merged = first;
         merged[7] = 0xee;
         addWrite(PortKind::Dma, 0, a, generic, first, "untagged full fill");
         addWrite(PortKind::Dma, 0, a + 7, generic, {merged[7]},
                  "untagged partial hit");
-        addRead(PortKind::Dma, 0, a, rxDescRead, merged, "descriptor hit");
-        addRead(PortKind::Dma, 0, a, txPayload, merged, "payload hit");
+        addRead(PortKind::Dma, 0, a, generic, merged, "descriptor hit");
+        addRead(PortKind::Dma, 0, a, generic, merged, "payload hit");
         addRead(PortKind::Dma, 0, a, generic, merged, "untagged hit");
         auto partial = std::vector<uint8_t>(blockSize);
         partial[9] = 0xab;
         addWrite(PortKind::Dma, 0, b + 9, generic, {partial[9]},
                  "untagged partial miss");
-        addRead(PortKind::Dma, 0, b, txPayload, partial, "partial retained");
-        addRead(PortKind::Dma, 0, c, rxDescRead, std::vector<uint8_t>(blockSize),
+        addRead(PortKind::Dma, 0, b, generic, partial, "partial retained");
+        addRead(PortKind::Dma, 0, c, generic, std::vector<uint8_t>(blockSize),
                 "descriptor cold miss");
-        addRead(PortKind::Dma, 0, c, txPayload, std::vector<uint8_t>(blockSize),
+        addRead(PortKind::Dma, 0, c, generic, std::vector<uint8_t>(blockSize),
                 "payload remains a miss");
         addRead(PortKind::Dma, 0, c, generic, std::vector<uint8_t>(blockSize),
                 "untagged remains a miss");
-    } else if (scenario == "tagged_noneligible") {
-        addWrite(PortKind::Dma, 1, a, rxPayload, first, "tagged generic write");
-        addRead(PortKind::Dma, 1, a, txPayload, first, "tagged generic read");
-        addRead(PortKind::Dma, 0, a, txPayload, first, "eligible probe misses");
+    } else if (scenario == "noneligible_dma") {
+        addWrite(PortKind::Dma, 1, a, generic, first, "noneligible DMA write");
+        addRead(PortKind::Dma, 1, a, generic, first, "noneligible DMA read");
+        addRead(PortKind::Dma, 0, a, generic, first, "eligible probe misses");
     } else if (scenario == "cold_full_write") {
-        addWrite(PortKind::Dma, 0, a, rxPayload, first, "cold RX write");
-        addRead(PortKind::Dma, coldReadIsTx ? 0 : 1, a,
-                coldReadIsTx ? txPayload : generic, first,
+        addWrite(PortKind::Dma, 0, a, generic, first, "cold RX write");
+        addRead(PortKind::Dma, 1, a,
+                generic, first,
                 "directory read after RX ACK");
-    } else if (scenario == "stash_unclassified") {
-        addWrite(PortKind::Dma, 0, a, rxDescWrite, first,
-                 "ordinary descriptor write");
-        addWrite(PortKind::Dma, 0, b, rxHeader, second,
-                 "ordinary RX header write");
-        addWrite(PortKind::Dma, 1, c, generic, third,
-                 "ordinary unclassified write");
-        // These first reads probe retention before any CPU demand fill.
-        addRead(PortKind::Dma, 0, a, txPayload, first,
-                "descriptor must not be stashed");
-        addRead(PortKind::Dma, 0, b, txPayload, second,
-                "header must not be stashed");
-        addRead(PortKind::Dma, 0, c, txPayload, third,
-                "ordinary allocation is independent of stashing");
-        addRead(PortKind::Dma, 0, a, rxDescRead, first,
-                "descriptor read is not a stash hint");
-        addWrite(PortKind::Cpu, 0, d + 7, generic, {0xee},
-                 "CPU store is not a stash hint");
-        addRead(PortKind::Cpu, 1, d + 7, generic, {0xee},
-                "CPU store remains coherent");
-    } else if (scenario == "stash_replacement") {
-        // The CHI test HNF holds eight lines (two four-way sets). Ten
-        // consecutive fills use ordinary ways and evict both private copies.
-        auto dirty = first;
-        dirty[7] = 0xee;
-        for (unsigned i = 0; i < 10; ++i) {
-            const Addr address = a + i * blockSize;
-            const auto data = pattern(0x10 + i);
-            addWrite(PortKind::Dma, 0, address, rxPayload, data,
-                     csprintf("stash capacity fill %u", i));
-            if (i == 0) {
-                addRead(PortKind::Cpu, 0, address, generic, {data[0]},
-                        "create replacement victim owner");
-                addWrite(PortKind::Cpu, 0, address + 7, generic, {dirty[7]},
-                         "dirty replacement victim");
-            } else if (i == 1) {
-                addRead(PortKind::Cpu, 0, address, generic, {data[0]},
-                        "create first replacement victim sharer");
-                addRead(PortKind::Cpu, 1, address, generic, {data[0]},
-                        "create second replacement victim sharer");
-            }
-        }
-        // Probe all four ways of one set, newest first, before any miss
-        // can demand-fill a line and disturb the residency oracle.
-        for (int i = 9; i >= 3; i -= 2) {
-            addRead(PortKind::Dma, 0, a + i * blockSize, txPayload,
-                    pattern(0x10 + i), "ordinary-way retained TX read");
-        }
-        addRead(PortKind::Dma, 0, a, txPayload, dirty,
-                "evicted dirty owner recovered from memory");
-        for (unsigned i = 0; i < 10; ++i) {
-            const auto data = i == 0 ? dirty : pattern(0x10 + i);
-            addRead(PortKind::Dma, 1, a + i * blockSize, generic, data,
-                    csprintf("full capacity readback %u", i));
-        }
-        addRead(PortKind::Cpu, 0, a + 7, generic, {dirty[7]},
-                "backinvalidated dirty owner readback");
-        addRead(PortKind::Cpu, 1, a + blockSize, generic, {0x11},
-                "backinvalidated shared victim readback");
-    } else if (scenario == "pvrdma_provenance") {
-        addWrite(PortKind::Dma, 0, a, rdmaRxPayload, first,
-                 "PVRDMA RX payload write");
-        addRead(PortKind::Dma, 0, a, rdmaTxPayload, first,
-                "PVRDMA TX payload read");
-        addRead(PortKind::Cpu, 0, a, generic, {first[0]},
-                "CPU read of prior PVRDMA RX payload");
     } else if (scenario == "hit_update") {
-        addWrite(PortKind::Dma, 0, a, rxPayload, first, "cold RX write");
-        addWrite(PortKind::Dma, 0, a, rxPayload, second,
+        addWrite(PortKind::Dma, 0, a, generic, first, "cold RX write");
+        addWrite(PortKind::Dma, 0, a, generic, second,
                  "RX full-line hit update");
-        addRead(PortKind::Dma, 0, a, txPayload, second,
+        addRead(PortKind::Dma, 0, a, generic, second,
                 "TX observes RX hit update");
     } else if (scenario == "nic_cpu_nic") {
-        addWrite(PortKind::Dma, 0, a, rxPayload, first, "cold RX write A");
+        addWrite(PortKind::Dma, 0, a, generic, first, "cold RX write A");
         addRead(PortKind::Cpu, 0, a, generic, first,
                 "CPU consumes NIC-filled A");
-        addWrite(PortKind::Dma, 0, a, rxPayload, second,
+        addWrite(PortKind::Dma, 0, a, generic, second,
                  "second RX write probes LLC after CPU read");
-        addRead(PortKind::Dma, 0, a, txPayload, second,
+        addRead(PortKind::Dma, 0, a, generic, second,
                 "TX checks entire overwritten line");
         addRead(PortKind::Cpu, 0, a, generic, second,
                 "private holder observes NIC invalidation");
@@ -361,13 +285,13 @@ MESIDDIODirectedTester::buildScenario()
             addRead(PortKind::Cpu, 0, a + i * setStride, generic, zero,
                     "conflicting clean CPU read forces private eviction");
         }
-        addRead(PortKind::Dma, 0, a, txPayload, zero,
+        addRead(PortKind::Dma, 0, a, generic, zero,
                 "TX probes clean private victim inserted in LLC");
         addRead(PortKind::Cpu, 1, a, generic, zero,
                 "CPU consumes clean LLC victim with UC grant");
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "RX probes LLC after clean unique grant");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "TX verifies full clean-victim overwrite");
     } else if (scenario == "hnf_evict_shared") {
         addWrite(PortKind::Dma, 1, a, generic, first, "seed shared A");
@@ -376,14 +300,14 @@ MESIDDIODirectedTester::buildScenario()
         // Four conflicting NIC fills evict A from the four-way CHI HNF,
         // without any CPU accesses that could evict the private holders.
         for (unsigned i = 1; i <= 4; ++i) {
-            addWrite(PortKind::Dma, 0, a + i * setStride, rxPayload,
+            addWrite(PortKind::Dma, 0, a + i * setStride, generic,
                      pattern(0x20 + i), "force shared HNF victim eviction");
         }
         // A write ACK precedes its HNF fill. Serialize behind that fill,
         // then probe A while its replacement TBE blocks new requests.
         addRead(PortKind::Dma, 1, e, generic, pattern(0x24),
                 "fence final NIC fill before testing eviction");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "TX miss proves shared A was evicted from HNF");
         addRead(PortKind::Cpu, 0, a, generic, first,
                 "first private holder survives noninclusive eviction");
@@ -398,39 +322,39 @@ MESIDDIODirectedTester::buildScenario()
                 "fill first L2 way from CPU");
         addRead(PortKind::Cpu, 0, b, generic, {second[0]},
                 "fill target outside DDIO subset");
-        addWrite(PortKind::Dma, 0, b, rxPayload, third,
+        addWrite(PortKind::Dma, 0, b, generic, third,
                  "RX hit outside DDIO subset");
-        addRead(PortKind::Dma, 0, b, txPayload, third,
+        addRead(PortKind::Dma, 0, b, generic, third,
                 "TX observes outside-subset hit update");
     } else if (scenario == "subset_full_victim") {
         auto ownerData = first;
         ownerData[7] = 0xee;
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "fill only DDIO way");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create private owner for DDIO victim");
         addWrite(PortKind::Cpu, 0, a + 7, generic, {ownerData[7]},
                  "dirty private DDIO victim owner");
-        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+        addWrite(PortKind::Dma, 0, b, generic, second,
                  "replace full DDIO subset victim");
         addRead(PortKind::Cpu, 0, a + 7, generic, {ownerData[7]},
                 "read back inclusive dirty victim");
-        addRead(PortKind::Dma, 0, b, txPayload, second,
+        addRead(PortKind::Dma, 0, b, generic, second,
                 "replacement line remains retained");
     } else if (scenario == "multi_way_subset_lru") {
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "fill DDIO subset way zero");
-        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+        addWrite(PortKind::Dma, 0, b, generic, second,
                  "fill DDIO subset way one");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "make way-zero line most recently used");
-        addWrite(PortKind::Dma, 0, c, rxPayload, third,
+        addWrite(PortKind::Dma, 0, c, generic, third,
                  "replace least-recently used subset way");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "way-zero line survives subset replacement");
-        addRead(PortKind::Dma, 0, c, txPayload, third,
+        addRead(PortKind::Dma, 0, c, generic, third,
                 "replacement line occupies evicted subset way");
-        addRead(PortKind::Dma, 0, b, txPayload, second,
+        addRead(PortKind::Dma, 0, b, generic, second,
                 "evicted subset line is recovered from memory");
     } else if (scenario == "clean_subset_ss") {
         addWrite(PortKind::Dma, 1, a, generic, first,
@@ -439,11 +363,11 @@ MESIDDIODirectedTester::buildScenario()
                 "create first clean sharer");
         addRead(PortKind::Cpu, 1, a + 1, generic, {first[1]},
                 "create clean SS victim");
-        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+        addWrite(PortKind::Dma, 0, b, generic, second,
                  "replace clean SS subset victim");
-        addRead(PortKind::Dma, 0, b, txPayload, second,
+        addRead(PortKind::Dma, 0, b, generic, second,
                 "clean SS replacement line remains retained");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "clean SS victim remains correct in memory");
     } else if (scenario == "clean_subset_m") {
         addWrite(PortKind::Dma, 1, a, generic, first,
@@ -458,38 +382,38 @@ MESIDDIODirectedTester::buildScenario()
                 "fill first helper into private L1");
         addRead(PortKind::Cpu, 0, c, generic, {third[0]},
                 "evict clean victim back to L2 M");
-        addWrite(PortKind::Dma, 0, d, rxPayload, fourth,
+        addWrite(PortKind::Dma, 0, d, generic, fourth,
                  "replace clean M subset victim");
-        addRead(PortKind::Dma, 0, d, txPayload, fourth,
+        addRead(PortKind::Dma, 0, d, generic, fourth,
                 "clean M replacement line remains retained");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "clean M victim remains correct in memory");
     } else if (scenario == "clean_subset_mt") {
         addWrite(PortKind::Dma, 1, a, generic, first,
                  "initialize clean MT victim");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create clean exclusive L1 owner");
-        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+        addWrite(PortKind::Dma, 0, b, generic, second,
                  "replace clean MT subset victim");
-        addRead(PortKind::Dma, 0, b, txPayload, second,
+        addRead(PortKind::Dma, 0, b, generic, second,
                 "clean MT replacement line remains retained");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "clean MT victim remains correct in memory");
     } else if (scenario == "dirty_subset_ss") {
         // A retained RX line is dirty in L2. Clean exclusive and shared CPU
         // reads do not clear that dirty bit, so the resulting SS state can
         // reach the dirty DDIO-subset replacement transition.
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "seed dirty SS victim in retained L2");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create clean exclusive owner of dirty L2 data");
         addRead(PortKind::Cpu, 1, a + 1, generic, {first[1]},
                 "downgrade retained dirty data to SS");
-        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+        addWrite(PortKind::Dma, 0, b, generic, second,
                  "replace dirty SS subset victim");
-        addRead(PortKind::Dma, 0, b, txPayload, second,
+        addRead(PortKind::Dma, 0, b, generic, second,
                 "dirty SS replacement line remains retained");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "dirty SS victim is written back correctly");
     } else if (scenario == "l1_sharer_invalidation") {
         addWrite(PortKind::Dma, 1, a, generic, first,
@@ -498,7 +422,7 @@ MESIDDIODirectedTester::buildScenario()
                 "CPU zero reads shared line");
         addRead(PortKind::Cpu, 1, a, generic, {first[0]},
                 "CPU one creates second sharer");
-        addWrite(PortKind::Dma, 0, a, rxPayload, second,
+        addWrite(PortKind::Dma, 0, a, generic, second,
                  "RX invalidates all L1 sharers");
         addRead(PortKind::Cpu, 0, a, generic, {second[0]},
                 "CPU zero observes invalidation");
@@ -507,7 +431,7 @@ MESIDDIODirectedTester::buildScenario()
     } else if (scenario == "disabled_ddio") {
         auto dirty = first;
         dirty[7] = 0xee;
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "cold write-through RX line");
         addWrite(PortKind::Dma, 1, b, generic, first,
                  "initialize retained line before disabled DDIO hit");
@@ -515,25 +439,25 @@ MESIDDIODirectedTester::buildScenario()
                 "create private owner before disabled DDIO hit");
         addWrite(PortKind::Cpu, 0, b + 7, generic, {dirty[7]},
                  "dirty owner before disabled DDIO hit");
-        addWrite(PortKind::Dma, 0, b, rxPayload, second,
+        addWrite(PortKind::Dma, 0, b, generic, second,
                  "hit write-through invalidates retained copies");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "cold-write memory readback without retention");
-        addRead(PortKind::Dma, 0, b, txPayload, second,
+        addRead(PortKind::Dma, 0, b, generic, second,
                 "hit-write memory readback without retention");
-        addRead(PortKind::Dma, 0, b, txPayload, second,
+        addRead(PortKind::Dma, 0, b, generic, second,
                 "second TX miss proves no allocation");
     } else if (scenario == "tx_hit_retains") {
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "seed retained TX line");
-        addRead(PortKind::Dma, 0, a, txPayload, first, "first TX hit");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first, "first TX hit");
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "second TX hit remains resident");
     } else if (scenario == "tx_miss_no_allocate") {
         addWrite(PortKind::Dma, 1, a, generic, first,
                  "initialize memory without L2 allocation");
-        addRead(PortKind::Dma, 0, a, txPayload, first, "first TX miss");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first, "first TX miss");
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "second TX miss proves no allocation");
     } else if (scenario == "dirty_owner_tx") {
         auto dirty = first;
@@ -544,38 +468,38 @@ MESIDDIODirectedTester::buildScenario()
                 "create exclusive private owner");
         addWrite(PortKind::Cpu, 0, a + 7, generic, {dirty[7]},
                  "dirty private owner");
-        addRead(PortKind::Dma, 0, a, txPayload, dirty,
+        addRead(PortKind::Dma, 0, a, generic, dirty,
                 "TX retrieves dirty owner data");
-        addRead(PortKind::Dma, 0, a, txPayload, dirty,
+        addRead(PortKind::Dma, 0, a, generic, dirty,
                 "retrieved line is retained in L2");
     } else if (scenario == "clean_owner_tx") {
         addWrite(PortKind::Dma, 1, a, generic, first,
                  "initialize clean TX-owner line");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create clean exclusive TX owner");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "TX retrieves data from clean exclusive owner");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "clean-owner TX data remains retained without allocation");
     } else if (scenario == "telemetry_exactness") {
         const Addr txMiss = a + blockSize;
         const Addr header = a + 2 * blockSize;
         const Addr desc = a + 3 * blockSize;
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "telemetry RX miss");
-        addWrite(PortKind::Dma, 0, a, rxPayload, second,
+        addWrite(PortKind::Dma, 0, a, generic, second,
                  "telemetry RX hit");
-        addRead(PortKind::Dma, 0, a, txPayload, second,
+        addRead(PortKind::Dma, 0, a, generic, second,
                 "telemetry TX hit");
         addWrite(PortKind::Dma, 1, txMiss, generic, third,
                  "initialize TX miss memory");
-        addRead(PortKind::Dma, 0, txMiss, txPayload, third,
+        addRead(PortKind::Dma, 0, txMiss, generic, third,
                 "telemetry TX miss");
-        addWrite(PortKind::Dma, 0, header, rxHeader, first,
+        addWrite(PortKind::Dma, 0, header, generic, first,
                  "telemetry RX header fill");
-        addWrite(PortKind::Dma, 0, desc, rxDescWrite, second,
+        addWrite(PortKind::Dma, 0, desc, generic, second,
                  "telemetry descriptor fill");
-        addRead(PortKind::Dma, 0, desc, rxDescRead, second,
+        addRead(PortKind::Dma, 0, desc, generic, second,
                 "telemetry descriptor access");
     } else if (scenario == "generic_partial") {
         const Addr next = a + blockSize;
@@ -626,33 +550,31 @@ MESIDDIODirectedTester::buildScenario()
         merged[0] = 0x11;
         addWrite(PortKind::Dma, 1, a, generic, first,
                  "initialize clean memory for aligned partial write");
-        addWrite(PortKind::Dma, 0, a, rxPayload, {merged[0]},
+        addWrite(PortKind::Dma, 0, a, generic, {merged[0]},
                  "aligned one-byte retained NIC write");
-        addRead(PortKind::Dma, 0, a, txPayload, merged,
+        addRead(PortKind::Dma, 0, a, generic, merged,
                 "TX observes aligned one-byte merge");
-    } else if (scenario == "partial_unaligned" ||
-               scenario == "stash_partial_cold") {
+    } else if (scenario == "partial_unaligned") {
         auto merged = first;
         const auto partial = bytes(13, 0xa0);
         std::copy(partial.begin(), partial.end(), merged.begin() + 17);
-        // With DDIO disabled, a descriptor seed leaves no HNF copy. Keep
-        // the original unclassified seed for existing MESI regressions.
-        addWrite(PortKind::Dma, scenario == "stash_partial_cold" ? 0 : 1, a,
-                 scenario == "stash_partial_cold" ? rxDescWrite : generic,
+        // Seed through a noneligible DMA port without retaining a copy.
+        addWrite(PortKind::Dma, 1, a,
+                 generic,
                  first, "initialize clean memory for unaligned partial write");
-        addWrite(PortKind::Dma, 0, a + 17, rxPayload, partial,
+        addWrite(PortKind::Dma, 0, a + 17, generic, partial,
                  "unaligned retained NIC write");
-        addRead(PortKind::Dma, 0, a, txPayload, merged,
+        addRead(PortKind::Dma, 0, a, generic, merged,
                 "TX observes unaligned merge");
     } else if (scenario == "partial_l2_m") {
         auto merged = first;
         const auto partial = bytes(5, 0xc0);
         std::copy(partial.begin(), partial.end(), merged.begin() + 9);
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "seed retained M line");
-        addWrite(PortKind::Dma, 0, a + 9, rxPayload, partial,
+        addWrite(PortKind::Dma, 0, a + 9, generic, partial,
                  "partial NIC hit in L2 M");
-        addRead(PortKind::Dma, 0, a, txPayload, merged,
+        addRead(PortKind::Dma, 0, a, generic, merged,
                 "TX observes L2 M partial merge");
     } else if (scenario == "partial_ss_sharers") {
         auto merged = first;
@@ -664,37 +586,31 @@ MESIDDIODirectedTester::buildScenario()
                 "create first clean sharer");
         addRead(PortKind::Cpu, 1, a + 1, generic, {first[1]},
                 "create second clean sharer");
-        addWrite(PortKind::Dma, 0, a + 20, rxPayload, partial,
+        addWrite(PortKind::Dma, 0, a + 20, generic, partial,
                  "partial NIC write invalidates SS sharers");
-        addRead(PortKind::Dma, 0, a, txPayload, merged,
+        addRead(PortKind::Dma, 0, a, generic, merged,
                 "TX observes SS merge");
         addRead(PortKind::Cpu, 0, a + 20, generic, {merged[20]},
                 "first CPU observes SS invalidation");
         addRead(PortKind::Cpu, 1, a + 23, generic, {merged[23]},
                 "second CPU observes SS invalidation");
-    } else if (scenario == "partial_clean_owner" ||
-               scenario == "stash_clean_owner") {
+    } else if (scenario == "partial_clean_owner") {
         auto merged = first;
         const auto partial = bytes(3, 0x70);
         std::copy(partial.begin(), partial.end(), merged.begin() + 2);
-        addWrite(PortKind::Dma, scenario == "stash_clean_owner" ? 0 : 1, a,
-                 scenario == "stash_clean_owner" ? rxDescWrite : generic,
+        addWrite(PortKind::Dma, 1, a,
+                 generic,
                  first, "initialize clean-owner partial line");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create clean exclusive partial-write owner");
-        addWrite(PortKind::Dma, 0, a + 2, rxPayload, partial,
+        addWrite(PortKind::Dma, 0, a + 2, generic, partial,
                  "partial NIC write invalidates clean owner");
-        addRead(PortKind::Dma, 0, a, txPayload, merged,
+        addRead(PortKind::Dma, 0, a, generic, merged,
                 "retained line preserves clean-owner untouched bytes");
-        if (scenario == "stash_clean_owner") {
-            addRead(PortKind::Cpu, 0, a + 2, generic, {merged[2]},
-                    "clean owner sees merged byte after invalidation");
-        } else {
-            addRead(PortKind::Dma, 1, a, generic, merged,
+        addRead(PortKind::Dma, 1, a, generic, merged,
                     "generic DMA receives merged retained line");
-            addRead(PortKind::Dma, 0, a, txPayload, merged,
+            addRead(PortKind::Dma, 0, a, generic, merged,
                     "TX miss observes merged memory after L2 invalidation");
-        }
     } else if (scenario == "partial_dirty_owner") {
         auto merged = first;
         merged[7] = 0xee;
@@ -706,9 +622,9 @@ MESIDDIODirectedTester::buildScenario()
                 "create private owner before partial NIC write");
         addWrite(PortKind::Cpu, 0, a + 7, generic, {merged[7]},
                  "dirty untouched owner byte");
-        addWrite(PortKind::Dma, 0, a + 2, rxPayload, partial,
+        addWrite(PortKind::Dma, 0, a + 2, generic, partial,
                  "partial NIC write retrieves dirty owner");
-        addRead(PortKind::Dma, 0, a, txPayload, merged,
+        addRead(PortKind::Dma, 0, a, generic, merged,
                 "TX observes owner data before NIC merge");
     } else if (scenario == "partial_no_retention") {
         auto cleanMerged = first;
@@ -724,13 +640,13 @@ MESIDDIODirectedTester::buildScenario()
                 "create no-retention private owner");
         addWrite(PortKind::Cpu, 0, b + 7, generic, {dirtyMerged[7]},
                  "dirty no-retention owner byte");
-        addWrite(PortKind::Dma, 0, a + 3, rxPayload, {cleanMerged[3]},
+        addWrite(PortKind::Dma, 0, a + 3, generic, {cleanMerged[3]},
                  "clean no-retention partial NIC write");
-        addWrite(PortKind::Dma, 0, b + 2, rxPayload, {dirtyMerged[2]},
+        addWrite(PortKind::Dma, 0, b + 2, generic, {dirtyMerged[2]},
                  "dirty-owner no-retention partial NIC write");
-        addRead(PortKind::Dma, 0, a, txPayload, cleanMerged,
+        addRead(PortKind::Dma, 0, a, generic, cleanMerged,
                 "memory readback of clean no-retention merge");
-        addRead(PortKind::Dma, 0, b, txPayload, dirtyMerged,
+        addRead(PortKind::Dma, 0, b, generic, dirtyMerged,
                 "memory readback of dirty-owner no-retention merge");
     } else if (scenario == "partial_cross_line") {
         const Addr next = a + blockSize;
@@ -743,11 +659,11 @@ MESIDDIODirectedTester::buildScenario()
                  "initialize first cross-line memory line");
         addWrite(PortKind::Dma, 1, next, generic, second,
                  "initialize second cross-line memory line");
-        addWrite(PortKind::Dma, 0, a + blockSize - 8, rxPayload, partial,
+        addWrite(PortKind::Dma, 0, a + blockSize - 8, generic, partial,
                  "contiguous cross-line retained NIC write");
-        addRead(PortKind::Dma, 0, a, txPayload, left,
+        addRead(PortKind::Dma, 0, a, generic, left,
                 "TX observes first cross-line fragment");
-        addRead(PortKind::Dma, 0, next, txPayload, right,
+        addRead(PortKind::Dma, 0, next, generic, right,
                 "TX observes second cross-line fragment");
     } else if (scenario == "sparse_mask") {
         const Addr middle = a + blockSize;
@@ -775,16 +691,16 @@ MESIDDIODirectedTester::buildScenario()
                  "initialize all-disabled middle sparse line");
         addWrite(PortKind::Dma, 1, last, generic, third,
                  "initialize last sparse memory line");
-        addMaskedWrite(PortKind::Dma, 0, a + 8, rxPayload, localData,
+        addMaskedWrite(PortKind::Dma, 0, a + 8, generic, localData,
                        localMask, "single-line sparse NIC write");
-        addMaskedWrite(PortKind::Dma, 0, a + 60, rxPayload, spanningData,
+        addMaskedWrite(PortKind::Dma, 0, a + 60, generic, spanningData,
                        spanningMask,
                        "multi-line sparse NIC write with empty middle");
-        addRead(PortKind::Dma, 0, a, txPayload, firstMerged,
+        addRead(PortKind::Dma, 0, a, generic, firstMerged,
                 "TX observes first sparse line");
-        addRead(PortKind::Dma, 0, middle, txPayload, second,
+        addRead(PortKind::Dma, 0, middle, generic, second,
                 "TX observes untouched all-disabled middle line");
-        addRead(PortKind::Dma, 0, last, txPayload, lastMerged,
+        addRead(PortKind::Dma, 0, last, generic, lastMerged,
                 "TX observes last sparse line");
     } else if (scenario == "partial_subset_race") {
         auto victim = first;
@@ -797,16 +713,16 @@ MESIDDIODirectedTester::buildScenario()
                  "initialize first partial replacement target");
         addWrite(PortKind::Dma, 1, c, generic, third,
                  "initialize second partial replacement target");
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "seed partial replacement victim");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create private partial replacement victim");
         addWrite(PortKind::Cpu, 0, a + 7, generic, {victim[7]},
                  "dirty partial replacement victim");
         const unsigned phase = reservePhase();
-        addWriteAt(phase, 0, PortKind::Dma, 0, b + 5, rxPayload,
+        addWriteAt(phase, 0, PortKind::Dma, 0, b + 5, generic,
                    {secondMerged[5]}, "first partial subset replacement");
-        addWriteAt(phase, 1, PortKind::Dma, 0, c + 9, rxPayload,
+        addWriteAt(phase, 1, PortKind::Dma, 0, c + 9, generic,
                    {thirdMerged[9]}, "second partial subset replacement");
         addRead(PortKind::Dma, 1, a, generic, victim,
                 "read back dirty partial replacement victim");
@@ -823,7 +739,7 @@ MESIDDIODirectedTester::buildScenario()
                  "initialize ownership-race memory line");
 
         const unsigned phase = reservePhase();
-        addWriteAt(phase, 0, PortKind::Dma, 0, a + 7, rxPayload,
+        addWriteAt(phase, 0, PortKind::Dma, 0, a + 7, generic,
                    {merged[7]}, "partial retained write awaiting ownership");
         // The retained miss reaches L2, fetches memory, and records L2 as the
         // directory owner before its DDIO_WRITE claim arrives. The second
@@ -853,27 +769,27 @@ MESIDDIODirectedTester::buildScenario()
         const std::vector<bool> disabledMask(disabledData.size(), false);
         addWrite(PortKind::Dma, 1, a, generic, first,
                  "initialize zero-mask memory line");
-        addMaskedWrite(PortKind::Dma, 0, a + 4, rxPayload, disabledData,
+        addMaskedWrite(PortKind::Dma, 0, a + 4, generic, disabledData,
                        disabledMask, "all-disabled NIC write no-op");
-        addRead(PortKind::Dma, 0, a, txPayload, first,
+        addRead(PortKind::Dma, 0, a, generic, first,
                 "TX observes zero-mask no-op");
     } else if (scenario == "routing_full_line") {
         for (unsigned bank = 0; bank < routingBanks; ++bank) {
             const Addr address = a + bank * blockSize;
             const auto data = pattern(0x20 + 0x20 * bank);
-            addWrite(PortKind::Dma, 0, address, rxPayload, data,
+            addWrite(PortKind::Dma, 0, address, generic, data,
                      csprintf("classified full-line write for bank %u", bank));
         }
         for (unsigned bank = 0; bank < routingBanks; ++bank) {
             const Addr address = a + bank * blockSize;
             const auto data = pattern(0x20 + 0x20 * bank);
-            addRead(PortKind::Dma, 0, address, txPayload, data,
+            addRead(PortKind::Dma, 0, address, generic, data,
                     csprintf("classified full-line read for bank %u", bank));
         }
     } else if (scenario == "overlap_dirty_write") {
         auto dirty = first;
         dirty[7] = 0xee;
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "initialize overlapping write line");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create private owner before overlapping write");
@@ -882,14 +798,14 @@ MESIDDIODirectedTester::buildScenario()
         const unsigned phase = reservePhase();
         addWriteAt(phase, 0, PortKind::Cpu, 1, a + 11, generic, {0x5a},
                    "overlapping CPU ownership transfer");
-        addWriteAt(phase, 0, PortKind::Dma, 0, a, rxPayload, second,
+        addWriteAt(phase, 0, PortKind::Dma, 0, a, generic, second,
                    "overlapping full-line DDIO write");
         addRead(PortKind::Dma, 1, a, generic, second,
                 "generic final read after overlapping DDIO write");
     } else if (scenario == "concurrent_subset_victim") {
         auto ownerData = first;
         ownerData[7] = 0xee;
-        addWrite(PortKind::Dma, 0, a, rxPayload, first,
+        addWrite(PortKind::Dma, 0, a, generic, first,
                  "seed concurrent DDIO victim");
         addRead(PortKind::Cpu, 0, a, generic, {first[0]},
                 "create private concurrent victim owner");
@@ -901,9 +817,9 @@ MESIDDIODirectedTester::buildScenario()
         // request reaches the same DDIO subset while the first replacement
         // is still stalled. The directed stats require both replacement
         // stalls, and the readbacks below verify the resulting commit order.
-        addWriteAt(phase, 0, PortKind::Dma, 0, b, rxPayload, second,
+        addWriteAt(phase, 0, PortKind::Dma, 0, b, generic, second,
                    "first concurrent same-set DDIO replacement");
-        addWriteAt(phase, 1, PortKind::Dma, 0, c, rxPayload, third,
+        addWriteAt(phase, 1, PortKind::Dma, 0, c, generic, third,
                    "second concurrent same-set DDIO replacement");
         addRead(PortKind::Dma, 1, a, generic, ownerData,
                 "generic dirty victim readback");

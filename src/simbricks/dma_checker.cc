@@ -13,21 +13,19 @@ AddrRangeList DmaChecker::Port::getAddrRanges() const {
 }
 void DmaChecker::check(PacketPtr p) {
     const Addr a = p->getAddr();
-    uint64_t expected;
+
     if (a >= 0x1038 && a + p->getSize() <= 0x10d8) {
-        expected = Request::NIC_RX_DESC_READ;
+
         panic_if(!p->isRead(), "descriptor direction"); ++descChunks;
     } else if ((a >= 0x2000 && a + p->getSize() <= 0x25c0) ||
                (a >= 0x3038 && a + p->getSize() <= 0x35f8)) {
-        expected = Request::NIC_RX_PAYLOAD_WRITE;
+
         panic_if(!p->isWrite(), "payload direction"); ++payloadChunks;
     } else {
         panic_if(a != 0x4000 && a != 0x4040, "unexpected DMA address");
-        expected = 0; ++controlChunks;
+        ++controlChunks;
     }
-    panic_if((p->req->getFlags() & Request::NIC_DMA_CATEGORY_MASK) != expected,
-             "DMA flag lost/wrong at memory: address %#x flags %#x expected %#x",
-             a, p->req->getFlags(), expected);
+    panic_if(p->req->getFlags(), "Unexpected DMA request flags");
     panic_if(p->getSize() > 64 || (a % 64) + p->getSize() > 64, "unsplit DMA");
     bytes += p->getSize();
     ++chunks;
@@ -40,9 +38,9 @@ void DmaChecker::check(PacketPtr p) {
                  "split DMA counts wrong");
         schedule(new EventFunctionWrapper([this]() {
             panic_if(chunks != 53, "extra DMA requests");
-            inform("DMA_MEMORY_FLAGS_OK chunks=%u desc=%u payload=%u control=%u bytes=%lu",
+            inform("DMA_MEMORY_OK chunks=%u desc=%u payload=%u control=%u bytes=%lu",
                    chunks, descChunks, payloadChunks, controlChunks, bytes);
-            exitSimLoop("DMA_MEMORY_FLAGS_OK");
+            exitSimLoop("DMA_MEMORY_OK");
         }, name() + ".finish", true), curTick() + 1000 * sim_clock::as_int::ns);
     }
 }

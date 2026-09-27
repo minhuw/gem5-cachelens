@@ -1,3 +1,11 @@
+> **Historical tagged-DMA evidence — retired.** This document describes runs
+> before removal of Request semantic flags and payload-only Ruby statistics.
+> Those observations are not measurements of the current aggregate counters.
+> The payload-directed script is removed; `run_native.sh` now runs maintained
+> untagged DMA/coherence checks. No payload-only hit-rate accuracy or automatic
+> stash validation is claimed for the untagged implementation. See
+> `CACHELENS_PROFILES.md` and `CACHELENS_STASHING.md` for current interfaces.
+
 # Accuracy topology scaffold — NOT completed accuracy validation
 
 Only `configs/simbricks/i40e_accuracy.py` and this directory are owned here.

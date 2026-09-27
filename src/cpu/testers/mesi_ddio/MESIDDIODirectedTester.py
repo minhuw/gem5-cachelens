@@ -39,9 +39,6 @@ class MESIDDIODirectedTester(ClockedObject):
     dma_race_port = RequestPort("Racing DMA-side Ruby sequencer port")
 
     scenario = Param.String("Directed MESI DDIO scenario")
-    cold_read_is_tx = Param.Bool(
-        False, "Use a classified TX read to probe cold-write retention"
-    )
     base_addr = Param.Addr(0x10000, "Base address of the test region")
     set_stride = Param.Addr(128, "Stride between lines in one L2 set")
     block_size = Param.Unsigned(64, "Cache-line size")

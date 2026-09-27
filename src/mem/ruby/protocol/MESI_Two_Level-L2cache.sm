@@ -120,7 +120,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     DMA_WRITE_PARTIAL,       desc="Masked NIC DDIO write retained in L2";
     DMA_WRITE_NORETAIN,      desc="NIC write-through request";
     DMA_READ_NOALLOC,             desc="Eligible coherent DMA read with no allocation";
-    DMA_OTHER,               desc="Other classified DMA request";
+    DMA_OTHER,               desc="Other eligible DMA request";
 
     // events initiated by this L2
     L2_Replacement,     desc="L2 Replacement", format="!r";
@@ -168,10 +168,10 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     MachineID L1_GetX_ID,          desc="ID of the L1 cache to forward the block to once we get a response";
     int pendingAcks,            desc="number of pending acks for invalidates during writeback";
 
-    // Original classified DMA transaction metadata. Keep request bytes
+    // Original eligible DMA transaction metadata. Keep request bytes
     // separate from any authoritative line returned by an L1 owner so Plan
     // 004 can add masked merging without changing the full-line path.
-    bool isDmaRequest, default="false", desc="TBE belongs to a classified DMA request";
+    bool isDmaRequest, default="false", desc="TBE belongs to a eligible DMA request";
     MachineID DmaRequestor, desc="Original DMA controller";
     DataBlock DmaDataBlk, desc="Data supplied by the DMA write";
     Addr DmaAccessAddr, default="0", desc="Original fragment address";
@@ -329,21 +329,6 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     return cache_entry.Dirty;
   }
 
-  // Source classes shared with CacheMemory DDIO way telemetry:
-  //   0 RX payload, 1 TX payload, 2 descriptor, 3 CPU/other, 4 RX header.
-  int dmaSourceClass(RequestPtr req) {
-    if (L2cache.isNicRxPayloadWriteReq(req)) {
-      return 0;
-    } else if (L2cache.isNicTxPayloadReadReq(req)) {
-      return 1;
-    } else if (L2cache.isNicDescDmaReq(req)) {
-      return 2;
-    } else if (L2cache.isNicRxHeaderWriteReq(req)) {
-      return 4;
-    }
-    return 3;
-  }
-
   // ** OUT_PORTS **
 
   out_port(L1RequestL2Network_out, RequestMsg, L1RequestFromL2Cache);
@@ -415,7 +400,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     }  // if not ready, do nothing
   }
 
-  // Requests from L1 caches and classified DMA controllers
+  // Requests from L1 caches and eligible DMA controllers
   in_port(L1RequestL2Network_in, RequestMsg, L1RequestToL2Cache, rank = 0) {
     if(L1RequestL2Network_in.isReady(clockEdge())) {
       peek(L1RequestL2Network_in,  RequestMsg) {
@@ -527,7 +512,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(ad_proxyDMARequestToDirectory, "ad",
-         desc="Proxy a classified DMA request without changing it") {
+         desc="Proxy a eligible DMA request without changing it") {
     L2cache.profileDmaRoutingProxy();
     peek(L1RequestL2Network_in, RequestMsg) {
       enqueue(DirRequestL2Network_out, RequestMsg, l2_request_latency) {
@@ -540,29 +525,11 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(dp_profileDmaAcceptance, "dp",
-         desc="Record classified DMA outcome and way access exactly once") {
+         desc="Record eligible DMA outcome and way access exactly once") {
     peek(L1RequestL2Network_in, RequestMsg) {
-      RequestPtr req := in_msg.seqReq;
-      if (in_msg.isSeqReqValid &&
-          L2cache.isNicRxPayloadWriteReq(req)) {
-        L2cache.profileRxPayload(address);
-        if (L2cache.isNicPvrdmaReq(req)) {
-          L2cache.profileRdmaRxPayload(address);
-        }
-      } else if (in_msg.isSeqReqValid &&
-                 L2cache.isNicRxHeaderWriteReq(req)) {
-        L2cache.profileRxHeader(address);
-      } else if (in_msg.isSeqReqValid &&
-                 L2cache.isNicTxPayloadReadReq(req)) {
-        L2cache.profileTxPayload(address);
-        if (L2cache.isNicPvrdmaReq(req)) {
-          L2cache.profileRdmaTxPayload(address);
-        }
-      }
-
-      if (is_valid(cache_entry)) {
+      if (in_msg.ddioEligible && is_valid(cache_entry)) {
         L2cache.profileDdioWayAccess(
-            dmaSourceClass(req), cache_entry.getWay(), address);
+            cache_entry.getWay());
       }
     }
   }
@@ -621,7 +588,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     cache_entry.Sharers.clear();
     cache_entry.Dirty := false;
     L2cache.profileDdioWayFill(
-        dmaSourceClass(tbe.DmaSeqReq), cache_entry.getWay(), address);
+        cache_entry.getWay());
   }
 
   action(dw_mergeWriteFromRequest, "dw",
@@ -1035,7 +1002,6 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(qq_allocateL2CacheBlock, "\q", desc="Set L2 cache tag equal to tag of block B.") {
     if (is_invalid(cache_entry)) {
       set_cache_entry(L2cache.allocate(address, new Entry));
-      L2cache.profileDdioWayFill(3, cache_entry.getWay(), address);
     }
   }
 
@@ -1082,7 +1048,6 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(du_profileCpuWayAccess, "du",
          desc="Record a CPU/general L2 hit by physical way") {
     assert(is_valid(cache_entry));
-    L2cache.profileDdioWayAccess(3, cache_entry.getWay(), address);
   }
 
   action(nn_addSharer, "\n", desc="Add L1 sharer to list") {

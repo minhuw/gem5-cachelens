@@ -153,7 +153,6 @@ class MESIDDIODirectedTester : public ClockedObject
     bool finishing = false;
 
     const std::string scenario;
-    const bool coldReadIsTx;
     const Addr baseAddress;
     const Addr setStride;
     const unsigned blockSize;
