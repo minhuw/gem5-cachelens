@@ -15,6 +15,7 @@ ADDRESS = 0x80000000
 WRITTEN = bytes((0x80 + index) & 0xFF for index in range(64))
 
 nic_dma_categories = ["rdma_rx_payload", ""]
+ddio_eligible = [True, False]
 hnf_alloc_on_writeback = False
 ddio_way_part = 2
 

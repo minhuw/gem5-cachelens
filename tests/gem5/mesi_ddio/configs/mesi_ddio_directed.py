@@ -77,12 +77,10 @@ system.cpu = MESIDDIODirectedTester(
     set_stride=128 * args.num_l2caches,
 )
 
-dma_ports = [system.cpu.dma_port]
-if args.scenario in {
-    "partial_claim_dma_read_race",
-    "partial_claim_dma_write_race",
-}:
-    dma_ports.append(system.cpu.dma_race_port)
+# Keep generic seeds/races on a distinct, noneligible requestor.
+dma_ports = [system.cpu.dma_port, system.cpu.dma_race_port]
+if hasattr(args, "ddio_dma_ports"):
+    args.ddio_dma_ports = [0]
 
 Ruby.create_system(
     args,

@@ -115,6 +115,13 @@ if buildEnv["USE_ARM_ISA"]:
                     "starting at 0000:00:02.0."
                 )
 
+        def get_ddio_dma_ports(self):
+            """Coherent DDIO requestors: network devices only, never IDE."""
+            return (
+                [nic.dma for nic in getattr(self, "nics", [])]
+                + [rdma.dma for rdma in getattr(self, "rdmas", [])]
+            )
+
         def get_nic_bdfs(self) -> List[str]:
             return [
                 f"0000:{int(nic.pci_bus):02x}:{int(nic.pci_dev):02x}."
@@ -238,6 +245,13 @@ if buildEnv["USE_X86_ISA"]:
             return (
                 [self.pc.south_bridge.ide.dma]
                 + [nic.dma for nic in getattr(self, "nics", [])]
+                + [rdma.dma for rdma in getattr(self, "rdmas", [])]
+            )
+
+        def get_ddio_dma_ports(self):
+            """Coherent DDIO requestors: network devices only, never IDE."""
+            return (
+                [nic.dma for nic in getattr(self, "nics", [])]
                 + [rdma.dma for rdma in getattr(self, "rdmas", [])]
             )
 

@@ -11,7 +11,8 @@ ADDRESS = 0x80000000
 EXPECTED = bytes(64)
 
 nic_dma_categories = ["tx_payload_read"]
-nic_read_no_allocate = True
+ddio_eligible = [True]
+nic_read_no_allocate = False  # Eligibility, not this legacy knob, controls policy.
 hnf_enable_dmt = False
 ddio_way_part = 2
 

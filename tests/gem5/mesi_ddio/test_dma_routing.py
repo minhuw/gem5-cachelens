@@ -104,7 +104,7 @@ class DMARoutingStatsVerifier(verifier.Verifier):
 
         for event in ("ReadRequest", "Data", "WriteRequest", "Ack"):
             observed = self._integer_stat(
-                stats, f"system.ruby.DMA_Controller.{event}"
+                stats, f"system.ruby.DMA_Controller.{event}::total"
             )
             if observed != self._l2_banks:
                 test_util.fail(

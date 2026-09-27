@@ -34,6 +34,7 @@ REQUEST_DATA = bytes(OFFSET) + UPDATE + bytes(64 - OFFSET - len(UPDATE))
 EXPECTED = DIRTY_OWNER[:OFFSET] + UPDATE + DIRTY_OWNER[OFFSET + 16 :]
 
 nic_dma_categories = ["", "rx_desc_writeback", ""]
+ddio_eligible = [False, True, False]
 hnf_alloc_on_writeback = False
 ddio_way_part = 2
 

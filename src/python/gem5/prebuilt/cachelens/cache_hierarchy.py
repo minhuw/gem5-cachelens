@@ -754,12 +754,14 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
     def _create_dma_requestors(self, board: AbstractBoard):
         requestors = []
         sequence_base = 2 * board.get_processor().get_num_cores()
+        ddio_ports = getattr(board, "get_ddio_dma_ports", lambda: [])()
         for index, port in enumerate(board.get_dma_ports()):
             controller = DMARequestor(
                 self.ruby_system.network,
                 board.get_cache_line_size(),
                 board.get_clock_domain(),
             )
+            controller.ddio_eligible = any(port is p for p in ddio_ports)
             controller.emit_rx_write_stash = self._cache_stashing == "hnf"
             controller.sequencer = RubySequencer(
                 version=sequence_base + index,

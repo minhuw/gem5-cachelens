@@ -15,9 +15,10 @@ ADDRESS = 0x80000000
 EXPECTED = bytes(64)
 
 nic_dma_categories = ["tx_payload_read"]
-nic_read_no_allocate = False
+ddio_eligible = [False]
+nic_read_no_allocate = True  # Must not opt a noneligible requestor into DDIO.
 hnf_enable_dmt = False
-ddio_way_part = -1
+ddio_way_part = 2
 
 
 def test_generators(generators):

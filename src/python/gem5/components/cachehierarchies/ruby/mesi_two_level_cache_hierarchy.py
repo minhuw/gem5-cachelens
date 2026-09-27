@@ -192,12 +192,14 @@ class MESITwoLevelCacheHierarchy(
         self._dma_controllers = []
         if board.has_dma_ports():
             dma_ports = board.get_dma_ports()
+            ddio_ports = getattr(board, "get_ddio_dma_ports", lambda: [])()
             for i, port in enumerate(dma_ports):
                 ctrl = DMAController(
                     self.ruby_system.network,
                     cache_line_size,
                     l2_select_num_bits,
                 )
+                ctrl.ddio_eligible = any(port is p for p in ddio_ports)
                 ctrl.dma_sequencer = DMASequencer(
                     version=i,
                     in_ports=port,

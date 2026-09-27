@@ -59,6 +59,14 @@ class L2Cache(RubyCache):
 
 def define_options(parser):
     parser.add_argument(
+        "--ddio-dma-ports", type=int, nargs="*", default=[],
+        help="Indices in dma_ports eligible for DDIO (default: none)",
+    )
+    parser.add_argument(
+        "--ddio-way-part", type=int, default=-1,
+        help="DDIO LLC ways; -1 selects coherent write-through/no-retention",
+    )
+    parser.add_argument(
         "--num-clusters",
         type=int,
         default=1,
@@ -84,6 +92,8 @@ def define_options(parser):
 def create_system(
     options, full_system, system, dma_ports, bootmem, ruby_system, cpus
 ):
+    ddio_way_part = getattr(options, "ddio_way_part", -1)
+    ddio_dma_ports = getattr(options, "ddio_dma_ports", [])
     if buildEnv["PROTOCOL"] != "MESI_Three_Level":
         fatal(
             "This script requires the MESI_Three_Level protocol to be\
@@ -103,6 +113,8 @@ def create_system(
     l2_cntrl_nodes = []
     dma_cntrl_nodes = []
 
+    if ddio_dma_ports and options.num_clusters != 1:
+        fatal("DDIO DMA requires one shared LLC cluster")
     assert options.num_cpus % options.num_clusters == 0
     num_cpus_per_cluster = options.num_cpus // options.num_clusters
 
@@ -230,6 +242,9 @@ def create_system(
                 size=options.l2_size,
                 assoc=options.l2_assoc,
                 start_index_bit=l2_index_start,
+                ddio_way_part=ddio_way_part,
+                replacement_policy=(LRURP() if ddio_way_part > 0
+                                    else TreePLRURP()),
             )
 
             l2_cntrl = L2Cache_Controller(
@@ -289,6 +304,8 @@ def create_system(
         dir_cntrl.requestToMemory = MessageBuffer()
         dir_cntrl.responseFromMemory = MessageBuffer()
 
+    if any(i < 0 or i >= len(dma_ports) for i in ddio_dma_ports):
+        fatal("--ddio-dma-ports index outside dma_ports")
     for i, dma_port in enumerate(dma_ports):
         #
         # Create the Ruby objects associated with the dma controller
@@ -298,6 +315,8 @@ def create_system(
         dma_cntrl = DMA_Controller(
             version=i,
             dma_sequencer=dma_seq,
+            ddio_eligible=i in ddio_dma_ports,
+            l2_select_num_bits=l2_bits,
             transitions_per_cycle=options.ports,
             ruby_system=ruby_system,
         )
@@ -328,6 +347,7 @@ def create_system(
         io_controller = DMA_Controller(
             version=len(dma_ports),
             dma_sequencer=io_seq,
+            l2_select_num_bits=l2_bits,
             ruby_system=ruby_system,
         )
         ruby_system.io_controller = io_controller

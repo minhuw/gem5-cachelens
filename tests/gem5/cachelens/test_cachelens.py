@@ -637,7 +637,8 @@ def run_pcap_replay_tests(params):
     )
 
 
-for scenario in ("cold_full_write", "partial_dirty_owner", "pvrdma_provenance"):
+for scenario in ("eligible_untagged", "tagged_noneligible",
+                 "cold_full_write", "partial_dirty_owner", "pvrdma_provenance"):
     cachelens_chi_dma_test(scenario)
 
 # All normal NIC allocation ways, no stashing. Include old policies as controls.

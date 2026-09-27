@@ -97,6 +97,7 @@ def check_topology(board):
     assert len(hierarchy.dma_requestors) == 2
     for port, requestor in zip(board.get_dma_ports(), hierarchy.dma_requestors):
         assert requestor.sequencer.in_ports[0].peer is port
+        assert bool(requestor.ddio_eligible) == (port is board.nics[0].dma)
         assert list(requestor.downstream_destinations) == list(hierarchy.hnfs)
     for cluster in hierarchy.core_clusters:
         assert cluster.l1d.sequencer.mem_request_port.peer.simobj is board.iobus

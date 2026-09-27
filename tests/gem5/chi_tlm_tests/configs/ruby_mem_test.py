@@ -69,6 +69,7 @@ class TLM_RNF(CHI_Node):
         ruby_system,
         parent,
         classify_ddio=False,
+        ddio_eligible=False,
         nic_dma_category="",
     ):
         super().__init__(ruby_system)
@@ -77,6 +78,7 @@ class TLM_RNF(CHI_Node):
             version=Versions.getVersion(CHI_Cache_Controller),
             ruby_system=ruby_system,
             test_nic_rx_payload_write=classify_ddio,
+            ddio_eligible=ddio_eligible,
             test_nic_dma_category=nic_dma_category,
         )
 
@@ -94,6 +96,9 @@ class TLM_RNF(CHI_Node):
 
 
 def rnf_gen(options, ruby_system, cpus):
+    eligible = getattr(suite, "ddio_eligible", [False] * len(system.cpu))
+    if len(eligible) != len(system.cpu):
+        raise ValueError("ddio_eligible must match --num-cpus")
     classify_ddio = getattr(suite, "classify_ddio", False)
     default_category = getattr(suite, "nic_dma_category", "")
     categories = getattr(suite, "nic_dma_categories", None)
@@ -104,6 +109,7 @@ def rnf_gen(options, ruby_system, cpus):
             ruby_system,
             cpu,
             classify_ddio=classify_ddio,
+            ddio_eligible=eligible[index],
             nic_dma_category=(
                 categories[index] if categories is not None
                 else default_category

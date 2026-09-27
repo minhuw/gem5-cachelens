@@ -119,12 +119,15 @@ class CacheLensHierarchyTestSuite(unittest.TestCase):
                     del board.realview
                     buses = [IOXBar(), IOXBar()]
                     board.has_dma_ports.return_value = True
+                    board.get_ddio_dma_ports.return_value = [buses[1].mem_side_ports]
                     board.get_dma_ports.return_value = [
                         bus.mem_side_ports for bus in buses
                     ]
                     hierarchy.incorporate_cache(board)
                     self.assertEqual(2, len(hierarchy.hnfs))
                     self.assertEqual(2, len(hierarchy.dma_requestors))
+                    self.assertFalse(hierarchy.dma_requestors[0].ddio_eligible)
+                    self.assertTrue(hierarchy.dma_requestors[1].ddio_eligible)
                     for hnf in hierarchy.hnfs:
                         self.assertEqual(
                             mode == "hnf", bool(hnf.accept_write_stash)

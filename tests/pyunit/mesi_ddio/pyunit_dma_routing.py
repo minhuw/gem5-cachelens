@@ -95,10 +95,10 @@ class MESIDMARoutingTest(unittest.TestCase):
             "mapAddressToRange(address,MachineType:L2Cache,l2_select_low_bit,"
             "l2_select_num_bits,intToID(0))"
         )
-        self.assertEqual(dma.count(dma_mapping), 2)
+        self.assertEqual(dma.count(dma_mapping), 1)
         self.assertGreaterEqual(l1.count(l1_mapping), 1)
 
-    def test_classification_uses_only_preserved_request_provenance(
+    def test_routing_uses_explicit_eligibility_not_tags(
         self,
     ) -> None:
         source = _DMA.read_text(encoding="utf-8")
@@ -106,9 +106,9 @@ class MESIDMARoutingTest(unittest.TestCase):
             _braced_body(source, "MachineID mapDMARequestToMachine")
         )
 
-        self.assertIn("if(is_seq_req_valid)", body)
-        self.assertIn("isNicDmaRead(seq_req)", body)
-        self.assertIn("isNicDmaWrite(seq_req)", body)
+        self.assertIn("if(ddio_eligible)", body)
+        self.assertNotIn("isNicDma", body)
+        self.assertNotIn("seq_req", body)
         self.assertIn(
             "returnmapAddressToMachine(addr,MachineType:Directory);", body
         )
@@ -161,7 +161,8 @@ class MESIDMARoutingTest(unittest.TestCase):
                 if count:
                     enabled[path] = count
 
-        self.assertEqual(enabled, {_LEGACY: 2, _STDLIB: 1})
+        self.assertEqual(enabled, {_LEGACY: 2, _STDLIB: 1,
+            _RUBY_HIERARCHIES / "mesi_three_level_cache_hierarchy.py": 1})
 
     def test_masked_dma_rejection_precedes_protocol_admission(self) -> None:
         source = _DMA_SEQUENCER_CC.read_text(encoding="utf-8")
@@ -250,8 +251,7 @@ class MESIDMARoutingTest(unittest.TestCase):
                 "DMA_WRITE_FULL",
                 "DMA_WRITE_PARTIAL",
                 "DMA_WRITE_NORETAIN",
-                "DMA_TX_READ",
-                "DMA_DESC_READ",
+                "DMA_READ_NOALLOC",
                 "DMA_OTHER",
                 "L2_Replacement",
                 "L2_Replacement_clean",
@@ -281,11 +281,11 @@ class MESIDMARoutingTest(unittest.TestCase):
             "transition(M,DMA_WRITE_PARTIAL)",
             "transition(SS,DMA_WRITE_PARTIAL,DM_WS)",
             "transition(MT,DMA_WRITE_PARTIAL,DM_WM)",
-            "transition(NP,DMA_TX_READ)",
-            "transition({SS,M},DMA_TX_READ)",
-            "transition(MT,DMA_TX_READ,DM_RT)",
+            "transition(NP,DMA_READ_NOALLOC)",
+            "transition({SS,M},DMA_READ_NOALLOC)",
+            "transition(MT,DMA_READ_NOALLOC,DM_RT)",
             "transition({NP,SS,M,MT},DMA_WRITE_NORETAIN)",
-            "transition({NP,SS,M,MT},{DMA_DESC_READ,DMA_OTHER})",
+            "transition({NP,SS,M,MT},DMA_OTHER)",
         ):
             self.assertIn(transition, compact)
 
@@ -293,7 +293,7 @@ class MESIDMARoutingTest(unittest.TestCase):
             "transition({M_I,MT_I,MCT_I,I_I,S_I,ISS,IS,IM,SS_MB,MT_MB,"
             "MT_IIB,MT_IB,MT_SB,DM_WF,DM_WI,DM_WS,DM_WM,DM_RT},"
             "{DMA_WRITE_FULL,DMA_WRITE_PARTIAL,DMA_WRITE_NORETAIN,"
-            "DMA_TX_READ,DMA_DESC_READ,DMA_OTHER})"
+            "DMA_READ_NOALLOC,DMA_OTHER})"
             "{zdr_recycleDMARequestQueue;}"
         )
         self.assertIn(transient_transition, compact)

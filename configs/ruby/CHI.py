@@ -42,6 +42,14 @@ from .Ruby import create_topology
 
 def define_options(parser):
     parser.add_argument(
+        "--ddio-dma-ports", type=int, nargs="*", default=[],
+        help="Indices in dma_ports eligible for DDIO (default: none)",
+    )
+    parser.add_argument(
+        "--ddio-way-part", type=int, default=-1,
+        help="DDIO HNF ways; -1 selects coherent write-through/no-retention",
+    )
+    parser.add_argument(
         "--chi-config",
         action="store",
         type=str,
@@ -66,6 +74,7 @@ def read_config_file(file):
 def create_system(
     options, full_system, system, dma_ports, bootmem, ruby_system, cpus
 ):
+    ddio_dma_ports = getattr(options, "ddio_dma_ports", [])
     if buildEnv["PROTOCOL"] != "CHI":
         m5.panic("This script requires the CHI build")
 
@@ -217,11 +226,14 @@ def create_system(
 
     # Creates the controller for dma ports and io
 
+    if any(i < 0 or i >= len(dma_ports) for i in ddio_dma_ports):
+        fatal("--ddio-dma-ports index outside dma_ports")
     if len(dma_ports) > 0:
         ruby_system.dma_rni = [
             CHI_RNI_DMA(ruby_system, dma_port, None) for dma_port in dma_ports
         ]
-        for rni in ruby_system.dma_rni:
+        for i, rni in enumerate(ruby_system.dma_rni):
+            rni._cntrl.ddio_eligible = i in ddio_dma_ports
             network_nodes.append(rni)
             network_cntrls.extend(rni.getNetworkSideControllers())
             all_cntrls.extend(rni.getAllControllers())

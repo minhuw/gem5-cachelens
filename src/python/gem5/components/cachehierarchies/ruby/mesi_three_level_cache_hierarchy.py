@@ -222,6 +222,7 @@ class MESIThreeLevelCacheHierarchy(
         self._dma_controllers = []
         if board.has_dma_ports():
             dma_ports = board.get_dma_ports()
+            ddio_ports = getattr(board, "get_ddio_dma_ports", lambda: [])()
             for i, port in enumerate(dma_ports):
                 ctrl = DMAController(
                     DMASequencer(
@@ -233,6 +234,7 @@ class MESIThreeLevelCacheHierarchy(
                     self.ruby_system,
                     l2_select_num_bits=self._l3_select_num_bits,
                 )
+                ctrl.ddio_eligible = any(port is p for p in ddio_ports)
                 self._dma_controllers.append(ctrl)
 
         self.ruby_system.num_of_sequencers = len(self._l1_controllers) + len(

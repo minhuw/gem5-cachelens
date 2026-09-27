@@ -20,6 +20,7 @@ REQUEST_DATA = ORIGINAL[:OFFSET] + UPDATE + ORIGINAL[OFFSET + 16 :]
 EXPECTED = ORIGINAL[:OFFSET] + UPDATE + ORIGINAL[OFFSET + 16 :]
 
 nic_dma_categories = ["", "rx_desc_writeback", ""]
+ddio_eligible = [False, True, False]
 hnf_alloc_on_writeback = True
 ddio_way_part = -1
 

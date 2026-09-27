@@ -65,6 +65,7 @@ class MESIDMAProvenanceTest(unittest.TestCase):
             "accessMask": "in_msg.writeMask",
             "seqReq": "in_msg.seqReq",
             "isSeqReqValid": "in_msg.isSeqReqValid",
+            "ddioEligible": "ddio_eligible",
         }
 
         for action_name in ("s_sendReadRequest", "s_sendWriteRequest"):

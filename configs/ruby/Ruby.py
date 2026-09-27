@@ -250,9 +250,11 @@ def create_system(
     if getattr(options, "ddio_way_part", -1) != -1 and protocol not in (
         "CHI",
         "MESI_Two_Level",
+        "MESI_Three_Level",
     ):
         raise ValueError(
-            "--ddio-way-part is only supported by CHI and MESI_Two_Level"
+            "--ddio-way-part is only supported by CHI, MESI_Two_Level "
+            "and MESI_Three_Level"
         )
     exec(f"from . import {protocol}")
     try:

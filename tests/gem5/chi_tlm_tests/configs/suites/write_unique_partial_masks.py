@@ -36,6 +36,7 @@ for offset in SPARSE_OFFSETS:
     EXPECTED[offset] = SPARSE_DATA[offset]
 
 nic_dma_categories = ["", "rx_desc_writeback", "rx_desc_writeback", ""]
+ddio_eligible = [False, True, True, False]
 hnf_alloc_on_writeback = False
 ddio_way_part = 2
 

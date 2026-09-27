@@ -135,9 +135,26 @@ class CacheLensMESIThreeLevelHierarchyTestSuite(unittest.TestCase):
         board.get_clock_domain.return_value = SimObjectStub(voltage_domain=object())
         board.has_io_bus.return_value = True
         board.has_dma_ports.return_value = dma
+        board.get_ddio_dma_ports.return_value = []
         board.get_dma_ports.return_value = [object(), object()] if dma else []
         board.get_mem_ports.return_value = [(object(), object())]
         return board
+
+    def test_dma_eligibility_is_explicit_and_defaults_off(self):
+        for selected in (False, True):
+            with self.subTest(selected=selected):
+                board = self.board()
+                ports = board.get_dma_ports()
+                if selected:
+                    board.get_ddio_dma_ports.return_value = [ports[1]]
+                else:
+                    del board.get_ddio_dma_ports
+                hierarchy = self.hierarchy()
+                hierarchy.incorporate_cache(board)
+                self.assertEqual(
+                    [False, selected],
+                    [dma.ddio_eligible for dma in hierarchy.dma_controllers],
+                )
 
     def test_native_wiring_and_callbacks(self):
         h = self.hierarchy(

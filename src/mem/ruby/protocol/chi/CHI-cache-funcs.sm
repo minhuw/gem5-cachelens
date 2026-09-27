@@ -468,14 +468,23 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
 
   tbe.isSeqReqValid := in_msg.isSeqReqValid;
   tbe.seqReq := in_msg.seqReq;
+  tbe.ddioEligible := in_msg.ddioEligible;
   tbe.is_local_pf := in_msg.is_local_pf;
   tbe.is_remote_pf := in_msg.is_remote_pf;
 
-  // NIC classification: the original gem5 request (from the NIC's DMA
-  // port) carries the category flags end-to-end. Accepted stash hints can
-  // override placement; payload/header telemetry remains category-specific.
-  tbe.is_ddio_write := is_HN && in_msg.isSeqReqValid &&
-      cache.isNicDdioWriteReq(in_msg.seqReq);
+  // Policy uses eligibility and the CHI operation, never optional NIC tags.
+  // Stash opcodes have already been normalized above.
+  tbe.is_ddio_write := is_HN && in_msg.ddioEligible &&
+      (tbe.reqType == CHIRequestType:WriteUniqueFull ||
+       tbe.reqType == CHIRequestType:WriteUniquePtl ||
+       tbe.reqType == CHIRequestType:WriteUniqueZero);
+  tbe.is_ddio_read := is_HN && in_msg.ddioEligible &&
+      (tbe.reqType == CHIRequestType:ReadOnce ||
+       tbe.reqType == CHIRequestType:ReadShared ||
+       tbe.reqType == CHIRequestType:ReadNotSharedDirty ||
+       tbe.reqType == CHIRequestType:ReadUnique ||
+       tbe.reqType == CHIRequestType:MakeReadUnique);
+  // Optional source/category profiling remains independent of eligibility.
   tbe.is_ddio_payload := is_HN && in_msg.isSeqReqValid &&
       cache.isNicRxPayloadWriteReq(in_msg.seqReq);
   tbe.is_ddio_header := is_HN && in_msg.isSeqReqValid &&
@@ -495,7 +504,7 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   // a block without replacing seqReq. Rejected requests never allocate a TBE;
   // downstream retries reuse this TBE and do not repeat profiling.
   if (is_HN && in_msg.isSeqReqValid &&
-      (tbe.is_ddio_write || tbe.is_nic_read)) {
+      (cache.isNicDdioWriteReq(in_msg.seqReq) || tbe.is_nic_read)) {
     int nic_dma_bytes := cache.getNicDmaRequestSize(in_msg.seqReq);
     if (!in_msg.accessMask.isEmpty()) {
       nic_dma_bytes := in_msg.accessMask.count();
@@ -503,7 +512,7 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
     assert((nic_dma_bytes > 0) && (nic_dma_bytes <= blockSize));
 
     bool write_partial := false;
-    if (tbe.is_ddio_write) {
+    if (cache.isNicDdioWriteReq(in_msg.seqReq)) {
       // NIC device writes must state their extent explicitly. In particular,
       // a classified WriteUniqueZero is malformed and must not be projected
       // into either write class.
@@ -565,6 +574,7 @@ TBE allocateDvmRequestTBE(Addr txnId, CHIRequestMsg in_msg), return_by_pointer="
 
   tbe.isSeqReqValid := in_msg.isSeqReqValid;
   tbe.seqReq := in_msg.seqReq;
+  tbe.ddioEligible := in_msg.ddioEligible;
   tbe.is_local_pf := in_msg.is_local_pf;
   tbe.is_remote_pf := in_msg.is_remote_pf;
 
@@ -744,6 +754,7 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   tbe.pendReqType := type;
   out_msg.isSeqReqValid := tbe.isSeqReqValid;
   out_msg.seqReq := tbe.seqReq;
+  out_msg.ddioEligible := tbe.ddioEligible;
   out_msg.is_local_pf := false;
   out_msg.is_remote_pf := tbe.is_local_pf || tbe.is_remote_pf;
   out_msg.txnId := tbe.txnId;
@@ -789,6 +800,7 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.retToSrc := tbe.pendReqRetToSrc;
   out_msg.isSeqReqValid := tbe.isSeqReqValid;
   out_msg.seqReq := tbe.seqReq;
+  out_msg.ddioEligible := tbe.ddioEligible;
   out_msg.is_local_pf := false;
   out_msg.is_remote_pf := tbe.is_local_pf || tbe.is_remote_pf;
   out_msg.atomic_op.clear();
@@ -813,6 +825,7 @@ void prepareRequestRetryDVM(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.retToSrc := tbe.pendReqRetToSrc;
   out_msg.isSeqReqValid := tbe.isSeqReqValid;
   out_msg.seqReq := tbe.seqReq;
+  out_msg.ddioEligible := tbe.ddioEligible;
   out_msg.is_local_pf := false;
   out_msg.is_remote_pf := tbe.is_local_pf || tbe.is_remote_pf;
 }

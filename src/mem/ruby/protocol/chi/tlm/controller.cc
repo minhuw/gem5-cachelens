@@ -85,7 +85,8 @@ nicDmaCategory(const CacheController::Params &p)
 
 CacheController::CacheController(const Params &p)
   : CHIGenericController(p),
-    testNicDmaCategory(nicDmaCategory(p))
+    testNicDmaCategory(nicDmaCategory(p)),
+    ddioEligible(p.ddio_eligible)
 {
 }
 
@@ -359,6 +360,7 @@ CacheController::sendRequestMsg(ARM::CHI::Payload &payload,
         req_msg->m_accessMask =
             ruby::WriteMask(byte_enabled.size(), byte_enabled);
     }
+    req_msg->m_ddioEligible = ddioEligible;
     req_msg->m_requestor = getMachineID();
     req_msg->m_fwdRequestor = getMachineID();
     req_msg->m_dataToFwdRequestor = false;

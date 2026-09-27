@@ -83,6 +83,9 @@ class DirectedBoard:
         return True
 
     def get_dma_ports(self):
+        return [self.system.tester.dma_port, self.system.tester.dma_race_port]
+
+    def get_ddio_dma_ports(self):
         return [self.system.tester.dma_port]
 
     def get_memory(self):
@@ -100,6 +103,7 @@ class DirectedBoard:
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--scenario", required=True, choices=(
+    "eligible_untagged", "tagged_noneligible",
     "cold_full_write", "partial_dirty_owner", "pvrdma_provenance",
     "stash_partial_cold", "partial_ss_sharers", "hit_update",
     "stash_unclassified", "stash_replacement", "stash_clean_owner",
@@ -153,7 +157,10 @@ assert metadata["hnf_inclusion"] == args.hnf_inclusion
 assert metadata["ddio_way_part"] == ddio
 assert metadata["nic_read_no_allocate"] is False
 assert len(hierarchy.core_clusters) == 2
-assert len(hierarchy.hnfs) == len(hierarchy.dma_requestors) == 1
+assert len(hierarchy.hnfs) == 1
+assert len(hierarchy.dma_requestors) == 2
+assert bool(hierarchy.dma_requestors[0].ddio_eligible)
+assert not bool(hierarchy.dma_requestors[1].ddio_eligible)
 assert len(hierarchy.misc_nodes) == 1
 for cluster in hierarchy.core_clusters:
     assert list(cluster.l1d.downstream_destinations) == [cluster.l2]
@@ -197,6 +204,12 @@ if stash_test:
     assert bool(hnf.accept_write_stash) == (
         args.cache_stashing == "hnf" and not args.decline_stash
     )
+
+if args.scenario == "tagged_noneligible":
+    # Distinguish generic behavior from DDIO even when tags and the legacy
+    # knob are set: the write bypasses; the generic read may allocate.
+    hnf.alloc_on_writeback = False
+    hnf.nic_read_no_allocate = True
 
 root = Root(full_system=False, system=system)
 m5.ticks.setGlobalFrequency("1ps")
@@ -252,6 +265,22 @@ expected = {
     "rdmaTxPayloadRequests": int(rdma),
     "rdmaRxPayloadCpuUniqueLines": int(rdma),
 }
+if args.scenario == "eligible_untagged":
+    expected = {"rxPayloadRequests": 0, "txPayloadRequests": 3,
+                "txPayloadHits": 2, "txPayloadMisses": 1,
+                "nicDescReadRequests": 2}
+    fills = hnf.cache.resolveStat("ddioWayFill")
+    fills.prepare()
+    assoc = int(hnf.cache.assoc)
+    untagged = fills.value[3 * assoc : 4 * assoc]
+    assert sum(fills.value) == sum(untagged) == 2, fills.value
+    assert all(v == 0 for v in untagged[ddio:]), untagged
+elif args.scenario == "tagged_noneligible":
+    expected = {"rxPayloadRequests": 1, "txPayloadRequests": 2,
+                "txPayloadHits": 1, "txPayloadMisses": 1}
+    fills = hnf.cache.resolveStat("ddioAllocWays")
+    fills.prepare()
+    assert sum(fills.value) == 0, fills.value
 if args.scenario in ("stash_partial_cold", "stash_clean_owner"):
     expected.update(nicDmaWriteRequests=2, nicDescWriteRequests=1)
 if args.scenario == "stash_unclassified":

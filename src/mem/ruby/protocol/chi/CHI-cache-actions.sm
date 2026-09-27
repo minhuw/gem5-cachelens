@@ -143,6 +143,7 @@ action(AllocateTBE_SeqRequest, desc="") {
       out_msg.fwdRequestor := machineID;
       out_msg.seqReq := in_msg.getRequestPtr();
       out_msg.isSeqReqValid := true;
+      out_msg.ddioEligible := ddio_eligible;
       assert(in_msg.Prefetch == PrefetchBit:No);
       out_msg.is_local_pf := false;
       out_msg.is_remote_pf := false;
@@ -279,11 +280,11 @@ action(Initiate_Request, desc="") {
   bool dealloc_entry := needDeallocCacheEntry(tbe.reqType);
   // Accepted stash hints override the NIC DDIO allocation policy. Other
   // NIC writes use its subset or write-through/no-retention when disabled.
-  // NIC-read no-allocation is an explicit controller/profile policy.
+  // Eligible reads never allocate, regardless of optional semantic tags.
   if (is_HN && is_invalid(cache_entry)) {
     if (acceptedWriteStash(tbe)) {
       alloc_entry := true;
-    } else if (tbe.is_nic_read && nic_read_no_allocate) {
+    } else if (tbe.is_ddio_read) {
       alloc_entry := false;
     } else if (tbe.is_ddio_write) {
       alloc_entry := cache.getDDIOWayPart() > 0;
@@ -1272,7 +1273,7 @@ action(Prepare_DDIOWrite, desc="") {
       tbe.reqType == CHIRequestType:WriteUniquePtl, tbe.dataValid);
   if (needs_read) {
     assert(tbe.is_ddio_write || acceptedWriteStash(tbe));
-    if (tbe.is_ddio_write && tbe.isSeqReqValid) {
+    if (tbe.isSeqReqValid && cache.isNicDdioWriteReq(tbe.seqReq)) {
       assert(tbe.nic_merge_read_profiled == false);
       cache.profileNicDmaMergeRead(tbe.seqReq);
       tbe.nic_merge_read_profiled := true;
@@ -3813,6 +3814,11 @@ action(CheckCacheFill, desc="") {
 
   // only perform the write if we have valid data and need to write
   bool need_fill := tbe.dataValid && (tbe.dataToBeInvalid == false) && tbe.doCacheFill;
+  // A read hit may update its existing line, but must never allocate if
+  // that line disappears while the transaction is in progress.
+  if (tbe.is_ddio_read && is_invalid(cache_entry)) {
+    need_fill := false;
+  }
   bool execute_next := true;
 
   // Accepted no-target stash hints use all ordinary ways. DDIO fills without

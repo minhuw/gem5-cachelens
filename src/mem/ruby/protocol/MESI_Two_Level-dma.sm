@@ -30,6 +30,7 @@
 machine(MachineType:DMA, "DMA Controller")
 : DMASequencer * dma_sequencer;
   int l2_select_num_bits;
+  bool ddio_eligible := "False";
   Cycles request_latency := 6;
 
   MessageBuffer * responseFromDir, network="From", virtual_network="1",
@@ -74,24 +75,12 @@ machine(MachineType:DMA, "DMA Controller")
   Tick clockEdge();
   MachineID mapAddressToMachine(Addr addr, MachineType mtype);
 
-  MachineID mapDMARequestToMachine(Addr addr, RequestPtr seq_req,
-                                   bool is_seq_req_valid, bool is_read) {
-    if (is_seq_req_valid) {
-      if (is_read) {
-        if (isNicDmaRead(seq_req)) {
-          return mapAddressToRange(addr, MachineType:L2Cache,
-                                   l2_select_low_bit, l2_select_num_bits,
-                                   intToID(0));
-        }
-      } else {
-        if (isNicDmaWrite(seq_req)) {
-          return mapAddressToRange(addr, MachineType:L2Cache,
-                                   l2_select_low_bit, l2_select_num_bits,
-                                   intToID(0));
-        }
-      }
+  MachineID mapDMARequestToMachine(Addr addr) {
+    if (ddio_eligible) {
+      return mapAddressToRange(addr, MachineType:L2Cache,
+                               l2_select_low_bit, l2_select_num_bits,
+                               intToID(0));
     }
-
     return mapAddressToMachine(addr, MachineType:Directory);
   }
 
@@ -169,8 +158,8 @@ machine(MachineType:DMA, "DMA Controller")
         out_msg.accessMask := in_msg.writeMask;
         out_msg.seqReq := in_msg.seqReq;
         out_msg.isSeqReqValid := in_msg.isSeqReqValid;
-        out_msg.Destination.add(mapDMARequestToMachine(
-            address, in_msg.seqReq, in_msg.isSeqReqValid, true));
+        out_msg.ddioEligible := ddio_eligible;
+        out_msg.Destination.add(mapDMARequestToMachine(address));
         out_msg.MessageSize := MessageSizeType:Writeback_Control;
       }
     }
@@ -189,8 +178,8 @@ machine(MachineType:DMA, "DMA Controller")
           out_msg.accessMask := in_msg.writeMask;
           out_msg.seqReq := in_msg.seqReq;
           out_msg.isSeqReqValid := in_msg.isSeqReqValid;
-          out_msg.Destination.add(mapDMARequestToMachine(
-              address, in_msg.seqReq, in_msg.isSeqReqValid, false));
+          out_msg.ddioEligible := ddio_eligible;
+          out_msg.Destination.add(mapDMARequestToMachine(address));
           out_msg.MessageSize := MessageSizeType:Writeback_Control;
         }
       }

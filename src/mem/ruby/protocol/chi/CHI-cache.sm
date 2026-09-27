@@ -131,8 +131,11 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // possible.
   bool enable_DCT;
 
-  // Prevent classified NIC reads from allocating an HNF line on a miss.
-  // This is a model/profile choice, not an unconditional CHI rule.
+  // Explicit requestor opt-in, propagated to the HNF independently of tags.
+  bool ddio_eligible := "False";
+
+  // Compatibility parameter: eligible reads always bypass miss allocation;
+  // noneligible reads always use generic CHI policy, regardless of this knob.
   bool nic_read_no_allocate := "False";
 
   // Synthetic bridge policy: hint system-cache allocation for RX payloads.
@@ -694,13 +697,15 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     // Accepted hints override DDIO allocation; payload/header provenance
     // and telemetry remain independent of that placement decision.
     bool is_write_stash,    default="false",   desc="Original request carried a no-target write-stash hint";
-    bool is_ddio_write,     default="false",   desc="NIC DMA write subject to DDIO policy";
+    bool ddioEligible, default="false", desc="Preserved requestor eligibility";
+    bool is_ddio_read, default="false", desc="Eligible coherent DMA read";
+    bool is_ddio_write,     default="false",   desc="Eligible coherent DMA write subject to DDIO policy";
     bool is_ddio_payload,   default="false",   desc="NIC RX payload DMA write";
     bool is_ddio_header,    default="false",   desc="NIC RX header DMA write";
     bool is_tx_payload,     default="false",   desc="NIC TX payload DMA read";
     bool is_pvrdma,         default="false",   desc="PVRDMA payload provenance";
     bool is_nic_desc,       default="false",   desc="NIC descriptor DMA";
-    bool is_nic_read,       default="false",   desc="NIC DMA read subject to the profile allocation policy";
+    bool is_nic_read,       default="false",   desc="Optional NIC DMA read category for telemetry";
     bool ddio_access_profiled, default="false", desc="DDIO way access already recorded";
     bool nic_merge_read_profiled, default="false",
          desc="Partial NIC write merge read already recorded";

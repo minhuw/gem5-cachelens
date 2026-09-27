@@ -182,6 +182,20 @@ _EXPECTED = {
     },
 }
 
+_EXPECTED["eligible_untagged"] = {
+    "rxPayloadRequests": 0, "txPayloadRequests": 3,
+    "txPayloadHits": 2, "txPayloadMisses": 1,
+    "ddioWayFill::cpu_other_way0": 2, "ddioWayFill::total": 2,
+    "ddioOwnershipRequests": 2, "ddioOwnershipAcks": 2,
+    "dmaRoutingProxyRequests": 3,
+}
+_EXPECTED["tagged_noneligible"] = {
+    "rxPayloadRequests": 0, "txPayloadRequests": 1,
+    "txPayloadHits": 0, "txPayloadMisses": 1,
+    "ddioWayFill::total": 0, "ddioOwnershipRequests": 0,
+    "dmaRoutingProxyRequests": 1,
+}
+
 # Per-bank expectations from test_dma_routing.py (not summed across banks).
 _EXPECTED["routing_full_line"] = {
     "dmaRoutingProxyRequests": 0,
@@ -224,7 +238,7 @@ class ThreeLevelStatsVerifier(verifier.Verifier):
         }
         if self.scenario == "routing_full_line":
             for event in ("ReadRequest", "Data", "WriteRequest", "Ack"):
-                expected[f"{_RUBY}DMA_Controller.{event}"] = self.banks
+                expected[f"{_RUBY}DMA_Controller.{event}::total"] = self.banks
         for name, value in expected.items():
             if stats.get(name) != value:
                 test_util.fail(

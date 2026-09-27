@@ -72,13 +72,13 @@ MESI two-level profile retains its historical, different parameter mapping.
 Three-level MESI backend names are one level lower: Ruby `L0Cache`, `L1Cache`,
 and `L2Cache` correspond to physical L1, L2, and L3. Its shared controller
 reuses the fork's MESI DMA routing, partial writes, ownership, replacement,
-and PVRDMA payload attribution. Classified payload DMA goes to the shared L3,
+and PVRDMA payload attribution. Eligible coherent DMA goes to the shared L3,
 not a private L2. Shared-LLC evictions invalidate private copies through both
 private levels. CPU caches do not receive the DDIO way partition.
 
 LLC indexing can be `linear` or experimental `splitmix64`; bank selection
-remains explicit low address bits. MESI classified TX payload reads use the
-existing fixed no-allocation behavior. Matching capacities does not imply that
+remains explicit low address bits. Eligible DMA reads (including descriptors and untagged reads) use coherent
+no-allocation behavior in both MESI and CHI. Matching capacities does not imply that
 CHI and MESI have identical transaction latency or replacement behavior.
 
 ## Validation boundaries
@@ -103,3 +103,39 @@ CHI and MESI have identical transaction latency or replacement behavior.
   model. The CacheLens full-system attachment remains explicitly x86-only.
 - Freeze physical/model inputs before scoring accuracy; do not fit separate
   architecture-specific coefficients to the evaluation hit rates.
+
+## Explicit DMA eligibility
+
+DDIO is a requestor policy, not a NIC semantic-tag policy. The default-false
+`ddio_eligible` controller parameter is carried in Ruby requests (including CHI
+forwarding and retries). Eligible full/partial writes use the DDIO way subset;
+`ddio_way_part=-1` instead uses coherent write-through/no-retention. Eligible
+reads never allocate on misses and may use an existing LLC line on hits.
+Descriptor, payload, RDMA and untagged reads follow the same path. Tags only
+provide optional source/category telemetry; untagged traffic is CPU/other in
+per-source way counters. The legacy `ddioAllocWays` histogram remains
+category-based; use `ddioWayFill` plus port-policy configuration for untagged
+allocation checks. Noneligible traffic keeps the generic protocol path,
+even when tagged.
+
+CacheLens ARM/x86 boards expose `get_ddio_dma_ports()`: NIC and RDMA ports,
+never IDE. Both stdlib MESI hierarchies and CacheLens CHI consume this opt-in;
+boards without the method select no ports. The maintained SimBricks MESI
+`AccuracyBoard` (outer `gem5/experiments/i40e-rxonly/board.py`) inherits
+`CacheLensX86Board`, populates `nics` with its `SimBricksPci`, and uses
+`CacheLensMESIThreeLevelHierarchy`; it therefore selects only that NIC port,
+without requiring `semantic_dma`. ARM CacheLens subclasses inherit the same
+network-only selection. Legacy MESI/CHI configs accept `--ddio-dma-ports` with
+explicit zero-based DMA port indices (default empty); legacy three-level MESI
+DDIO requires one shared LLC cluster.
+
+CHI's public `nic_read_no_allocate` parameter remains accepted for configuration
+compatibility. It neither enables DDIO nor overrides eligibility: eligible
+reads always no-allocate, noneligible reads use generic CHI policy. Historical
+profile metadata still reports that knob. Accepted write-stash hints retain
+their independent ordinary-way allocation behavior; automatic RX-payload stash
+hint emission remains a separate, tag-dependent feature.
+
+For synthetic legacy MemTest traffic, select policy and telemetry separately,
+e.g. `--num-dmas=1 --num-nic-dmas=1 --ddio-dma-ports 0`. The semantic option
+alone no longer enables DDIO.

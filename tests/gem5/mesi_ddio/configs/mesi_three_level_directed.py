@@ -81,6 +81,9 @@ class DirectedBoard:
         return True
 
     def get_dma_ports(self):
+        return [self.system.tester.dma_port, self.system.tester.dma_race_port]
+
+    def get_ddio_dma_ports(self):
         return [self.system.tester.dma_port]
 
     def get_mem_ports(self):
@@ -141,7 +144,9 @@ assert metadata["bank_select_bits"] == args.num_hnfs.bit_length() - 1
 assert len(hierarchy.l1_controllers) == len(hierarchy.l2_controllers) == 2
 assert len(hierarchy.l3_controllers) == args.num_hnfs
 assert len(hierarchy.directory_controllers) == 1
-assert len(hierarchy.dma_controllers) == 1
+assert len(hierarchy.dma_controllers) == 2
+assert bool(hierarchy.dma_controllers[0].ddio_eligible)
+assert not bool(hierarchy.dma_controllers[1].ddio_eligible)
 for l1, l2 in zip(hierarchy.l1_controllers, hierarchy.l2_controllers):
     assert l1.type == "MESI_Three_Level_L0Cache_Controller"
     assert l2.type == "MESI_Three_Level_L1Cache_Controller"

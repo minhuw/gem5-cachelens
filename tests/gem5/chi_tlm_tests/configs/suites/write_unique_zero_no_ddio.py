@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""A classified WriteUniqueZero is write-through with DDIO disabled."""
+"""An eligible untagged WriteUniqueZero is write-through when disabled."""
 
 from m5.stats.gem5stats import get_simstat
 from m5.tlm_chi import ReqOpcode
@@ -19,7 +19,8 @@ from chi_tlm_test_utils import (
 ADDRESS = 0x80000000
 ORIGINAL = bytes((0x70 + index) & 0xFF for index in range(64))
 
-nic_dma_categories = ["rx_payload", "", "rx_payload", ""]
+nic_dma_categories = ["rx_payload", "", "", ""]
+ddio_eligible = [True, False, True, False]
 hnf_alloc_on_writeback = True
 hnf_enable_dmt = False
 ddio_way_part = -1
@@ -68,7 +69,7 @@ def check(system):
     deallocations = vector_values(find_stat(stats, "wayDeallocations"))
     assoc = len(deallocations)
     cpu_accesses = accesses[3 * assoc : 4 * assoc]
-    assert sum(cpu_accesses) == 0, cpu_accesses
+    assert sum(cpu_accesses) == 1, cpu_accesses  # Untagged zero-write hit.
     assert sum(deallocations) >= 1, deallocations
     print(
         "No-DDIO WriteUniqueZero backing-memory publication and "
