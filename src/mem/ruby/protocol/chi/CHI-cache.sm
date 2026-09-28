@@ -696,6 +696,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     bool ddioEligible, default="false", desc="Preserved requestor eligibility";
     bool is_ddio_read, default="false", desc="Eligible coherent DMA read";
     bool is_ddio_write,     default="false",   desc="Eligible coherent DMA write subject to DDIO policy";
+    bool dma_lookup_profiled, default="false", desc="Accepted DMA lookup recorded";
     bool ddio_access_profiled, default="false", desc="DDIO way access already recorded";
     bool stale_wb_path,     default="false",   desc="Writeback handled via stale-copyback path";
 

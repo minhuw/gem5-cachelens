@@ -4,7 +4,7 @@
 from m5.stats.gem5stats import get_simstat
 from m5.tlm_chi import Size
 
-from chi_tlm_test_utils import find_stat, schedule_read, vector_values
+from chi_tlm_test_utils import check_dma_lookups, find_stat, schedule_read, vector_values
 
 
 ADDRESS = 0x80000000
@@ -39,6 +39,7 @@ def test_generators(generators):
 def check(system):
     # Data bytes, masks, snoops and completion ordering are checked above.
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
+    check_dma_lookups(stats, 0, 2, 0, 0)
     assert sum(vector_values(find_stat(stats, "ddioWayFill"))) == 0
     assert sum(vector_values(find_stat(stats, "ddioWayAccess"))) == 0
     assert find_stat(stats, "m_demand_misses") == 2

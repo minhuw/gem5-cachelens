@@ -295,6 +295,14 @@ class CacheMemory : public SimObject
           statistics::Scalar ddioOwnershipRequests;
           statistics::Scalar ddioOwnershipAcks;
 
+          // dma-llc-tag-v1: accepted eligible DMA lookups, before mutation.
+          statistics::Scalar dmaReadRequests;
+          statistics::Scalar dmaReadHits;
+          statistics::Scalar dmaReadMisses;
+          statistics::Scalar dmaWriteRequests;
+          statistics::Scalar dmaWriteHits;
+          statistics::Scalar dmaWriteMisses;
+
           // Aggregate eligible DMA way accounting, without source metadata.
           statistics::Vector ddioAllocWays;
           statistics::Vector ddioWayAccess;
@@ -309,6 +317,19 @@ class CacheMemory : public SimObject
       void profileDemandMiss();
       void profilePrefetchHit();
       void profilePrefetchMiss();
+
+      void profileDmaLookup(bool is_read, bool hit)
+      {
+          if (is_read) {
+              cacheMemoryStats.dmaReadRequests++;
+              if (hit) cacheMemoryStats.dmaReadHits++;
+              else cacheMemoryStats.dmaReadMisses++;
+          } else {
+              cacheMemoryStats.dmaWriteRequests++;
+              if (hit) cacheMemoryStats.dmaWriteHits++;
+              else cacheMemoryStats.dmaWriteMisses++;
+          }
+      }
 
       void profileDmaRoutingProxy()
       {

@@ -228,6 +228,7 @@ structure (CacheMemory, external = "yes") {
   void profileWriteStash(bool);
   void profileWriteStashAllocation();
   bool ddioWriteNeedsRead(bool, bool);
+  void profileDmaLookup(bool, bool);
   void profileDdioWayAccess(int);
   void profileDdioWayFill(int);
   AbstractCacheEntry getNullEntry();

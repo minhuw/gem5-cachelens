@@ -158,3 +158,15 @@ def vector_values(vector):
         value["value"] if isinstance(value, dict) else value
         for value in vector.values()
     ]
+
+
+def check_dma_lookups(stats, read_hits, read_misses, write_hits, write_misses):
+    """Exact accepted eligible line counts; internal merge reads excluded."""
+    for direction, hits, misses in (
+        ("Read", read_hits, read_misses), ("Write", write_hits, write_misses)
+    ):
+        for outcome, expected in (("Requests", hits + misses),
+                                  ("Hits", hits), ("Misses", misses)):
+            name = f"dma{direction}{outcome}"
+            value = find_stat(stats, name)
+            assert value == expected, (name, value, expected)

@@ -101,13 +101,17 @@ def cachelens_arm_chi_profile_test(profile, inclusion="noninclusive"):
 
 
 def cachelens_chi_dma_test(scenario, inclusion=None,
-                           read_not_shared_dirty=False, dealloc=False):
+                           read_not_shared_dirty=False, dealloc=False,
+                           ddio_off=False):
     # Protocol/data-value coverage only: no guest execution or external TLM.
     config_args = ["--scenario", scenario]
     suffix = ""
     if inclusion is not None:
         config_args += ["--hnf-inclusion", inclusion, "--ddio-way-part", "4"]
         suffix += f"-{inclusion}"
+    if ddio_off:
+        config_args += ["--ddio-way-part", "-1"]
+        suffix += "-ddio-off"
     if read_not_shared_dirty:
         config_args.append("--read-not-shared-dirty")
         suffix += "-read-not-shared-dirty"
@@ -611,8 +615,11 @@ def run_pcap_replay_tests(params):
 
 
 for scenario in ("eligible_untagged", "noneligible_dma",
-                 "cold_full_write", "partial_dirty_owner"):
+                 "cold_full_write", "partial_dirty_owner",
+                 "hit_update", "tx_miss_no_allocate"):
     cachelens_chi_dma_test(scenario)
+for scenario in ("hit_update", "tx_miss_no_allocate", "disabled_ddio"):
+    cachelens_chi_dma_test(scenario, ddio_off=True)
 
 # All normal NIC allocation ways, no stashing. Include old policies as controls.
 for inclusion in ("mostly-exclusive", "inclusive", "noninclusive"):

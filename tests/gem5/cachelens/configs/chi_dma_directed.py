@@ -107,6 +107,7 @@ parser.add_argument("--scenario", required=True, choices=(
     "cold_full_write", "partial_dirty_owner",
     "partial_ss_sharers", "hit_update",
     "nic_cpu_nic", "clean_private_victim", "hnf_evict_shared",
+    "tx_miss_no_allocate", "disabled_ddio",
     "zero_mask", "sparse_mask",  # Unsupported by RubySequencer: must fail.
 ))
 parser.add_argument("--ddio-way-part", type=int, default=None)
@@ -177,9 +178,9 @@ assert bool(hnf.enable_DCT) == (not inclusive)
 assert int(hnf.cache.ddio_way_part) == ddio
 assert list(hierarchy.dma_requestors[0].downstream_destinations) == [hnf]
 
-if args.scenario == "noneligible_dma":
+if args.scenario in ("noneligible_dma", "tx_miss_no_allocate"):
     # Distinguish generic behavior from DDIO even when the legacy
-    # knob is set: the write bypasses; the generic read may allocate.
+    # knob is set: the seed write bypasses; only a generic read may allocate.
     hnf.alloc_on_writeback = False
     hnf.nic_read_no_allocate = True
 
@@ -213,6 +214,48 @@ elif args.scenario == "cold_full_write":
 elif args.scenario == "hit_update":
     assert sum(fills.value) == int(ddio > 0), fills.value
     assert sum(accesses.value) == 2 * int(ddio > 0), accesses.value
+# dma-llc-tag-v1: HNF tag presence, NOT data service or directory presence.
+# Noninclusive cold CPU reads use DMT and can leave directory-only entries.
+retained = int(ddio > 0)
+lookup_expectations = {
+    "eligible_untagged": (4, 3, 1, 2),
+    "noneligible_dma": (1, 0, 0, 0),  # generic read filled before eligible probe
+    "cold_full_write": (0, 0, 0, 1),
+    "hit_update": (retained, 1 - retained, retained, 2 - retained),
+    "tx_miss_no_allocate": (0, 2, 0, 0),
+    # The generic seed write allocates. Only mostly-exclusive removes that
+    # tag on the CPU's unique grant; directory-only RU is a write miss.
+    "partial_dirty_owner": (
+        retained, 1 - retained, int(not mostly_exclusive), int(mostly_exclusive)
+    ),
+    # A second CPU sharer restores/retains an HNF tag in all three policies.
+    "partial_ss_sharers": (retained, 1 - retained, 1, 0),
+    "nic_cpu_nic": (1, 0, int(not mostly_exclusive), 1 + int(mostly_exclusive)),
+    "clean_private_victim": (2, 0, int(not mostly_exclusive), int(mostly_exclusive)),
+    "disabled_ddio": (0, 3, int(not mostly_exclusive), 1 + int(mostly_exclusive)),
+    "hnf_evict_shared": (0, 1, 0, 4),
+}
+if args.scenario in lookup_expectations:
+    rh, rm, wh, wm = lookup_expectations[args.scenario]
+    expected_lookups = (rh + rm, rh, rm, wh + wm, wh, wm)
+else:
+    expected_lookups = None
+observed_lookups = []
+for direction in ("Read", "Write"):
+    values = []
+    for outcome in ("Requests", "Hits", "Misses"):
+        name = f"dma{direction}{outcome}"
+        stat = hnf.cache.resolveStat(name)
+        stat.prepare()
+        values.append(stat.value)
+        print(f"CHI_DMA_LOOKUP {name}={stat.value}")
+    assert values[0] == values[1] + values[2], values
+    observed_lookups.extend(values)
+if expected_lookups is not None:
+    assert tuple(observed_lookups) == expected_lookups, (
+        observed_lookups, expected_lookups
+    )
+
 if args.scenario in ("clean_private_victim", "hnf_evict_shared"):
     # Demand-hit counts distinguish surviving private copies from refills;
     # full-line read checks in the tester alone cannot prove no backinv.

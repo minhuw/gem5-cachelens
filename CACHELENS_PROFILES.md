@@ -39,7 +39,7 @@ python3 verification/ddio-smoke.py \
 ```
 
 The output directory must not exist; omit `--output` for a fresh temporary
-location. All 12 cases run by default, with a 120-second wall timeout per case
+location. All 15 cases run by default, with a 120-second wall timeout per case
 (`--timeout` overrides it). Each retains its command, elapsed time, combined
 log, configuration and statistics; `summary.json` records pass/fail. Failure,
 timeout, missing completion, topology mismatch or an incorrect exact counter
@@ -56,6 +56,46 @@ three-level expectations are shared with testlib in
 supplementary regressions, not the primary profile smoke. See
 [validation evidence](verification/no-tags/README.md#native-x86-three-level-primary-smoke)
 for the measured native run and persisted binary.
+
+## DMA LLC tag-hit metric (`dma-llc-tag-v1`)
+
+Each LLC bank exports six scalar counters: `dmaReadRequests`, `dmaReadHits`,
+`dmaReadMisses`, `dmaWriteRequests`, `dmaWriteHits`, `dmaWriteMisses`.
+Read/write direction comes from the coherence opcode, not descriptor, payload,
+address history, or provenance tags. Only coherent DMA from an explicitly
+eligible controller/port is counted. Noneligible devices are excluded even if
+an operation happens to be a NIC descriptor or packet transfer.
+
+A request is **one accepted cache-line transaction**, not a device operation,
+byte, packet, or first enqueue/arrival. At acceptance, before this request's own
+allocation/fill/update, an existing `CacheMemory` entry is a **tag hit**.
+A resident tag counts even when a private CPU owner must be recalled or local
+LLC data is invalid/stale. CHI directory-only metadata without a CacheMemory
+entry is a miss. Lookup rejects `NotPresent` entries; a resident entry with
+invalid data/permissions is not itself a data-service hit. These counters do
+not identify the data source, LLC data-array service, or memory traffic.
+
+MESI records the accepted stable lookup **after** any existing subset-victim
+replacement/recycling. This is deliberately not a first-arrival observation;
+intervening coherence work may change tag presence. The shared MESI controller
+is physically the L3 in the Three-Level profile. CHI records at HNF request
+initiation (including stale initiation), before allocation, with an independent
+per-request-TBE guard; rejected/retried requests are not new lookups.
+
+For each direction, `Requests = Hits + Misses`. Hit rate is `Hits / Requests`
+(undefined when Requests is zero). Sum banks' counters before computing a
+system rate; do not average bank percentages. Full-line writes that miss and
+then allocate remain **write misses**. Internal partial-merge reads, downstream
+forwarding, retries/recycles, snoop responses and fills add nothing. Empty
+masked fragments never accepted by the LLC add nothing either.
+
+`ddio_way_part=-1` disables retention/allocation policy, **not measurement**:
+eligible write-through and read lookups still count. There is no separate
+metric off switch; remove port eligibility to exclude a device (also changing
+its coherent-I/O policy). `ddioWayAccess`/`ddioWayFill` remain separate way
+accounting. Native NIC descriptor/payload operation and byte counters remain
+device-local issuance metrics, not these per-line LLC denominators; no
+source-specific cache statistics are reintroduced.
 
 ## Configure
 

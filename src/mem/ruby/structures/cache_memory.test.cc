@@ -123,6 +123,16 @@ class CacheMemoryTest : public ::testing::Test
     {
         return cache->cacheMemoryStats.dmaRoutingTransientRecycles.value();
     }
+    void expectDmaLookups(Counter rh, Counter rm, Counter wh, Counter wm)
+    {
+        const auto &stats = cache->cacheMemoryStats;
+        EXPECT_EQ(stats.dmaReadRequests.value(), rh + rm);
+        EXPECT_EQ(stats.dmaReadHits.value(), rh);
+        EXPECT_EQ(stats.dmaReadMisses.value(), rm);
+        EXPECT_EQ(stats.dmaWriteRequests.value(), wh + wm);
+        EXPECT_EQ(stats.dmaWriteHits.value(), wh);
+        EXPECT_EQ(stats.dmaWriteMisses.value(), wm);
+    }
     void makePresent(Addr address)
     {
         auto *entry = new TestEntry;
@@ -334,6 +344,26 @@ TEST_F(CacheMemoryTest, DMARoutingTelemetryIsIndependentAndResettable)
     cache->resetStats();
     EXPECT_EQ(dmaRoutingProxies(), 0);
     EXPECT_EQ(dmaRoutingRecycles(), 0);
+}
+
+TEST_F(CacheMemoryTest, DmaLookupDirectionsAndResetIncludeDisabledDDIO)
+{
+    makeCache(-1);
+    expectDmaLookups(0, 0, 0, 0);
+    cache->profileDmaLookup(true, true);
+    cache->profileDmaLookup(true, false);
+    cache->profileDmaLookup(true, false);
+    cache->profileDmaLookup(false, true);
+    cache->profileDmaLookup(false, true);
+    cache->profileDmaLookup(false, false);
+    // Fill/access/proxy/merge preparation must not change the denominator.
+    cache->profileDdioWayFill(0);
+    cache->profileDdioWayAccess(0);
+    cache->profileDmaRoutingProxy();
+    cache->ddioWriteNeedsRead(true, false);
+    expectDmaLookups(1, 2, 2, 1);
+    cache->resetStats();
+    expectDmaLookups(0, 0, 0, 0);
 }
 
 TEST_F(CacheMemoryTest, DDIOWritePreparationPreservesSnoopData)

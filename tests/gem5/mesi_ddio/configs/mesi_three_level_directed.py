@@ -98,7 +98,7 @@ class DirectedBoard:
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--scenario", required=True)
-parser.add_argument("--num-hnfs", type=int, choices=(1, 2), default=1)
+parser.add_argument("--num-hnfs", type=int, choices=(1, 2, 8), default=1)
 parser.add_argument("--ddio-way-part", type=int, choices=(1, -1), default=1)
 parser.add_argument("--abs-max-tick", type=int, default=10000000000)
 args = parser.parse_args()

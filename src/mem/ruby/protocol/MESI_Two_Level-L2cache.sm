@@ -527,9 +527,14 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(dp_profileDmaAcceptance, "dp",
          desc="Record eligible DMA outcome and way access exactly once") {
     peek(L1RequestL2Network_in, RequestMsg) {
-      if (in_msg.ddioEligible && is_valid(cache_entry)) {
-        L2cache.profileDdioWayAccess(
-            cache_entry.getWay());
+      if (in_msg.ddioEligible) {
+        // Accepted stable lookup, after any subset victim/recycle, before
+        // this request's fill/update. A private owner still counts as a hit.
+        L2cache.profileDmaLookup(in_msg.Type == CoherenceRequestType:DMA_READ,
+                                 is_valid(cache_entry));
+        if (is_valid(cache_entry)) {
+          L2cache.profileDdioWayAccess(cache_entry.getWay());
+        }
       }
     }
   }

@@ -5,6 +5,7 @@ from m5.stats.gem5stats import get_simstat
 from m5.tlm_chi import ReqOpcode, Size
 
 from chi_tlm_test_utils import (
+    check_dma_lookups,
     find_stat,
     schedule_read,
     schedule_write,
@@ -56,6 +57,7 @@ def test_generators(generators):
 def check(system):
     # Data bytes, masks, snoops and completion ordering are checked above.
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
+    check_dma_lookups(stats, 0, 0, 1, 0)
     assert sum(vector_values(find_stat(stats, "ddioWayAccess"))) == 1
     assert sum(vector_values(find_stat(stats, "wayDeallocations"))) >= 1
     print("Untagged CHI data/coherence and aggregate accounting passed")

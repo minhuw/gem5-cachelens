@@ -290,3 +290,52 @@ This closes native three-level directed **data-port** validation, not x86
 instruction execution or a guest/application accuracy run. ARM/CHI evidence
 remains the earlier native ARM/TLM results above; no ARM rebuild, live device
 traffic, full-system boot or workload validation was added in this follow-up.
+
+## Accepted DMA LLC tag metrics (`dma-llc-tag-v1`)
+
+Follow-up from clean `46e590ee79`: six directional `dmaRead*`/`dmaWrite*`
+request/hit/miss scalars now count eligible **accepted per-line tag lookups**,
+including DDIO-off. No descriptor/payload/provenance metadata was added.
+See [the exact metric contract](../../CACHELENS_PROFILES.md#dma-llc-tag-hit-metric-dma-llc-tag-v1).
+MESI counts after any subset replacement/recycling, not first arrival. CHI
+counts CacheMemory entries, not directory-only entries or local data validity.
+Existing policy and way accounting remain unchanged.
+
+New, separate evidence: `build/dma-llc-metrics/` (previous evidence preserved).
+Incremental native X86_MESI_Three_Level and ARM_TLM builds both exit 0, with
+intermediates in the existing `/dev/shm` trees. Persisted stripped-debug opt
+binaries are **now** `build/dma-llc-metrics/X86_MESI_Three_Level.gem5.opt` and
+`ARM_TLM.gem5.opt`; hashes are in `binary.sha256` and `arm-binary.sha256`.
+The old three-level binary predates these counters and remains historical.
+
+- **15/15 primary native Three-Level cases pass**: `native-final/summary.json`.
+  Exact counters cover full-write miss/hit, owner-backed hits, no-allocation
+  reads, partial/sparse merges, zero fragments, eligibility, DDIO-off,
+  subset replacement and two-bank routing. `overlap_dirty_write` requires
+  **two transient recycles but exactly two accepted writes (one hit/miss)**.
+- **Eight-bank native routing passes**, one write miss and one read hit per
+  bank: `routing_full_line-8/stats.txt`, command/assertions in
+  `check-three-extra.py` and `three-extra-results.json`. Default smoke routing
+  remains two-bank. The current outer analyzer also parsed those real eight-bank
+  statistics: eight read hits out of eight reads, zero write hits out of eight
+  writes (`outer-analyzer-integration.json`). This checks the reporting path,
+  not a guest ROI. Three additional race runs retain exact denominators;
+  they do not claim transient-recycle coverage (their recycle counters are 0).
+- **32/32 native ARM/CHI cases pass**: `chi-arm-merge-final-results.json`.
+  Exact HNF counters include all inclusion policies, dirty-owner resident tags
+  versus directory-only `RU`, untagged traffic, repeated misses and DDIO-off.
+  **15/15 ARM CHI-TLM registrations pass**: `tlm-final/tlm-results.json`, with
+  added exact merge/no-allocation/noneligible/off counter checks. Existing
+  runtime drivers were retained and copied to the new evidence destination.
+- **12 CacheMemory unit tests**, **25 MESI Python tests**, **5 hierarchy tests**,
+  config-contract check, Python parsing and `git diff --check` pass.
+
+Initial CHI expectation failures are preserved in `chi-arm-merge-tests/`:
+ordinary generic reads can allocate, and noninclusive is not synonymous with
+absent tags. Corrected checks account for those existing policies; the new
+read-miss fixture disables seed-write allocation. An exploratory, previously
+unregistered MESI `generic_partial` scenario through CHI aborted on a cross-line
+`WriteMask::setMask` bound; it is not advertised as supported or repaired.
+Pure noneligible counters are checked by the maintained TLM sparse suite.
+No guest/application run, forced CHI stale/retry test, or CHI multibank test is
+claimed. MESI transient recycling is directly asserted as described above.

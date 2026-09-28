@@ -117,6 +117,46 @@ _EXPECTED["disabled_ddio"] = {
     "ddioOwnershipAcks": 0,
 }
 
+# Accepted line lookups: (read hits, read misses, write hits, write misses).
+# noneligible_dma ends with ONE eligible probe; generic_partial is entirely
+# noneligible. Internal merge reads and the empty sparse fragment are excluded.
+_DMA_LOOKUPS = {
+    "cold_full_write": (0, 0, 0, 1),
+    "partial_dirty_owner": (1, 0, 1, 0),
+    "partial_ss_sharers": (1, 0, 1, 0),
+    "tx_miss_no_allocate": (0, 2, 0, 0),
+    "clean_subset_mt": (1, 1, 0, 1),
+    "subset_full_victim": (1, 0, 0, 2),
+    "sparse_mask": (1, 2, 1, 2),
+    "zero_mask": (0, 1, 0, 0),
+    "eligible_untagged": (4, 3, 1, 2),
+    "noneligible_dma": (0, 1, 0, 0),
+    "routing_full_line": (1, 0, 0, 1),
+    "disabled_ddio": (0, 3, 1, 1),
+    "hit_update": (1, 0, 1, 1),
+    "generic_partial": (0, 0, 0, 0),
+    "overlap_dirty_write": (0, 0, 1, 1),
+}
+_EXPECTED["hit_update"] = {
+    "ddioWayFill::way0": 1, "ddioWayAccess::way0": 2,
+    "ddioOwnershipRequests": 1, "ddioOwnershipAcks": 1,
+}
+_EXPECTED["generic_partial"] = {"ddioWayAccess::way0": 0}
+# Native three-level timing forces two transient recycles, but only two
+# accepted writes (one miss, one owner-backed tag hit) enter the denominator.
+_EXPECTED["overlap_dirty_write"] = {
+    "ddioWayFill::way0": 1, "ddioWayAccess::way0": 1,
+    "dmaRoutingTransientRecycles": 2,
+    "ddioOwnershipRequests": 1, "ddioOwnershipAcks": 1,
+}
+for scenario, (rh, rm, wh, wm) in _DMA_LOOKUPS.items():
+    for direction, hits, misses in (("Read", rh, rm), ("Write", wh, wm)):
+        _EXPECTED[scenario].update({
+            f"dma{direction}Requests": hits + misses,
+            f"dma{direction}Hits": hits,
+            f"dma{direction}Misses": misses,
+        })
+
 # Hits on CPU-filled lines, read misses, zero masks, generic DMA and DDIO-off
 # must not allocate DDIO lines. Totals also forbid fills in another way.
 for counters in _EXPECTED.values():

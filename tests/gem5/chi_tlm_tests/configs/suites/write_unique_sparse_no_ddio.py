@@ -3,6 +3,7 @@
 from m5.stats.gem5stats import get_simstat
 from m5.tlm_chi import ReqOpcode, Size
 from chi_tlm_test_utils import (
+    check_dma_lookups,
     find_stat, schedule_read, schedule_write, vector_values,
 )
 
@@ -51,6 +52,7 @@ def test_generators(generators):
 def check(system):
     assert completed == [3, 5], completed
     stats = get_simstat(system.ruby.hnf, prepare_stats=True).to_json()
+    check_dma_lookups(stats, 0, 0, 0, 0)
     assert find_stat(stats, "m_demand_misses") == 3
     assert find_stat(stats, "m_demand_hits") == 2
     for name in ("ddioWayFill", "ddioWayAccess", "wayDeallocations"):
