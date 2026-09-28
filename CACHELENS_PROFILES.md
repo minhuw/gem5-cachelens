@@ -19,6 +19,7 @@ by the CacheLens runner.
 From the gem5 source root with the normal gem5 build dependencies installed:
 
 ```sh
+scons defconfig build/X86_MESI_Three_Level build_opts/X86_MESI_Three_Level
 scons build/X86_MESI_Three_Level/gem5.opt --without-tcmalloc -j16
 scons build/ARM_CHI/gem5.opt --without-tcmalloc -j16
 ```
@@ -26,6 +27,35 @@ scons build/ARM_CHI/gem5.opt --without-tcmalloc -j16
 `build_opts/ARM_CHI` explicitly names the existing ARM/CHI protocol combination.
 Use each binary with its matching ISA/protocol. These targets do not by
 themselves rebuild the outer CacheLens guest images or packaged artifacts.
+
+## Primary DDIO smoke (no guest resources)
+
+From this source root, run the **native x86/MESI_Three_Level** binary:
+
+```sh
+python3 verification/ddio-smoke.py \
+  --gem5 build/X86_MESI_Three_Level/gem5.opt \
+  --output build/ddio-smoke-local
+```
+
+The output directory must not exist; omit `--output` for a fresh temporary
+location. All 12 cases run by default, with a 120-second wall timeout per case
+(`--timeout` overrides it). Each retains its command, elapsed time, combined
+log, configuration and statistics; `summary.json` records pass/fail. Failure,
+timeout, missing completion, topology mismatch or an incorrect exact counter
+fails the command. The fixture requires x86 and MESI_Three_Level: NULL and
+MESI_Two_Level are not substitutes.
+
+Traffic uses two synthetic CPU data ports through private L1 and L2 to the
+shared L3, plus opted-in and generic DMA ports and real SimpleMemory. Cases
+cover full/partial writes, dirty owners and sharers, inclusive replacement,
+no-allocation reads, sparse/zero masks, two-bank routing, and DDIO disabled
+(`--ddio-way-part=-1`). C++ byte/readback assertions remain enabled. Exact
+three-level expectations are shared with testlib in
+`tests/gem5/mesi_ddio/three_level_checks.py`; existing MESI_Two_Level tests are
+supplementary regressions, not the primary profile smoke. See
+[validation evidence](verification/no-tags/README.md#native-x86-three-level-primary-smoke)
+for the measured native run and persisted binary.
 
 ## Configure
 

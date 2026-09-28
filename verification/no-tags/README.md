@@ -1,9 +1,12 @@
 # Untagged DMA / device-local accounting verification
 
-Development tree: `/home/minhuw/cachelens-dev/dma-ddio-gem5`, base
-`727f942d6e`, uncommitted changes. No dependency-tree or outer-repository edits.
-Evidence from this change is in `build/no-tags/`; earlier `build/*` verification
-logs/results remain historical evidence, not claims about the new interfaces.
+Development tree: `/home/minhuw/cachelens-dev/dma-ddio-gem5`.
+The original untagged-DMA phase below used base `727f942d6e` and evidence in
+`build/no-tags/`. Its boundaries are historical. The
+[native x86 three-level follow-up](#native-x86-three-level-primary-smoke)
+(2026-09-28, base `d7614d57f4`) closes the earlier native MESI_Three_Level gap;
+its evidence is separately retained in `build/three-level-smoke/`.
+No dependency-tree or outer-repository edits.
 
 ## Interface changes
 
@@ -95,9 +98,11 @@ for ISA instruction-count annotations, never instantiated. The stdlib unittest
 wrapper similarly does not instantiate fake processors; the ARM-core graph is
 explicitly skipped.
 
-No ARM/x86 guest boot, live SimBricks peer/checkpoint run, full SimBricks link,
-E1000 runtime, or native MESI Three Level runtime was performed here. The shared
-MESI machines, generated Three Level SLICC and Python wiring are checked.
+In the original untagged-DMA phase, no ARM/x86 guest boot, live SimBricks
+peer/checkpoint run, full SimBricks link, E1000 runtime, or native MESI Three
+Level runtime was performed. Only the shared MESI machines, generated Three
+Level SLICC and Python wiring were checked. The native three-level boundary
+is superseded by the follow-up below; the other exclusions still apply.
 
 The former native synthetic auto-stash tests are retired, **not equivalent** to
 ordinary DMA. Historical payload-only accuracy and semantic-wire verification
@@ -206,3 +211,82 @@ exact mask and reaches the repaired HNF path.
 **The earlier declined/plain sparse failures are resolved.** Raw sparse writes
 directly to the SNF are not added as a supported interface; these HNF paths
 instead publish a merged full line using the existing protocol machinery.
+
+## Native x86 three-level primary smoke
+
+**2026-09-28 follow-up, base `d7614d57f4`: 12/12 native cases pass.** This is
+`X86_MESI_Three_Level`, not the earlier NULL/MESI_Two_Level substitute. The
+tracked runner is `verification/ddio-smoke.py`; testlib uses the same exact
+expectations and completion checks in `tests/gem5/mesi_ddio/three_level_checks.py`.
+The two-level suites remain unchanged, supplementary regressions.
+
+Build commands (from the dev gem5 root):
+
+```sh
+scons defconfig build/X86_MESI_Three_Level build_opts/X86_MESI_Three_Level
+scons build/X86_MESI_Three_Level/gem5.opt --without-tcmalloc -j32
+```
+
+Only the new `build/X86_MESI_Three_Level` products were placed behind a symlink
+to `/dev/shm/cachelens-x86-three-level`; sources remain in this dev tree.
+`TMPDIR` also pointed there. Existing ARM_TLM and NULL builds were untouched.
+`build/three-level-smoke/build.sh`, `build.log`, `build.exit` and `build-config`
+retain the exact commands, configuration and status. Defconfig took **3.67 s**;
+compilation/link took **480.04 s**, exit 0. Optional capstone, PNG, HDF5 and
+SimBricks support were unavailable; none is needed by this smoke.
+
+A **58 MiB stripped-debug opt binary** (assertions retained) is persisted on
+normal disk at `build/three-level-smoke/X86_MESI_Three_Level.gem5.opt`.
+`validate.sh` records its creation; `binary.sha256` records SHA-256
+`e6123886c3fea240aef7b9a862ea92126b74860f038fac2cd121374782d4a5a5`.
+Unlike tmpfs intermediates, this executable remains usable after reboot:
+
+```sh
+python3 verification/ddio-smoke.py \
+  --gem5 build/three-level-smoke/X86_MESI_Three_Level.gem5.opt \
+  --output build/three-level-smoke-rerun
+```
+
+Choose a **new** output directory for every run; existing directories are
+rejected, even if empty. Omitting `--output` creates a fresh temporary directory.
+The final measured invocation used `--output build/three-level-smoke/native-final`:
+**12/12 pass, 15.75 s wall time**, exit 0. `native-final.log`, `native-final.exit`
+and `native-final/summary.json` retain results, elapsed times and every gem5
+command; per-case `run.log`, `config.ini`, `config.json` and `stats.txt` retain
+native evidence. The initial successful run (`native/`, 15.65 s) is preserved.
+
+What passed:
+
+- Actual native physical L1/L2/L3 controller types, private queue connections,
+  capacities, distinct core/LLC clocks, bank indexing and `[eligible, generic]`
+  DMA-port policy assertions in the production CacheLens hierarchy fixture.
+- Untagged eligible and noneligible traffic; full/partial writes; authoritative
+  dirty-owner bytes and sharer invalidations; clean/dirty inclusive subset
+  replacement; read-miss no-allocation; sparse and zero masks. All original
+  C++ byte/readback and exactly-once-completion assertions remain unchanged.
+- CPU traversal through **both private levels**: `partial_ss_sharers` requires
+  exactly two demand misses in each CPU's physical L1D **and** private L2
+  (before and after DMA invalidation), alongside the data checks.
+- Two-bank routing: exactly one fill, one access and one ownership request/ack
+  **per L3 bank**; DMA ReadRequest/Data/WriteRequest/Ack totals each equal two.
+- DDIO-off control: partition `-1`, zero DDIO fills/allocations/ownership claims,
+  five directory proxies and one access to the previously CPU-filled line;
+  write-through readbacks and repeated miss confirm no retention.
+- The former three-level expected counters all matched natively; none was
+  relaxed. New total fill/allocation checks explicitly require zero for
+  CPU-line hits, read-only misses, zero masks, noneligible DMA and DDIO-off.
+  Aggregate cache metrics were not relabeled as payload/source metrics.
+
+Additional checks: 25 Python MESI/DDIO tests pass (including four runner/helper
+regressions for missing/wrong stats, completion markers, process failures,
+timeouts and evidence preservation); five hierarchy unit tests pass; config
+contract passes; testlib discovers all 12 x86 opt registrations, and its native
+`partial_ss_sharers` execution plus shared verifier both pass with `--skip-build`
+(`testlib-runtime.log`, 1.83 s); `git diff --check` passes. Logs are in `build/three-level-smoke/`. The runner also rejects
+the real NULL/MESI_Two_Level binary: **0/12 pass, exit 1** in
+`rejected-null-two-level/`, rather than silently substituting that profile.
+
+This closes native three-level directed **data-port** validation, not x86
+instruction execution or a guest/application accuracy run. ARM/CHI evidence
+remains the earlier native ARM/TLM results above; no ARM rebuild, live device
+traffic, full-system boot or workload validation was added in this follow-up.

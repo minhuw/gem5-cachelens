@@ -17,6 +17,9 @@ from m5.objects import (
 )
 
 from gem5.isas import ISA
+from gem5.utils.requires import requires
+
+requires(isa_required=ISA.X86)
 from gem5.prebuilt.cachelens.mesi_three_level_cache_hierarchy import (
     CacheLensMESIThreeLevelHierarchy,
 )
@@ -96,6 +99,7 @@ class DirectedBoard:
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--scenario", required=True)
 parser.add_argument("--num-hnfs", type=int, choices=(1, 2), default=1)
+parser.add_argument("--ddio-way-part", type=int, choices=(1, -1), default=1)
 parser.add_argument("--abs-max-tick", type=int, default=10000000000)
 args = parser.parse_args()
 
@@ -122,7 +126,7 @@ system.cache_hierarchy = CacheLensMESIThreeLevelHierarchy(
     hnf_size="512B",
     hnf_assoc=4,
     num_hnfs=args.num_hnfs,
-    ddio_way_part=1,
+    ddio_way_part=args.ddio_way_part,
     core_clock="2GHz",
     indexing_policy="linear",
 )
@@ -133,6 +137,7 @@ ruby.randomization = False
 
 metadata = hierarchy.get_configuration()
 assert metadata["coherence_protocol"] == "MESI_Three_Level"
+assert metadata["ddio_way_part"] == args.ddio_way_part
 assert metadata["hnf_inclusion"] == "inclusive"
 assert metadata["nic_read_no_allocate"] is True
 assert metadata["private_l2_size_bytes"] == 256
@@ -159,7 +164,7 @@ for l1, l2 in zip(hierarchy.l1_controllers, hierarchy.l2_controllers):
 for bank, l3 in enumerate(hierarchy.l3_controllers):
     assert l3.type == "MESI_Three_Level_L2Cache_Controller"
     assert int(l3.L2cache.start_index_bit) == 6 + metadata["bank_select_bits"]
-    assert int(l3.L2cache.ddio_way_part) == 1
+    assert int(l3.L2cache.ddio_way_part) == args.ddio_way_part
     assert not bool(l3.L2cache.addr_hash)
     assert hierarchy.hnf_index_for_address(0x10000 + bank * 64) == bank
 for dma in hierarchy.dma_controllers:
