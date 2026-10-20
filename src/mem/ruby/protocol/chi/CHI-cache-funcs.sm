@@ -480,7 +480,7 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   tbe.is_local_pf := in_msg.is_local_pf;
   tbe.is_remote_pf := in_msg.is_remote_pf;
 
-  // Policy uses eligibility and the CHI operation, never optional NIC tags.
+  // Policy uses requestor eligibility and the normalized CHI operation.
   // Stash opcodes have already been normalized above.
   tbe.is_ddio_write := is_HN && in_msg.ddioEligible &&
       (tbe.reqType == CHIRequestType:WriteUniqueFull ||

@@ -292,12 +292,14 @@ network-only selection. Legacy MESI/CHI configs accept `--ddio-dma-ports` with
 explicit zero-based DMA port indices (default empty); legacy three-level MESI
 DDIO requires one shared LLC cluster.
 
-CHI's public `nic_read_no_allocate` parameter remains accepted for configuration
-compatibility. It neither enables DDIO nor overrides eligibility: eligible
-reads always no-allocate, noneligible reads use generic CHI policy. Historical
-profile metadata still reports that knob. Accepted write-stash hints retain
-their independent ordinary-way allocation behavior. Automatic payload-only
-stash emission and its parameter were removed, not broadened to all writes.
+CHI's public `nic_read_no_allocate` parameter is **deprecated** and accepted
+only for configuration compatibility. Its value has no effect on allocation:
+eligible reads always no-allocate, noneligible reads use generic CHI policy.
+Historical profile metadata retains the key for existing configuration readers;
+new code should use requestor eligibility rather than this parameter. Accepted
+write-stash hints retain their independent ordinary-way allocation behavior.
+Automatic payload-only stash emission and its parameter were removed, not
+broadened to all writes.
 
 For synthetic legacy MemTest traffic use normal DMA and explicit policy:
 `--num-dmas=1 --ddio-dma-ports 0`. The old tagging option is removed.

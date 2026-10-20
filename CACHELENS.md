@@ -1,27 +1,57 @@
 # CacheLens integration
 
-## Promotion provenance (new documentation)
+This fork adds coherent DMA allocation and measurement to two gem5 targets:
 
-Local source promotion for the 40g-mesi project; baseline `441786151ed90924b373d2f520ac870891b20b6e`.
-Source: parent project `gem5/work/sources/simbricks-accuracy/cachelens-gem5`.
-Branch: `cachelens-integration/native`. Implementation, build definitions, fixtures, and imported
-documentation are preserved byte-for-byte except the explicitly requested gem5
-configuration exception: `build_opts/X86_CHI` is restored to baseline so ordinary
-builds do not require SimBricks; `X86_CHI_ACCURACY` remains opt-in and unchanged.
-The parent owns the new MESI3 SimBricks defconfig. No remote-GDB changes.
-Upstream README, copyright notices, and licenses remain unchanged.
+| Target | Physical cache hierarchy | I/O allocation |
+| --- | --- | --- |
+| x86 / MESI_Three_Level | private L1I/L1D → private L2 → inclusive shared L3 | Configurable DDIO way subset |
+| ARM / CHI | private L1I/L1D → private L2 → shared HNF cache/directory | Configurable coherent-I/O allocation; disabled by default |
 
-Native SimBricks PCI/Ethernet adapters, semantic DMA checks, and prototype
-configuration/verification inputs. Host checks:
-`python3 verification/rxonly/test_rss_pcap.py` and
-`python3 verification/accuracy/test_config_contract.py`.
-The obsolete `accuracy/build.sh` is intentionally omitted. The parent project
-owns the new portable build entry point. Existing verification shell scripts
-are historical fixtures, not portable build entry points: some assume the old
-`cachelens-gem5` sibling name, Docker image, or project/work directory layout.
+DDIO eligibility comes from explicitly selected DMA ports/controllers. NICs
+issue ordinary DMA without descriptor, header, payload or RDMA semantic tags.
+Eligible writes allocate within the configured way subset; `ddio_way_part=-1`
+disables new write allocation. Eligible read misses do not allocate. Coherence,
+partial-write merging and existing-line updates remain active in either mode.
 
-Imported verification reports describe historical runs, not validation of this
-checkout. Generated binaries, logs, run inputs, and results are not promoted.
-The parent project's `gem5/results/source-promotion-40g-v1` records baseline
-pins, tracked patches, inventories, source/promoted SHA-256 hashes, omissions,
-and fresh checks. No full guest or MESI workload validation is claimed here.
+## Architecture and measurement
+
+- [Architecture profiles and metric contracts](CACHELENS_PROFILES.md): topology,
+  port eligibility, DMA tag-hit counters and line-state distributions.
+- [Explicit CHI write stashing](CACHELENS_STASHING.md): optional acceptance of
+  explicit stash opcodes, separate from ordinary NIC DMA.
+- [Untagged DMA validation](verification/no-tags/README.md): retained native
+  MESI, ARM/CHI and TLM evidence, with workload and coverage boundaries.
+
+`dmaRead*` and `dmaWrite*` counters measure accepted eligible cache-line
+lookups. A hit means an LLC CacheMemory tag was present before the request's
+own update; it does not identify which component supplied authoritative data.
+Device-local issuance counters have separate operation/byte denominators.
+
+## Focused verification
+
+The primary DDIO smoke requires an actual x86/MESI_Three_Level binary:
+
+```sh
+python3 verification/ddio-smoke.py \
+  --gem5 build/X86_MESI_Three_Level/gem5.opt \
+  --output build/ddio-smoke-new
+```
+
+Use a new output directory. The smoke checks native private L1/L2 traversal,
+coherent DMA data, partial masks, allocation policy and exact per-bank counters;
+it does not boot Linux or validate model accuracy. Build commands and target
+requirements are documented in [CACHELENS_PROFILES.md](CACHELENS_PROFILES.md).
+
+Host-only checker and wiring regressions can be run separately:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover \
+  -s tests/pyunit/mesi_ddio -p 'pyunit_*.py'
+```
+
+The parent CacheLens repository owns pinned source builds, guest assets,
+SimBricks/i40e workload launchers and experiment evidence. Imported historical
+reports describe their recorded runs; they do not certify a new checkout or
+replace fresh workload validation. Current initialized-NIC checkpoint support
+and its restricted boundary are described in
+[verification/initialized-nic/README.md](verification/initialized-nic/README.md).

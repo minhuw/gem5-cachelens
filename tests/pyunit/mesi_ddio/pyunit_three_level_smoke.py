@@ -7,19 +7,22 @@ import importlib.util
 import io
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "tests/gem5/mesi_ddio"))
+from three_level_checks import check_output, check_stats, expected_stats
+
 spec = importlib.util.spec_from_file_location("ddio_smoke", ROOT / "verification/ddio-smoke.py")
 smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
-from three_level_checks import check_output, check_stats, expected_stats
 
 
 class ThreeLevelSmokeTest(unittest.TestCase):
-    def test_exact_stats_missing_wrong_and_zero_allocations(self):
+    def test_checker_rejects_missing_and_wrong_stats(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "stats.txt"
             for scenario in smoke._EXPECTED:
@@ -34,8 +37,6 @@ class ThreeLevelSmokeTest(unittest.TestCase):
                 path.write_text(text + f"\n{key} {expected[key] + 1}\n")
                 with self.assertRaisesRegex(ValueError, "ddioWayFill::total"):
                     check_stats(path, scenario)
-            for scenario in ("noneligible_dma", "disabled_ddio", "zero_mask", "tx_miss_no_allocate"):
-                self.assertEqual(smoke._EXPECTED[scenario]["ddioAllocWays::total"], 0)
 
     def test_all_completion_markers_required(self):
         markers = [

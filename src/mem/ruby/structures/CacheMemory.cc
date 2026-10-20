@@ -413,34 +413,16 @@ CacheMemory::allocateInWays(Addr address, AbstractCacheEntry *entry,
         }
     }
 
-    // Otherwise find a free slot within the DDIO way subset, again using
-    // the replacement policy among the free slots rather than way order.
+    // Choose a free slot round-robin within the DDIO subset. Replacement
+    // policy selection is only needed when evicting a valid line.
     if (way < 0) {
-        std::vector<ReplaceableEntry*> free_candidates;
-        std::vector<std::unique_ptr<ReplaceableEntry>> tmp_entries;
-        for (int i = 0; i < ways; i++) {
-            if (!set[i]) {
-                auto te = std::make_unique<ReplaceableEntry>();
-                te->setPosition(cacheSet, i);
-                te->replacementData = replacement_data[cacheSet][i];
-                free_candidates.push_back(te.get());
-                tmp_entries.push_back(std::move(te));
-            } else if (set[i]->m_Permission == AccessPermission_NotPresent) {
-                free_candidates.push_back(
-                    static_cast<ReplaceableEntry*>(set[i]));
-            }
-        }
-        if (!free_candidates.empty()) {
-            // Invalid LRU entries commonly all have tick zero. Select such
-            // ties round-robin rather than relying on candidate order.
-            for (int offset = 0; offset < ways; ++offset) {
-                const int candidate =
-                    (m_next_invalid_way[cacheSet] + offset) % ways;
-                if (!set[candidate] || set[candidate]->m_Permission ==
-                        AccessPermission_NotPresent) {
-                    way = candidate;
-                    break;
-                }
+        for (int offset = 0; offset < ways; ++offset) {
+            const int candidate =
+                (m_next_invalid_way[cacheSet] + offset) % ways;
+            if (!set[candidate] || set[candidate]->m_Permission ==
+                    AccessPermission_NotPresent) {
+                way = candidate;
+                break;
             }
         }
     }
@@ -527,21 +509,26 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
     entry->initBlockSize(m_block_size);
     entry->setRubySystem(m_ruby_system);
 
-    // Find a free slot.  Pick the replacement policy's victim among the
-    // free slots (LRU naturally prefers the one invalidated longest ago,
-    // since invalidate() zeroes the touch tick) instead of the first
-    // slot in way order: with a first-free-way policy, low-numbered ways
-    // are consumed preferentially by all fill sources, which biases any
-    // way-partitioned region (e.g. DDIO ways).
+    // Rotate free-slot selection when DDIO is enabled so ordinary fills do
+    // not preferentially occupy its low-numbered ways. Otherwise use the
+    // replacement policy among free slots if it supports candidate subsets,
+    // or retain first-free selection for policies such as TreePLRU.
     int64_t cacheSet = addressToCacheSet(address);
     std::vector<AbstractCacheEntry*> &set = m_cache[cacheSet];
     int free_way = -1;
-    // Only policies that are safe on candidate subsets (e.g. LRU; tree-
-    // based policies index by full associativity) can pick among free
-    // slots.  Otherwise fall back to first-free-way.
     const bool subset_safe =
         dynamic_cast<replacement_policy::LRU*>(m_replacementPolicy_ptr);
-    if (subset_safe) {
+    if (m_ddio_way_part > 0) {
+        for (int offset = 0; offset < m_cache_assoc; ++offset) {
+            const int candidate =
+                (m_next_invalid_way[cacheSet] + offset) % m_cache_assoc;
+            if (!set[candidate] || set[candidate]->m_Permission ==
+                    AccessPermission_NotPresent) {
+                free_way = candidate;
+                break;
+            }
+        }
+    } else if (subset_safe) {
         std::vector<ReplaceableEntry*> free_candidates;
         // Temporary entry views for NULL (deallocated) slots; their
         // replacement data persists across deallocation.
@@ -558,17 +545,7 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
                     static_cast<ReplaceableEntry*>(set[i]));
             }
         }
-        if (!free_candidates.empty() && m_ddio_way_part > 0) {
-            for (int offset = 0; offset < m_cache_assoc; ++offset) {
-                const int candidate =
-                    (m_next_invalid_way[cacheSet] + offset) % m_cache_assoc;
-                if (!set[candidate] || set[candidate]->m_Permission ==
-                        AccessPermission_NotPresent) {
-                    free_way = candidate;
-                    break;
-                }
-            }
-        } else if (!free_candidates.empty()) {
+        if (!free_candidates.empty()) {
             free_way = m_replacementPolicy_ptr->
                 getVictim(free_candidates)->getWay();
         }

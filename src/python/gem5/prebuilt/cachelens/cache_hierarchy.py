@@ -69,6 +69,7 @@ _PROFILE_ALIASES = {
 
 # These are intentionally descriptive model profiles, not claims that the
 # resulting configuration is calibrated to a particular commercial CPU.
+# nic_read_no_allocate is deprecated compatibility metadata, not read policy.
 _MODEL_PROFILES = {
     "abstract": {
         "description": "architecture-neutral abstract CHI model",
@@ -488,6 +489,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 "no private target, DataPull, or StashOnce"
                 if self._cache_stashing == "hnf" else "disabled"
             ),
+            # Preserve the deprecated metadata key for existing config readers.
             "nic_read_no_allocate": self._nic_read_no_allocate,
             "hnf_inclusion": self._hnf_inclusion,
             "hnf_dealloc_on_unique": self._hnf_inclusion != "inclusive" and (

@@ -131,14 +131,14 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // possible.
   bool enable_DCT;
 
-  // Explicit requestor opt-in, propagated to the HNF independently of tags.
+  // Explicit requestor opt-in, propagated to the HNF.
   bool ddio_eligible := "False";
 
-  // Compatibility parameter: eligible reads always bypass miss allocation;
-  // noneligible reads always use generic CHI policy, regardless of this knob.
+  // Deprecated compatibility input; eligible reads never allocate on a miss.
+  // Noneligible reads keep generic CHI policy regardless of this value.
+  bool nic_read_no_allocate := "False";
 
   // HN acceptance of no-target write-stash hints, independent of DDIO ways.
-  bool nic_read_no_allocate := "False";
   bool accept_write_stash := "False";
 
   // Atomic Operation Policy

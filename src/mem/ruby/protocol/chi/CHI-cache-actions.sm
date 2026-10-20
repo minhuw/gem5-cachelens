@@ -288,7 +288,7 @@ action(Initiate_Request, desc="") {
   bool dealloc_entry := needDeallocCacheEntry(tbe.reqType);
   // Accepted stash hints override the NIC DDIO allocation policy. Other
   // NIC writes use its subset or write-through/no-retention when disabled.
-  // Eligible reads never allocate, regardless of optional semantic tags.
+  // Eligible reads never allocate on a miss.
   if (is_HN && is_invalid(cache_entry)) {
     if (acceptedWriteStash(tbe)) {
       alloc_entry := true;
