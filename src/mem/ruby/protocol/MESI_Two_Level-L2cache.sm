@@ -232,6 +232,16 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     return State:NP;
   }
 
+  // dma-llc-state-v1 fixed indices: only accepted stable states are legal.
+  int dmaProfileState(State state) {
+    if (state == State:NP) { return 0; }
+    if (state == State:SS) { return 1; }
+    if (state == State:M) { return 2; }
+    if (state == State:MT) { return 3; }
+    error("Unexpected transient state at accepted DMA lookup");
+    return -1;
+  }
+
   void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
     // MUST CHANGE
     if (is_valid(tbe)) {
@@ -530,8 +540,14 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
       if (in_msg.ddioEligible) {
         // Accepted stable lookup, after any subset victim/recycle, before
         // this request's fill/update. A private owner still counts as a hit.
+        State initial := getState(tbe, cache_entry, address);
+        bool dirty := false;
+        if (is_valid(cache_entry)) {
+          dirty := cache_entry.Dirty;
+        }
         L2cache.profileDmaLookup(in_msg.Type == CoherenceRequestType:DMA_READ,
-                                 is_valid(cache_entry));
+                                 is_valid(cache_entry), dmaProfileState(initial),
+                                 dirty, initial == State:MT);
         if (is_valid(cache_entry)) {
           L2cache.profileDdioWayAccess(cache_entry.getWay());
         }

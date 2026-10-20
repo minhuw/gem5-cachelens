@@ -9,6 +9,8 @@ No external TLM library or guest resources. Explicit stash tests use CHI-TLM.
 """
 
 import argparse
+from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import m5
@@ -18,6 +20,11 @@ from m5.objects import (
 )
 from gem5.isas import ISA
 from gem5.prebuilt.cachelens.cache_hierarchy import CacheLensCHIHierarchy
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "mesi_ddio"))
+from line_state_checks import check_cache_marginals
+from chi_state_expectations import directed_marginals
 
 
 class DirectedCore:
@@ -276,4 +283,10 @@ if args.scenario in ("clean_private_victim", "hnf_evict_shared"):
                 assert stat.value == value, (index, level, name, stat.value, value)
                 print(f"CHI_PRIVATE_STAT core={index} level={level} "
                       f"{name}={stat.value}")
+check_cache_marginals(
+    hnf.cache, "CHI", directed_marginals(
+        args.scenario, args.hnf_inclusion, ddio,
+        args.read_not_shared_dirty, args.dealloc_on_unique,
+    ),
+)
 print(f"CACHELENS_CHI_DMA_OK scenario={args.scenario}")

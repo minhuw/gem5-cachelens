@@ -920,6 +920,45 @@ MachineID getMiscNodeMachine() {
   return mapAddressToMachine(intToAddress(0), MachineType:MiscNode);
 }
 
+// dma-llc-state-v1 fixed union indices; preserve the exact initial enum.
+int dmaProfileState(State state) {
+  if (state == State:I) { return 4; }
+  if (state == State:SC) { return 5; }
+  if (state == State:UC) { return 6; }
+  if (state == State:SD) { return 7; }
+  if (state == State:UD) { return 8; }
+  if (state == State:UD_T) { return 9; }
+  if (state == State:RU) { return 10; }
+  if (state == State:RSC) { return 11; }
+  if (state == State:RSD) { return 12; }
+  if (state == State:RUSC) { return 13; }
+  if (state == State:RUSD) { return 14; }
+  if (state == State:SC_RSC) { return 15; }
+  if (state == State:SD_RSC) { return 16; }
+  if (state == State:SD_RSD) { return 17; }
+  if (state == State:UC_RSC) { return 18; }
+  if (state == State:UC_RU) { return 19; }
+  if (state == State:UD_RU) { return 20; }
+  if (state == State:UD_RSD) { return 21; }
+  if (state == State:UD_RSC) { return 22; }
+  if (state == State:DvmTlbi_Unconfirmed) { return 23; }
+  if (state == State:DvmSync_Unsent) { return 24; }
+  if (state == State:DvmSync_Unconfirmed) { return 25; }
+  if (state == State:DvmTlbi_Waiting) { return 26; }
+  if (state == State:DvmSync_Waiting) { return 27; }
+  if (state == State:DvmOp_Finished) { return 28; }
+  if (state == State:DvmExtTlbi_Partial) { return 29; }
+  if (state == State:DvmExtTlbi_Executing) { return 30; }
+  if (state == State:DvmExtSync_Partial) { return 31; }
+  if (state == State:DvmExtSync_Executing) { return 32; }
+  if (state == State:DvmExtOp_Finished) { return 33; }
+  if (state == State:BUSY_INTR) { return 34; }
+  if (state == State:BUSY_BLKD) { return 35; }
+  if (state == State:null) { return 36; }
+  error("Unknown native state at accepted DMA lookup");
+  return -1;
+}
+
 void copyCacheAndDir(CacheEntry cache_entry, DirEntry dir_entry,
                      TBE tbe, State initialState) {
   assert(is_valid(tbe));

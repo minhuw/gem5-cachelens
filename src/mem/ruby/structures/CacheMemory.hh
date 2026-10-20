@@ -303,6 +303,16 @@ class CacheMemory : public SimObject
           statistics::Scalar dmaWriteHits;
           statistics::Scalar dmaWriteMisses;
 
+          // dma-llc-state-v1: independent accepted-lookup marginals.
+          statistics::Vector dmaReadState;
+          statistics::Vector dmaWriteState;
+          statistics::Vector dmaReadTagPresence;
+          statistics::Vector dmaWriteTagPresence;
+          statistics::Vector dmaReadLocalDirty;
+          statistics::Vector dmaWriteLocalDirty;
+          statistics::Vector dmaReadPrivateOwner;
+          statistics::Vector dmaWritePrivateOwner;
+
           // Aggregate eligible DMA way accounting, without source metadata.
           statistics::Vector ddioAllocWays;
           statistics::Vector ddioWayAccess;
@@ -318,18 +328,9 @@ class CacheMemory : public SimObject
       void profilePrefetchHit();
       void profilePrefetchMiss();
 
-      void profileDmaLookup(bool is_read, bool hit)
-      {
-          if (is_read) {
-              cacheMemoryStats.dmaReadRequests++;
-              if (hit) cacheMemoryStats.dmaReadHits++;
-              else cacheMemoryStats.dmaReadMisses++;
-          } else {
-              cacheMemoryStats.dmaWriteRequests++;
-              if (hit) cacheMemoryStats.dmaWriteHits++;
-              else cacheMemoryStats.dmaWriteMisses++;
-          }
-      }
+      // State indices are fixed explicitly in the protocol SLICC mappings.
+      void profileDmaLookup(bool is_read, bool hit, int state,
+                            bool local_dirty, bool private_owner);
 
       void profileDmaRoutingProxy()
       {

@@ -97,6 +97,98 @@ accounting. Native NIC descriptor/payload operation and byte counters remain
 device-local issuance metrics, not these per-line LLC denominators; no
 source-specific cache statistics are reintroduced.
 
+
+## DMA LLC line-state marginals (`dma-llc-state-v1`)
+
+This contract extends `dma-llc-tag-v1` at the **same accepted lookup**. Each
+bank exports `dmaReadState`, `dmaWriteState`, `dmaReadTagPresence`,
+`dmaWriteTagPresence`, `dmaReadLocalDirty`, `dmaWriteLocalDirty`,
+`dmaReadPrivateOwner`, and `dmaWritePrivateOwner` as statically labelled
+vectors (`vector::label`, plus `vector::total`). No policy, eligibility,
+request metadata, or first-arrival observation is added. All six tag counters
+and four directional dimensions increment in one `profileDmaLookup(bool
+is_read, bool hit, int state, bool local_dirty, bool private_owner)` call.
+
+| Dimension | Labels / interpretation |
+| --- | --- |
+| `State` | Exact native enum with protocol prefix; union listed below. |
+| `TagPresence` | `absent`, `present`: same CacheMemory-entry test as tag miss/hit. |
+| `LocalDirty` | `absent` without a tag; otherwise `clean` or `dirty` according to the native local flag. |
+| `PrivateOwner` | `absent`, `present`: actual explicit private owner, independent of tag presence. |
+
+The fixed `State` union, in index order (starting at zero), is:
+
+- `MESI_NP`
+- `MESI_SS`
+- `MESI_M`
+- `MESI_MT`
+- `CHI_I`
+- `CHI_SC`
+- `CHI_UC`
+- `CHI_SD`
+- `CHI_UD`
+- `CHI_UD_T`
+- `CHI_RU`
+- `CHI_RSC`
+- `CHI_RSD`
+- `CHI_RUSC`
+- `CHI_RUSD`
+- `CHI_SC_RSC`
+- `CHI_SD_RSC`
+- `CHI_SD_RSD`
+- `CHI_UC_RSC`
+- `CHI_UC_RU`
+- `CHI_UD_RU`
+- `CHI_UD_RSD`
+- `CHI_UD_RSC`
+- `CHI_DvmTlbi_Unconfirmed`
+- `CHI_DvmSync_Unsent`
+- `CHI_DvmSync_Unconfirmed`
+- `CHI_DvmTlbi_Waiting`
+- `CHI_DvmSync_Waiting`
+- `CHI_DvmOp_Finished`
+- `CHI_DvmExtTlbi_Partial`
+- `CHI_DvmExtTlbi_Executing`
+- `CHI_DvmExtSync_Partial`
+- `CHI_DvmExtSync_Executing`
+- `CHI_DvmExtOp_Finished`
+- `CHI_BUSY_INTR`
+- `CHI_BUSY_BLKD`
+- `CHI_null`
+
+All labels are emitted, including zeros; report only the active protocol's
+state labels. The mapping is explicit in SLICC, independent of enum ordinal
+values. Unknown states fail rather than being folded into a fallback bucket.
+MESI accepts only stable `NP`, `SS`, `M`, `MT` and rejects transients at this
+hook. `MT` means an explicit private exclusive owner (possibly clean or dirty),
+not proof of dirty owner data. `SS` sharers are not an exclusive owner.
+MESI local dirty is `CacheEntry.Dirty`, not the private owner's dirty status.
+
+CHI records the exact `initial` enum used by `Initiate_Request` or
+`Initiate_Request_Stale`, immediately after `copyCacheAndDir`, under the
+existing `!dma_lookup_profiled` guard and before allocation. All declared CHI
+states, including DVM/busy/null, have distinct labels; their presence in the
+schema does not imply eligible DMA can normally accept in those states.
+Local dirty is the native `tbe.dataDirty` flag set by `copyCacheAndDir`, gated
+by tag presence for the `absent` category. This flag can describe stale data
+(e.g. `UD_RU`); `clean` likewise does not guarantee valid local data. It is
+**not** a measurement of authoritative dirty bytes, data source, or latency.
+Private owner is exactly `tbe.dir_ownerExists`, never inferred from sharers.
+Directory-only `RU` has no tag and an owner; directory-only `RSC`/`RUSC` can
+have sharers without any owner. Lack of an owner does not mean lack of a
+directory entry. Native state together with tag presence preserves these
+semantic distinctions, but the separate marginals do not recover joint counts.
+
+For **each direction and each bank**, every dimension sums to `Requests`,
+`TagPresence::present = Hits`, and `TagPresence::absent = Misses`.
+`LocalDirty::absent = Misses`, and its clean plus dirty counts equal Hits.
+Each vector is an **independent request-weighted marginal**, not a joint
+state/tag/owner distribution or a sample of cache capacity. Sum bank counts
+before computing category fractions (`category_count / Requests`); represent
+zero-denominator fractions as **null**, never zero. Do not average bank
+percentages. DDIO-off, retries, internal merge reads, empty fragments and
+noneligible traffic have exactly the existing tag-metric eligibility rules.
+
 ## Configure
 
 The common runner is `configs/example/gem5_library/cachelens-fs.py`. Supply

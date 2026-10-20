@@ -268,7 +268,9 @@ action(Initiate_Request, desc="") {
   // Tag presence, not local data validity or directory-only metadata.
   // Count only after acceptance, before allocation/fill, including DDIO-off.
   if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.dma_lookup_profiled) {
-    cache.profileDmaLookup(tbe.is_ddio_read, is_valid(cache_entry));
+    cache.profileDmaLookup(tbe.is_ddio_read, is_valid(cache_entry),
+                           dmaProfileState(initial), tbe.dataDirty,
+                           tbe.dir_ownerExists);
     tbe.dma_lookup_profiled := true;
   }
   if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.ddio_access_profiled && is_valid(cache_entry)) {
@@ -332,7 +334,9 @@ action(Initiate_Request_Stale, desc="") {
   // Tag presence, not local data validity or directory-only metadata.
   // Count only after acceptance, before allocation/fill, including DDIO-off.
   if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.dma_lookup_profiled) {
-    cache.profileDmaLookup(tbe.is_ddio_read, is_valid(cache_entry));
+    cache.profileDmaLookup(tbe.is_ddio_read, is_valid(cache_entry),
+                           dmaProfileState(initial), tbe.dataDirty,
+                           tbe.dir_ownerExists);
     tbe.dma_lookup_profiled := true;
   }
   if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.ddio_access_profiled && is_valid(cache_entry)) {

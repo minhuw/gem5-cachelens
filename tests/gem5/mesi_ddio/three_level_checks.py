@@ -3,7 +3,9 @@
 
 """Shared native three-level smoke expectations; no gem5/testlib imports."""
 
-from pathlib import Path
+from line_state_checks import (
+    DIMENSIONS, check_marginals, expected_marginals, read_stats,
+)
 
 _RUBY = "system.cache_hierarchy.ruby_system."
 
@@ -170,6 +172,36 @@ for counters in _EXPECTED.values():
     counters["ddioWayAccess::total"] = counters["ddioWayAccess::way0"]
 
 
+# Exact accepted lookups from the directed operations. In particular, the
+# generic memory seed plus CPU unique grant leaves MT locally CLEAN even
+# when the CPU dirties its copy. A retained NIC fill leaves M locally dirty.
+_NP = ("MESI_NP", False, False, False)
+_M = ("MESI_M", True, True, False)
+_MT_CLEAN = ("MESI_MT", True, False, True)
+_MT_DIRTY = ("MESI_MT", True, True, True)
+_SS_CLEAN = ("MESI_SS", True, False, False)
+_LINE_STATES = {
+    "cold_full_write": expected_marginals(write=[_NP]),
+    "partial_dirty_owner": expected_marginals(read=[_M], write=[_MT_CLEAN]),
+    "partial_ss_sharers": expected_marginals(read=[_M], write=[_SS_CLEAN]),
+    "tx_miss_no_allocate": expected_marginals(read=[_NP, _NP]),
+    "clean_subset_mt": expected_marginals(read=[_M, _NP], write=[_NP]),
+    "subset_full_victim": expected_marginals(read=[_M], write=[_NP, _NP]),
+    "sparse_mask": expected_marginals(read=[_M, _NP, _NP], write=[_NP, _M, _NP]),
+    "zero_mask": expected_marginals(read=[_NP]),
+    "eligible_untagged": expected_marginals(read=[_M] * 4 + [_NP] * 3,
+                                           write=[_NP, _M, _NP]),
+    "noneligible_dma": expected_marginals(read=[_NP]),
+    "routing_full_line": expected_marginals(read=[_M], write=[_NP]),
+    "disabled_ddio": expected_marginals(read=[_NP] * 3, write=[_NP, _MT_CLEAN]),
+    "hit_update": expected_marginals(read=[_M], write=[_NP, _M]),
+    "generic_partial": expected_marginals(),
+    # Two transient recycles must not enter ANY marginal; the accepted
+    # overwrite sees the retained tag and the new private owner after transfer.
+    "overlap_dirty_write": expected_marginals(write=[_NP, _MT_DIRTY]),
+}
+
+
 def scenario_args(scenario):
     return (
         f"--scenario={scenario}",
@@ -179,8 +211,8 @@ def scenario_args(scenario):
     )
 
 
-def expected_stats(scenario):
-    banks = 2 if scenario == "routing_full_line" else 1
+def expected_stats(scenario, banks=None):
+    banks = banks or (2 if scenario == "routing_full_line" else 1)
     expected = {
         f"{_RUBY}l3_controllers{bank if banks > 1 else ''}.L2cache.{suffix}": value
         for bank in range(banks)
@@ -197,23 +229,32 @@ def expected_stats(scenario):
     if scenario == "routing_full_line":
         for event in ("ReadRequest", "Data", "WriteRequest", "Ack"):
             expected[f"{_RUBY}DMA_Controller.{event}::total"] = banks
+    for bank in range(banks):
+        prefix = f"{_RUBY}l3_controllers{bank if banks > 1 else ''}.L2cache."
+        for direction in ("Read", "Write"):
+            for dimension, labels in DIMENSIONS.items():
+                values = _LINE_STATES[scenario][direction, dimension]
+                name = f"{prefix}dma{direction}{dimension}"
+                for label in labels:
+                    expected[f"{name}::{label}"] = values.get(label, 0)
+                expected[f"{name}::total"] = _EXPECTED[scenario][f"dma{direction}Requests"]
     return expected
 
 
-def check_stats(path, scenario):
-    stats = {}
-    for line in Path(path).read_text().splitlines():
-        fields = line.split()
-        if len(fields) >= 2:
-            try:
-                stats[fields[0]] = float(fields[1])
-            except ValueError:
-                pass
+def check_stats(path, scenario, banks=None):
+    banks = banks or (2 if scenario == "routing_full_line" else 1)
+    stats = read_stats(path)
     errors = [
         f"{name}: expected {value}, observed {stats.get(name, 'missing')}"
-        for name, value in expected_stats(scenario).items()
+        for name, value in expected_stats(scenario, banks).items()
         if stats.get(name) != value
     ]
+    for bank in range(banks):
+        prefix = f"{_RUBY}l3_controllers{bank if banks > 1 else ''}.L2cache."
+        try:
+            check_marginals(stats, prefix, "MESI", _LINE_STATES[scenario])
+        except ValueError as error:
+            errors.append(str(error))
     if errors:
         raise ValueError(f"{scenario}: " + "; ".join(errors))
 

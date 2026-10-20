@@ -133,6 +133,30 @@ class CacheMemoryTest : public ::testing::Test
         EXPECT_EQ(stats.dmaWriteHits.value(), wh);
         EXPECT_EQ(stats.dmaWriteMisses.value(), wm);
     }
+    void expectDmaMarginals(bool reset = false)
+    {
+        auto &s = cache->cacheMemoryStats;
+        for (auto *v : {&s.dmaReadState, &s.dmaReadTagPresence,
+                        &s.dmaReadLocalDirty, &s.dmaReadPrivateOwner,
+                        &s.dmaWriteState, &s.dmaWriteTagPresence,
+                        &s.dmaWriteLocalDirty, &s.dmaWritePrivateOwner}) {
+            Counter total = 0;
+            for (unsigned i = 0; i < v->size(); ++i)
+                total += (*v)[i].value();
+            EXPECT_EQ(total, reset ? 0 : 3);
+        }
+        EXPECT_EQ(s.dmaReadState[3].value(), reset ? 0 : 1);
+        EXPECT_EQ(s.dmaReadState[10].value(), reset ? 0 : 1);
+        EXPECT_EQ(s.dmaReadTagPresence[1].value(), reset ? 0 : 1);
+        EXPECT_EQ(s.dmaReadLocalDirty[0].value(), reset ? 0 : 2);
+        EXPECT_EQ(s.dmaReadLocalDirty[1].value(), reset ? 0 : 1);
+        EXPECT_EQ(s.dmaReadLocalDirty[2].value(), 0);
+        EXPECT_EQ(s.dmaReadPrivateOwner[1].value(), reset ? 0 : 2);
+        EXPECT_EQ(s.dmaWriteTagPresence[1].value(), reset ? 0 : 2);
+        EXPECT_EQ(s.dmaWriteLocalDirty[2].value(), reset ? 0 : 1);
+        EXPECT_EQ(s.dmaWriteLocalDirty[1].value(), reset ? 0 : 1);
+        EXPECT_EQ(s.dmaWritePrivateOwner[1].value(), 0);
+    }
     void makePresent(Addr address)
     {
         auto *entry = new TestEntry;
@@ -350,20 +374,22 @@ TEST_F(CacheMemoryTest, DmaLookupDirectionsAndResetIncludeDisabledDDIO)
 {
     makeCache(-1);
     expectDmaLookups(0, 0, 0, 0);
-    cache->profileDmaLookup(true, true);
-    cache->profileDmaLookup(true, false);
-    cache->profileDmaLookup(true, false);
-    cache->profileDmaLookup(false, true);
-    cache->profileDmaLookup(false, true);
-    cache->profileDmaLookup(false, false);
+    cache->profileDmaLookup(true, true, 3, false, true);
+    cache->profileDmaLookup(true, false, 10, true, true);
+    cache->profileDmaLookup(true, false, 0, false, false);
+    cache->profileDmaLookup(false, true, 2, true, false);
+    cache->profileDmaLookup(false, true, 1, false, false);
+    cache->profileDmaLookup(false, false, 4, false, false);
     // Fill/access/proxy/merge preparation must not change the denominator.
     cache->profileDdioWayFill(0);
     cache->profileDdioWayAccess(0);
     cache->profileDmaRoutingProxy();
     cache->ddioWriteNeedsRead(true, false);
     expectDmaLookups(1, 2, 2, 1);
+    expectDmaMarginals();
     cache->resetStats();
     expectDmaLookups(0, 0, 0, 0);
+    expectDmaMarginals(true);
 }
 
 TEST_F(CacheMemoryTest, DDIOWritePreparationPreservesSnoopData)

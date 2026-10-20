@@ -829,6 +829,74 @@ CacheMemory::isLocked(Addr address, int context)
     return entry->isLocked(context);
 }
 
+namespace
+{
+// Fixed union of native protocol states. Never merge MESI and CHI semantics.
+const std::vector<std::string> dmaStateLabels = {
+    "MESI_NP",
+    "MESI_SS",
+    "MESI_M",
+    "MESI_MT",
+    "CHI_I",
+    "CHI_SC",
+    "CHI_UC",
+    "CHI_SD",
+    "CHI_UD",
+    "CHI_UD_T",
+    "CHI_RU",
+    "CHI_RSC",
+    "CHI_RSD",
+    "CHI_RUSC",
+    "CHI_RUSD",
+    "CHI_SC_RSC",
+    "CHI_SD_RSC",
+    "CHI_SD_RSD",
+    "CHI_UC_RSC",
+    "CHI_UC_RU",
+    "CHI_UD_RU",
+    "CHI_UD_RSD",
+    "CHI_UD_RSC",
+    "CHI_DvmTlbi_Unconfirmed",
+    "CHI_DvmSync_Unsent",
+    "CHI_DvmSync_Unconfirmed",
+    "CHI_DvmTlbi_Waiting",
+    "CHI_DvmSync_Waiting",
+    "CHI_DvmOp_Finished",
+    "CHI_DvmExtTlbi_Partial",
+    "CHI_DvmExtTlbi_Executing",
+    "CHI_DvmExtSync_Partial",
+    "CHI_DvmExtSync_Executing",
+    "CHI_DvmExtOp_Finished",
+    "CHI_BUSY_INTR",
+    "CHI_BUSY_BLKD",
+    "CHI_null",
+};
+} // anonymous namespace
+
+void
+CacheMemory::profileDmaLookup(bool is_read, bool hit, int state,
+                              bool local_dirty, bool private_owner)
+{
+    panic_if(state < 0 || state >= dmaStateLabels.size(),
+             "Invalid accepted DMA native state index: %d", state);
+    auto &s = cacheMemoryStats;
+    if (is_read) {
+        s.dmaReadRequests++;
+        if (hit) s.dmaReadHits++;
+        else s.dmaReadMisses++;
+    } else {
+        s.dmaWriteRequests++;
+        if (hit) s.dmaWriteHits++;
+        else s.dmaWriteMisses++;
+    }
+    (is_read ? s.dmaReadState : s.dmaWriteState)[state]++;
+    (is_read ? s.dmaReadTagPresence : s.dmaWriteTagPresence)[hit ? 1 : 0]++;
+    (is_read ? s.dmaReadLocalDirty : s.dmaWriteLocalDirty)
+        [hit ? (local_dirty ? 2 : 1) : 0]++;
+    (is_read ? s.dmaReadPrivateOwner : s.dmaWritePrivateOwner)
+        [private_owner ? 1 : 0]++;
+}
+
 CacheMemory::
 CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
     : statistics::Group(parent),
@@ -877,6 +945,14 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(dmaWriteRequests, "Accepted eligible DMA write line lookups"),
       ADD_STAT(dmaWriteHits, "Accepted eligible DMA write LLC tag hits"),
       ADD_STAT(dmaWriteMisses, "Accepted eligible DMA write LLC tag misses"),
+      ADD_STAT(dmaReadState, "Accepted eligible DMA read native coherence state"),
+      ADD_STAT(dmaWriteState, "Accepted eligible DMA write native coherence state"),
+      ADD_STAT(dmaReadTagPresence, "Accepted eligible DMA read cache-entry tag presence"),
+      ADD_STAT(dmaWriteTagPresence, "Accepted eligible DMA write cache-entry tag presence"),
+      ADD_STAT(dmaReadLocalDirty, "Accepted eligible DMA read local dirty flag (not data authority)"),
+      ADD_STAT(dmaWriteLocalDirty, "Accepted eligible DMA write local dirty flag (not data authority)"),
+      ADD_STAT(dmaReadPrivateOwner, "Accepted eligible DMA read explicit private owner presence"),
+      ADD_STAT(dmaWritePrivateOwner, "Accepted eligible DMA write explicit private owner presence"),
       ADD_STAT(ddioAllocWays, "Eligible DMA allocations in DDIO ways"),
       ADD_STAT(ddioWayAccess,
                "Eligible DMA accesses per way"),
@@ -885,6 +961,21 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(wayDeallocations,
                "Cache-entry deallocations per way (all causes)")
 {
+    for (auto *v : {&dmaReadState, &dmaWriteState}) {
+        v->init(dmaStateLabels.size()).flags(statistics::total);
+        for (unsigned i = 0; i < dmaStateLabels.size(); ++i)
+            v->subname(i, dmaStateLabels[i]);
+    }
+    for (auto *v : {&dmaReadTagPresence, &dmaWriteTagPresence,
+                    &dmaReadPrivateOwner, &dmaWritePrivateOwner}) {
+        v->init(2).flags(statistics::total);
+        v->subname(0, "absent").subname(1, "present");
+    }
+    for (auto *v : {&dmaReadLocalDirty, &dmaWriteLocalDirty}) {
+        v->init(3).flags(statistics::total);
+        v->subname(0, "absent").subname(1, "clean").subname(2, "dirty");
+    }
+
     numDataArrayReads
         .flags(statistics::nozero);
 

@@ -40,6 +40,7 @@
 import argparse
 import importlib
 import os
+from pathlib import Path
 import sys
 
 import m5
@@ -48,7 +49,11 @@ from m5.objects import *
 from m5.tlm_chi import *
 from m5.util import addToPath
 
-m5.util.addToPath(os.path.join(m5.util.repoPath(), "configs"))
+m5.util.addToPath(str(Path(__file__).resolve().parents[4] / "configs"))
+m5.util.addToPath(str(Path(__file__).resolve().parents[2] / "mesi_ddio"))
+from line_state_checks import check_cache_marginals
+from chi_state_expectations import tlm_marginals
+
 from common import Options
 from ruby import (
     CHI,
@@ -287,3 +292,9 @@ print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
 
 if hasattr(suite, "check"):
     suite.check(system)
+
+# Apply the state contract to every bank, including wholly noneligible suites.
+# Existing byte/snoop/completion checks above remain the primary data checks.
+for hnf in system.ruby.hnf:
+    check_cache_marginals(hnf._cntrl.cache, "CHI", tlm_marginals(Path(args.suite).stem))
+print("CHI_DMA_STATE_MARGINALS_OK")
