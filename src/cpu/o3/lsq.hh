@@ -44,6 +44,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <map>
 #include <queue>
@@ -52,6 +53,7 @@
 #include "arch/generic/mmu.hh"
 #include "arch/generic/tlb.hh"
 #include "base/flags.hh"
+#include "base/statistics.hh"
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
@@ -853,6 +855,11 @@ class LSQ
      */
     void checkStaleTranslations();
 
+    /** Sends queued TLBI sync completions in order.
+     * @return false if the cache port rejected one; it retries later.
+     */
+    bool sendTlbiSyncComps();
+
     /**
      * Retry the previous send that failed.
      */
@@ -907,6 +914,16 @@ class LSQ
     bool waitingForStaleTranslation;
     /** The ID if the transaction that made translations stale */
     Addr staleTranslationWaitTxnId;
+    /** TLBI sync completions waiting for a cache port retry. */
+    std::deque<PacketPtr> pendingTlbiSyncComps;
+
+    struct LSQStats : public statistics::Group
+    {
+        LSQStats(statistics::Group *parent);
+
+        /** Sync completions rejected by a busy cache port. */
+        statistics::Scalar tlbiSyncCompBlocked;
+    } stats;
 
     /** The LSQ policy for SMT mode. */
     SMTQueuePolicy lsqPolicy;

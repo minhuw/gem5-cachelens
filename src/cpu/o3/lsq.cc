@@ -75,6 +75,7 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       cacheLoadPorts(params.cacheLoadPorts), usedLoadPorts(0),
       waitingForStaleTranslation(false),
       staleTranslationWaitTxnId(0),
+      stats(nullptr),
       lsqPolicy(params.smtLSQPolicy),
       LQEntries(params.LQEntries),
       SQEntries(params.SQEntries),
@@ -86,6 +87,7 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       numThreads(params.numThreads)
 {
     assert(numThreads > 0 && numThreads <= MaxThreads);
+    cpu->addStatGroup("lsq", &stats);
 
     //**********************************************
     //************ Handle SMT Parameters ***********
@@ -137,6 +139,7 @@ void
 LSQ::drainSanityCheck() const
 {
     assert(isDrained());
+    assert(pendingTlbiSyncComps.empty());
 
     for (ThreadID tid = 0; tid < numThreads; tid++)
         thread[tid].drainSanityCheck();
@@ -383,6 +386,11 @@ LSQ::setLastRetiredHtmUid(ThreadID tid, uint64_t htmUid)
 void
 LSQ::recvReqRetry()
 {
+    // Pending sync completions go first; other requests stay blocked
+    // until the port has accepted all of them.
+    if (!sendTlbiSyncComps())
+        return;
+
     iewStage->cacheUnblocked();
     cacheBlocked(false);
 
@@ -1513,13 +1521,39 @@ LSQ::checkStaleTranslations()
     req->setExtraData(staleTranslationWaitTxnId);
     PacketPtr pkt = Packet::createRead(req);
 
-    // TODO - reserve some credit for these responses?
-    if (!dcachePort.sendTimingReq(pkt)) {
-        panic("Couldn't send TLBI_EXT_SYNC_COMP message");
-    }
-
     waitingForStaleTranslation = false;
     staleTranslationWaitTxnId = 0;
+
+    // A busy sequencer may reject the completion (squashed loads still
+    // hold its slots), but it must not be dropped: queue it behind any
+    // earlier one that is waiting for a retry.
+    pendingTlbiSyncComps.push_back(pkt);
+    if (pendingTlbiSyncComps.size() == 1)
+        sendTlbiSyncComps();
+}
+
+bool
+LSQ::sendTlbiSyncComps()
+{
+    while (!pendingTlbiSyncComps.empty()) {
+        if (!dcachePort.sendTimingReq(pendingTlbiSyncComps.front())) {
+            // The port sends a retry once it can accept a request. Block
+            // normal requests so they cannot take the freed slot first.
+            DPRINTF(LSQ, "TLBI_EXT_SYNC_COMP blocked, waiting for retry\n");
+            ++stats.tlbiSyncCompBlocked;
+            cacheBlocked(true);
+            return false;
+        }
+        pendingTlbiSyncComps.pop_front();
+    }
+    return true;
+}
+
+LSQ::LSQStats::LSQStats(statistics::Group *parent)
+    : statistics::Group(parent),
+      ADD_STAT(tlbiSyncCompBlocked, statistics::units::Count::get(),
+               "Number of TLBI sync completions rejected by the cache port")
+{
 }
 
 Fault
