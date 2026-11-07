@@ -369,6 +369,11 @@ let {{
         fault = xc->initiateMemMgmtCmd(memAccessFlags);
 
         PendingDvm = true;
+    } else {
+        // With DVM enabled this instruction is decoded as a load. Without
+        // a DVM message no memory access follows, so let the CPU complete
+        // it (O3 otherwise waits forever for a response).
+        xc->setMemAccPredicate(false);
     }
     '''
     msrTlbiIop = ArmInstObjParams("msr", "Tlbi64LocalHub", "TlbiOp64",
