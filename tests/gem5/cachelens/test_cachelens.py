@@ -777,3 +777,23 @@ for speed in ("1Gbps", "10Gbps"):
         protocol="CHI",
         gem5_fixture_factory=CacheLensExactProtocolFixture,
     )
+
+
+# Bare-metal O3 TLBI/DVM regressions; no guest resources.
+for scenario in ("local-tlbi", "sync-retry"):
+    gem5_verify_config(
+        name=f"cachelens-arm-o3-tlbi-{scenario}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(
+            f"CACHELENS_O3_TLBI_OK scenario={scenario}"
+        )),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "arm_o3_tlbi_dvm.py"
+        ),
+        config_args=("--scenario", scenario),
+        valid_isas=(constants.arm_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+        protocol="CHI",
+        gem5_fixture_factory=CacheLensExactProtocolFixture,
+    )
