@@ -27,6 +27,8 @@ parser.add_argument(
 parser.add_argument("--max-packet-size", type=int, default=1514)
 parser.add_argument("--packet-rate", type=int, default=100_000)
 parser.add_argument("--link-speed", default="100Gbps")
+parser.add_argument("--packet-overhead", type=int, default=0)
+parser.add_argument("--reverse-link", action="store_true")
 parser.add_argument("--start-tick", type=int, default=1)
 parser.add_argument("--stop-tick", type=int, default=(1 << 64) - 1)
 parser.add_argument("--ticks", type=int, default=200_000_000)
@@ -48,8 +50,12 @@ root.loadgen = LoadGeneratorPcap(
     stop_tick=args.stop_tick,
 )
 root.dump = EtherDump(file=args.dump, maxlen=65535)
-root.link = EtherLink(speed=args.link_speed, delay="0ns", dump=root.dump)
-root.link.int0 = root.loadgen.interface
+root.link = EtherLink(speed=args.link_speed, packet_overhead=args.packet_overhead,
+                      delay="0ns", dump=root.dump)
+if args.reverse_link:
+    root.link.int1 = root.loadgen.interface
+else:
+    root.link.int0 = root.loadgen.interface
 
 m5.instantiate(args.restore)
 event = m5.simulate(args.ticks)
@@ -58,3 +64,5 @@ if args.checkpoint:
     print(f"PCAP_CHECKPOINT_SAVED tick={m5.curTick()} path={args.checkpoint}")
 else:
     print(f"PCAP_REPLAY_DONE tick={m5.curTick()} cause={event.getCause()}")
+    print(f"PCAP_TIMING sent={root.loadgen.replaySent()} "
+          f"eof_tick={root.loadgen.replayEofTick()}")

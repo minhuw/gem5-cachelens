@@ -84,6 +84,7 @@ class EtherLink : public SimObject
         Interface *rxint;
 
         const double ticksPerByte;
+        const unsigned packetOverhead;
         const Tick linkDelay;
         const Tick delayVar;
         EtherDump *const dump;
@@ -112,7 +113,8 @@ class EtherLink : public SimObject
 
       public:
         Link(const std::string &name, EtherLink *p, int num,
-             double rate, Tick delay, Tick delay_var, EtherDump *dump);
+             double rate, unsigned packet_overhead, Tick delay,
+             Tick delay_var, EtherDump *dump);
         ~Link() {}
 
         const std::string name() const { return objName; }

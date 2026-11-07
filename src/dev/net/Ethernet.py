@@ -70,6 +70,9 @@ class EtherLink(SimObject):
     delay = Param.Latency("0us", "packet transmit delay")
     delay_var = Param.Latency("0ns", "packet transmit delay variability")
     speed = Param.NetworkBandwidth("1Gbps", "link speed")
+    packet_overhead = Param.Unsigned(
+        0, "Extra bytes of link occupancy per packet; does not change frame data"
+    )
     dump = Param.EtherDump(NULL, "dump object")
 
 

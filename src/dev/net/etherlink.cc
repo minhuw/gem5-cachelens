@@ -69,9 +69,9 @@ EtherLink::EtherLink(const Params &p)
     : SimObject(p)
 {
     link[0] = new Link(name() + ".link0", this, 0, p.speed,
-                       p.delay, p.delay_var, p.dump);
+                       p.packet_overhead, p.delay, p.delay_var, p.dump);
     link[1] = new Link(name() + ".link1", this, 1, p.speed,
-                       p.delay, p.delay_var, p.dump);
+                       p.packet_overhead, p.delay, p.delay_var, p.dump);
 
     interface[0] = new Interface(name() + ".int0", link[0], link[1]);
     interface[1] = new Interface(name() + ".int1", link[1], link[0]);
@@ -106,9 +106,11 @@ EtherLink::Interface::Interface(const std::string &name, Link *tx, Link *rx)
 }
 
 EtherLink::Link::Link(const std::string &name, EtherLink *p, int num,
-                      double rate, Tick delay, Tick delay_var, EtherDump *d)
+                      double rate, unsigned packet_overhead, Tick delay,
+                      Tick delay_var, EtherDump *d)
     : objName(name), parent(p), number(num), txint(NULL), rxint(NULL),
-      ticksPerByte(rate), linkDelay(delay), delayVar(delay_var), dump(d),
+      ticksPerByte(rate), packetOverhead(packet_overhead),
+      linkDelay(delay), delayVar(delay_var), dump(d),
       doneEvent([this]{ txDone(); }, name),
       txQueueEvent([this]{ processTxQueue(); }, name)
 { }
@@ -186,7 +188,9 @@ EtherLink::Link::transmit(EthPacketPtr pkt)
     DDUMP(EthernetData, pkt->data, pkt->length);
 
     packet = pkt;
-    Tick delay = (Tick)ceil(((double)pkt->simLength * ticksPerByte) + 1.0);
+    // Framing and inter-frame gap occupy the link without adding DMA bytes.
+    const double wireLength = double(pkt->simLength) + packetOverhead;
+    Tick delay = (Tick)ceil((wireLength * ticksPerByte) + 1.0);
     if (delayVar != 0)
         delay += rng->random<Tick>(0, delayVar);
 
