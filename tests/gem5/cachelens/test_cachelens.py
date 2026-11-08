@@ -797,3 +797,32 @@ for scenario in ("local-tlbi", "sync-retry"):
         protocol="CHI",
         gem5_fixture_factory=CacheLensExactProtocolFixture,
     )
+
+
+# Bare-metal SplitSim CHI HNF partitions; no guest resources. Each run checks
+# the guest and HNF traffic only; serial/codec/thread statistics identity is
+# compared outside testlib (each mode is a separate gem5 run).
+for mode, layout in (
+    ("serial", "hnf1"),
+    ("codec", "hnf1"),
+    ("codec", "hnf2"),
+    ("thread", "hnf1"),
+    ("thread", "hnf2"),
+):
+    gem5_verify_config(
+        name=f"cachelens-arm-split-partition-{mode}-{layout}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(
+            f"CACHELENS_SPLIT_OK mode={mode} layout={layout} "
+            "tick=200000000 "
+        )),),
+        config=joinpath(
+            absdirpath(__file__), "configs", "arm_split_partition.py"
+        ),
+        config_args=("--mode", mode, "--layout", layout),
+        valid_isas=(constants.arm_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+        protocol="CHI",
+        gem5_fixture_factory=CacheLensExactProtocolFixture,
+    )

@@ -314,6 +314,8 @@ PySource('gem5.prebuilt.cachelens',
 PySource('gem5.prebuilt.cachelens',
     'gem5/prebuilt/cachelens/network.py')
 PySource('gem5.prebuilt.cachelens',
+    'gem5/prebuilt/cachelens/split_partition.py')
+PySource('gem5.prebuilt.cachelens',
     'gem5/prebuilt/cachelens/topology.py')
 PySource('gem5.prebuilt.demo', 'gem5/prebuilt/demo/__init__.py')
 PySource('gem5.prebuilt.demo', 'gem5/prebuilt/demo/x86_demo_board.py')
