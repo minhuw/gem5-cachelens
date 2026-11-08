@@ -160,6 +160,13 @@ LSQ::isDrained() const
         drained = false;
     }
 
+    // A rejected TLBI_EXT_SYNC_COMP waits here for a cache retry and is not
+    // serialized, so a checkpoint taken now would lose it.
+    if (!pendingTlbiSyncComps.empty()) {
+        DPRINTF(Drain, "Not drained, TLBI sync completion pending.\n");
+        drained = false;
+    }
+
     return drained;
 }
 
