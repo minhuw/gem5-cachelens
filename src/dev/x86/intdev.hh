@@ -41,6 +41,7 @@
 #ifndef __DEV_X86_INTDEV_HH__
 #define __DEV_X86_INTDEV_HH__
 
+#include <algorithm>
 #include <cassert>
 #include <functional>
 #include <string>
@@ -48,6 +49,7 @@
 #include "base/cast.hh"
 #include "mem/tport.hh"
 #include "sim/sim_object.hh"
+#include "sim/timing_fence.hh"
 
 namespace gem5
 {
@@ -122,6 +124,14 @@ class IntRequestPort : public QueuedRequestPort
         reqQueue(*_parent, *this), snoopRespQueue(*_parent, *this),
         device(dev), latency(_latency)
     {
+        timingFencePacketQueues().push_back(&reqQueue);
+    }
+
+    ~IntRequestPort() override
+    {
+        auto &queues = timingFencePacketQueues();
+        queues.erase(std::remove(queues.begin(), queues.end(), &reqQueue),
+                     queues.end());
     }
 
     bool

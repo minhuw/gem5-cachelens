@@ -130,6 +130,7 @@ class StateMachine(Symbol):
         self.debug_flags = set()
         self.debug_flags.add("RubyGenerated")
         self.debug_flags.add("RubySlicc")
+        self.debug_flags.add("ProtocolTrace")
 
     def __repr__(self):
         return f"[StateMachine: {self.ident}]"
@@ -389,7 +390,7 @@ namespace ruby
 namespace ${protocol}
 {
 
-extern std::stringstream ${ident}_transitionComment;
+extern thread_local std::stringstream ${ident}_transitionComment;
 
 class $c_ident : public AbstractController
 {
@@ -683,11 +684,12 @@ namespace ruby
 namespace ${protocol}
 {
 
-// for adding information to the protocol debug trace
-std::stringstream ${ident}_transitionComment;
+// Comments belong to the executing host thread, never to a shared stream.
+// Avoid evaluating trace-only expressions when protocol tracing is disabled.
+thread_local std::stringstream ${ident}_transitionComment;
 
 #ifndef NDEBUG
-#define APPEND_TRANSITION_COMMENT(str) (${ident}_transitionComment << str)
+#define APPEND_TRANSITION_COMMENT(str) do { if (GEM5_UNLIKELY(TRACING_ON && ::gem5::debug::ProtocolTrace)) { ${ident}_transitionComment << str; } } while (0)
 #else
 #define APPEND_TRANSITION_COMMENT(str) do {} while (0)
 #endif
@@ -1664,7 +1666,7 @@ ${ident}_Controller::wakeup()
 #define HASH_FUN(state, event)  ((int(state)*${ident}_Event_NUM)+int(event))
 
 #define GET_TRANSITION_COMMENT() (${ident}_transitionComment.str())
-#define CLEAR_TRANSITION_COMMENT() (${ident}_transitionComment.str(""))
+#define CLEAR_TRANSITION_COMMENT() do { if (GEM5_UNLIKELY(TRACING_ON && ::gem5::debug::ProtocolTrace)) { ${ident}_transitionComment.str(""); } } while (0)
 
 namespace gem5
 {

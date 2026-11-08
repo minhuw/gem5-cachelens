@@ -217,8 +217,13 @@ random_time()
 void
 MessageBuffer::enqueue(MsgPtr message, Tick current_time, Tick delta,
                        bool ruby_is_random, bool ruby_warmup,
-                       bool bypassStrictFIFO)
+                       bool bypassStrictFIFO, bool fromSplit)
 {
+    if (m_split_enqueue && !fromSplit) {
+        m_split_enqueue(std::move(message), current_time, delta,
+                        ruby_is_random, ruby_warmup, bypassStrictFIFO);
+        return;
+    }
     // record current time incase we have a pop that also adjusts my size
     if (m_time_last_time_enqueue < current_time) {
         m_msgs_this_cycle = 0;  // first msg this cycle
@@ -542,6 +547,8 @@ MessageBuffer::readyTime() const
 uint32_t
 MessageBuffer::functionalAccess(Packet *pkt, bool is_read, WriteMask *mask)
 {
+    fatal_if(m_split_enqueue && !m_split_functional_safe,
+             "Functional access across prototype split is unsupported");
     DPRINTF(RubyQueue, "functional %s for %#x\n",
             is_read ? "read" : "write", pkt->getAddr());
 

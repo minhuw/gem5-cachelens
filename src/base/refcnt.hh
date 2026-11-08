@@ -41,6 +41,8 @@
 #ifndef __BASE_REFCNT_HH__
 #define __BASE_REFCNT_HH__
 
+#include <atomic>
+#include <cassert>
 #include <type_traits>
 
 /**
@@ -104,6 +106,27 @@ class RefCounted
     {
         if (--count <= 0)
             delete this;
+    }
+};
+
+/** Reference counting for immutable values shared by simulator threads.
+ * Keep the ordinary RefCounted fast path for objects with one queue owner.
+ */
+class AtomicRefCounted
+{
+  private:
+    mutable std::atomic<int> count{0};
+    AtomicRefCounted(const AtomicRefCounted &) = delete;
+    AtomicRefCounted &operator=(const AtomicRefCounted &) = delete;
+  public:
+    AtomicRefCounted() = default;
+    virtual ~AtomicRefCounted() = default;
+    void incref() const { count.fetch_add(1, std::memory_order_relaxed); }
+    void decref() const
+    {
+        const int previous = count.fetch_sub(1, std::memory_order_acq_rel);
+        assert(previous > 0);
+        if (previous == 1) delete this;
     }
 };
 

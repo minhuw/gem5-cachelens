@@ -86,6 +86,7 @@ class Consumer
 
     void scheduleEventAbsolute(Tick timeAbs);
     void scheduleEvent(Cycles timeDelta);
+    void moveWakeupWhileStopped(EventQueue *from, EventQueue *to);
 
   private:
     std::set<Tick> m_wakeup_ticks;

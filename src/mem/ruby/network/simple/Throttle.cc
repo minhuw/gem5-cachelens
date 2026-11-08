@@ -194,7 +194,7 @@ Throttle::operateVnet(int vnet, int channel, int &total_bw_remaining,
             DPRINTF(RubyNetwork, "throttle: %d my bw %d bw spent "
                     "enqueueing net msg %d time: %lld.\n",
                     m_node, getLinkBandwidth(vnet), units_remaining,
-                    m_ruby_system->curCycle());
+                    m_switch->curCycle());
 
             // Move the message
             in->dequeue(current_time);

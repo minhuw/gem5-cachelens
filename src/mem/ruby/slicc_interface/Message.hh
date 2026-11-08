@@ -66,7 +66,7 @@ class Message
         : m_block_size(block_size),
           m_time(curTime),
           m_LastEnqueueTime(curTime),
-          m_DelayedTicks(0), m_msg_counter(0)
+          m_DelayedTicks(0), m_msg_counter(0), incoming_link(-1), vnet(-1)
     { }
 
     Message(const Message &other) = default;
@@ -110,6 +110,20 @@ class Message
     Tick getTime() const { return m_time; }
     void setMsgCounter(uint64_t c) { m_msg_counter = c; }
     uint64_t getMsgCounter() const { return m_msg_counter; }
+
+    /** Restore a transported message before its normal receiver enqueue. */
+    void
+    restoreTransportState(Tick creation_time, Tick last_enqueue_time,
+                          Tick delayed_ticks, uint64_t msg_counter,
+                          int link, int virtual_network)
+    {
+        m_time = creation_time;
+        m_LastEnqueueTime = last_enqueue_time;
+        m_DelayedTicks = delayed_ticks;
+        m_msg_counter = msg_counter;
+        incoming_link = link;
+        vnet = virtual_network;
+    }
 
     // Functions related to network traversal
     virtual const NetDest& getDestination() const

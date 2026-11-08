@@ -49,7 +49,9 @@
  * for the flow control of the port.
  */
 
+#include <cstdint>
 #include <list>
+#include <memory>
 
 #include "mem/port.hh"
 #include "sim/drain.hh"
@@ -89,6 +91,17 @@ class PacketQueue : public Drainable
 
     /** Event used to call processSendEvent. */
     EventFunctionWrapper sendEvent;
+
+    /** Replace the static send event with an exact-deadline handoff. */
+    bool timingFenceEnabled = false;
+    Tick timingFenceWhen = MaxTick;
+    uint64_t timingFenceGeneration = 0;
+
+    // Callbacks must not retain this queue or its packets after destruction.
+    // Allocate only when enabled; stale callbacks hold a weak reference.
+    std::shared_ptr<const bool> timingFenceLifetime;
+
+    void armTimingFence(Tick when);
 
      /*
       * Optionally disable the sanity check
@@ -155,6 +168,18 @@ class PacketQueue : public Drainable
   public:
 
     /**
+     * Enable after stopped queue migration, with both timing-fence hooks set.
+     * Preserve an existing send event's deadline; awaiting retry is unsupported.
+     */
+    void enableTimingFenceWhileStopped();
+
+    /**
+     * Disable before flushing handoffs or clearing hooks, while queues are
+     * stopped. Invalidate callbacks and restore the exact pending deadline.
+     */
+    void disableTimingFenceWhileStopped();
+
+    /**
      * Provide a name to simplify debugging.
      *
      * @return A complete name, appended to module and port
@@ -204,6 +229,12 @@ class PacketQueue : public Drainable
      * @param when Absolute time (in ticks) to send packet
      */
     void schedSendTiming(PacketPtr pkt, Tick when);
+
+    // Only at an all-queue rendezvous: the enqueue was deferred from an
+    // earlier tick, so preserve its original send deadline instead of the
+    // normal +1 anti-recursion clamp. send_now services one due request
+    // under the rendezvous, allowing zero-time local APIC dispatch safely.
+    void schedSendTimingAtFence(PacketPtr pkt, Tick when, bool send_now);
 
     /**
      * Retry sending a packet from the queue. Note that this is not

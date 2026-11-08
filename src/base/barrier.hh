@@ -39,6 +39,8 @@
 #define __BASE_BARRIER_HH__
 
 #include <condition_variable>
+#include <atomic>
+#include <cstdint>
 
 namespace gem5
 {
@@ -56,15 +58,42 @@ class Barrier
     unsigned generation;
     /// Number of threads remaining for the current generation
     unsigned numLeft;
+    inline static std::atomic<bool> defaultSpinWait{false};
+    const bool spinWait;
+    std::atomic<unsigned> spinLeft;
+    std::atomic<uint64_t> spinGeneration{0};
 
   public:
+    // Set only during stopped simulator initialization/activation. Existing
+    // barriers retain their own wait policy and generation state.
+    static void useSpinForNewBarriers(bool enabled)
+    {
+        defaultSpinWait.store(enabled, std::memory_order_relaxed);
+    }
+
     Barrier(unsigned _numWaiting)
-        : numWaiting(_numWaiting), generation(0), numLeft(_numWaiting)
+        : numWaiting(_numWaiting), generation(0), numLeft(_numWaiting),
+          spinWait(defaultSpinWait.load(std::memory_order_relaxed)),
+          spinLeft(_numWaiting)
     {}
 
     bool
     wait()
     {
+        if (spinWait) {
+            uint64_t gen = spinGeneration.load(std::memory_order_acquire);
+            if (spinLeft.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                spinLeft.store(numWaiting, std::memory_order_relaxed);
+                spinGeneration.fetch_add(1, std::memory_order_release);
+                return true;
+            }
+            while (spinGeneration.load(std::memory_order_acquire) == gen) {
+#if defined(__x86_64__) || defined(__i386__)
+                __asm__ __volatile__("pause");
+#endif
+            }
+            return false;
+        }
         std::unique_lock<std::mutex> lock(bMutex);
         unsigned int gen = generation;
 

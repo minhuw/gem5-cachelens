@@ -136,9 +136,28 @@ class MessageBuffer : public SimObject
 
     const MsgPtr &peekMsgPtr() const { return m_prio_heap.front(); }
 
+    using SplitEnqueue = std::function<void(MsgPtr, Tick, Tick, bool, bool, bool)>;
+    void setSplitEnqueue(SplitEnqueue callback, bool functional_safe = false)
+    {
+        fatal_if(m_split_enqueue, "Multiple split owners for %s", name());
+        m_split_enqueue = std::move(callback);
+        m_split_functional_safe = functional_safe;
+    }
+    void clearSplitEnqueueWhileStopped()
+    {
+        fatal_if(inParallelMode, "Cannot clear an active split hook");
+        m_split_enqueue = {};
+        m_split_functional_safe = false;
+    }
+    bool hasPendingMessages() const
+    {
+        return !m_prio_heap.empty() || !m_stall_msg_map.empty() ||
+               !m_deferred_msg_map.empty();
+    }
+
     void enqueue(MsgPtr message, Tick curTime, Tick delta,
                 bool ruby_is_random, bool ruby_warmup,
-                bool bypassStrictFIFO = false);
+                bool bypassStrictFIFO = false, bool fromSplit = false);
 
     // Defer enqueueing a message to a later cycle by putting it aside and not
     // enqueueing it in this cycle
@@ -216,6 +235,8 @@ class MessageBuffer : public SimObject
   private:
     // Data Members (m_ prefix)
     //! Consumer to signal a wakeup(), can be NULL
+    SplitEnqueue m_split_enqueue;
+    bool m_split_functional_safe = false;
     Consumer* m_consumer;
     std::vector<MsgPtr> m_prio_heap;
 

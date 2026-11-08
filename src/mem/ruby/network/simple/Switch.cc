@@ -79,6 +79,14 @@ Switch::init()
 }
 
 void
+Switch::moveConsumersWhileStopped(EventQueue *from, EventQueue *to)
+{
+    perfectSwitch.moveWakeupWhileStopped(from, to);
+    for (auto &throttle : throttles)
+        throttle.moveWakeupWhileStopped(from, to);
+}
+
+void
 Switch::addInPort(const std::vector<MessageBuffer*>& in)
 {
     perfectSwitch.addInPort(in);

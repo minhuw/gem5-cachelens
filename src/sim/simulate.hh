@@ -41,12 +41,15 @@
 #ifndef __SIMULATE_HH__
 #define __SIMULATE_HH__
 
+#include <vector>
+
 #include "base/types.hh"
 
 namespace gem5
 {
 
 class GlobalSimLoopExitEvent;
+class EventQueue;
 
 GlobalSimLoopExitEvent *simulate(Tick num_cycles = -1);
 
@@ -77,6 +80,16 @@ Tick get_max_tick();
  * GlobalExitEvent prior to calling this function.
  */
 void terminateEventQueueThreads();
+
+/**
+ * Promote one stopped serial queue to count total queues (2..8), with no
+ * pending global events except the simulation limit. Returns the new worker
+ * queues in index order, 1..count-1, all at the current tick.
+ */
+std::vector<EventQueue *> addStoppedEventQueues(unsigned count);
+
+// Compatibility wrapper returning queue 1 after promotion to two queues.
+EventQueue *addStoppedEventQueue();
 
 extern GlobalSimLoopExitEvent *simulate_limit_event;
 

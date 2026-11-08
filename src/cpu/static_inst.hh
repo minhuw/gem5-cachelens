@@ -85,7 +85,8 @@ class InstRecord;
  * solely on these flags can process instructions without being
  * recompiled for multiple ISAs.
  */
-class StaticInst : public RefCounted, public StaticInstFlags
+// Shared NOPs and other decoded values may outlive/move between CPU queues.
+class StaticInst : public AtomicRefCounted, public StaticInstFlags
 {
   public:
     using RegIdArrayPtr = RegId (StaticInst:: *)[];

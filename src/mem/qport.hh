@@ -91,6 +91,9 @@ class QueuedResponsePort : public ResponsePort
      * @param pkt Packet to send
      * @param when Absolute time (in ticks) to send packet
      */
+    void schedTimingRespAtFence(PacketPtr pkt, Tick when)
+    { respQueue.schedSendTimingAtFence(pkt, when, false); }
+
     void schedTimingResp(PacketPtr pkt, Tick when)
     { respQueue.schedSendTiming(pkt, when); }
 
@@ -147,6 +150,9 @@ class QueuedRequestPort : public RequestPort
      * @param pkt Packet to send
      * @param when Absolute time (in ticks) to send packet
      */
+    void schedTimingReqAtFence(PacketPtr pkt, Tick when)
+    { reqQueue.schedSendTimingAtFence(pkt, when, true); }
+
     void schedTimingReq(PacketPtr pkt, Tick when)
     { reqQueue.schedSendTiming(pkt, when); }
 

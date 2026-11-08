@@ -68,11 +68,13 @@ class RubyPort : public ClockedObject
     {
       private:
         RubyPort& owner;
+        EventManager requestManager;
         ReqPacketQueue reqQueue;
         SnoopRespPacketQueue snoopRespQueue;
 
       public:
         MemRequestPort(const std::string &_name, RubyPort& _port);
+        EventManager *outgoingManager() { return &requestManager; }
 
       protected:
         bool recvTimingResp(PacketPtr pkt);
@@ -131,9 +133,11 @@ class RubyPort : public ClockedObject
     {
       private:
         RubyPort& owner;
+        EventManager responseManager;
         RespPacketQueue queue;
 
       public:
+        EventManager *outgoingManager() { return &responseManager; }
         PioResponsePort(const std::string &_name, RubyPort& _port);
 
       protected:

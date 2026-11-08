@@ -129,7 +129,7 @@ class BaseGlobalEvent : public EventBase
     bool scheduled() const
     {
         bool sched = false;
-        for (uint32_t i = 0; i < numMainEventQueues; ++i) {
+        for (size_t i = 0; i < barrierEvent.size(); ++i) {
             sched = sched || barrierEvent[i]->scheduled();
         }
 

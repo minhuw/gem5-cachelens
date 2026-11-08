@@ -43,6 +43,7 @@
 #include "base/trace.hh"
 #include "debug/Drain.hh"
 #include "debug/PacketQueue.hh"
+#include "sim/timing_fence.hh"
 
 namespace gem5
 {
@@ -63,10 +64,93 @@ PacketQueue::~PacketQueue()
 }
 
 void
+PacketQueue::enableTimingFenceWhileStopped()
+{
+    fatal_if(inParallelMode,
+             "Packet queue timing-fence activation requires stopped queues");
+    if (timingFenceEnabled)
+        return;
+    fatal_if(waitingOnRetry,
+             "Cannot enable timing fence on packet queue %s awaiting retry",
+             name());
+    fatal_if(!timingFenceHandoff || !timingFenceIsSafe || !timingFenceIsSafe(),
+             "Packet queue timing fence requires active rendezvous hooks");
+
+    const Tick when = sendEvent.scheduled() ? sendEvent.when() : MaxTick;
+    timingFenceLifetime = std::make_shared<const bool>(true);
+    timingFenceEnabled = true;
+    if (sendEvent.scheduled()) {
+        // sendEvent is embedded, not AutoDelete: only remove its scheduling.
+        em.deschedule(sendEvent);
+        armTimingFence(when);
+    }
+}
+
+void
+PacketQueue::disableTimingFenceWhileStopped()
+{
+    fatal_if(inParallelMode,
+             "Packet queue timing-fence deactivation requires stopped queues");
+    if (!timingFenceEnabled)
+        return;
+
+    const Tick when = timingFenceWhen;
+    timingFenceEnabled = false;
+    timingFenceWhen = MaxTick;
+    ++timingFenceGeneration;
+    timingFenceLifetime.reset();
+    if (when != MaxTick) {
+        fatal_if(when < em.eventQueue()->getCurTick(),
+                 "Packet queue %s timing-fence deadline is in the past", name());
+        assert(!sendEvent.scheduled());
+        // Do not apply schedSendEvent's anti-recursion +1 on restoration.
+        em.schedule(sendEvent, when);
+    }
+}
+
+void
+PacketQueue::armTimingFence(Tick when)
+{
+    assert(timingFenceEnabled);
+    assert(!sendEvent.scheduled());
+    if (when >= timingFenceWhen)
+        return;
+    fatal_if(!timingFenceHandoff || !timingFenceIsSafe,
+             "Packet queue timing-fence hooks were cleared while enabled");
+
+    timingFenceWhen = when;
+    const uint64_t generation = ++timingFenceGeneration;
+    std::weak_ptr<const bool> lifetime = timingFenceLifetime;
+    const bool handed_off = timingFenceHandoff(&em, when,
+        [this, lifetime, generation, when] {
+            // Disable, replacement by an earlier send, and destruction all
+            // cancel a callback without touching the event or packet lifetime.
+            if (lifetime.expired())
+                return;
+            if (!timingFenceEnabled || generation != timingFenceGeneration ||
+                when != timingFenceWhen)
+                return;
+            fatal_if(curEventQueue() != em.eventQueue() || curTick() != when ||
+                     !timingFenceIsSafe || !timingFenceIsSafe(),
+                     "Packet queue %s send requires its exact rendezvous",
+                     name());
+            timingFenceWhen = MaxTick;
+            processSendEvent();
+        }, true);
+    fatal_if(!handed_off,
+             "Packet queue %s timing-fence handoff was rejected", name());
+}
+
+void
 PacketQueue::retry()
 {
     DPRINTF(PacketQueue, "Queue %s received retry\n", name());
     assert(waitingOnRetry);
+    fatal_if(timingFenceEnabled &&
+             (!timingFenceIsSafe || !timingFenceIsSafe() ||
+              curEventQueue() != em.eventQueue()),
+             "Packet queue %s retry outside a safe timing-fence rendezvous",
+             name());
     waitingOnRetry = false;
     sendDeferredPacket();
 }
@@ -156,6 +240,31 @@ PacketQueue::schedSendTiming(PacketPtr pkt, Tick when)
 }
 
 void
+PacketQueue::schedSendTimingAtFence(PacketPtr pkt, Tick when, bool send_now)
+{
+    assert(when >= curTick());
+    fatal_if(timingFenceEnabled &&
+             (!timingFenceIsSafe || !timingFenceIsSafe() ||
+              curEventQueue() != em.eventQueue()),
+             "Packet queue %s immediate send outside a safe rendezvous", name());
+    schedSendTiming(pkt, when);
+    if (when == curTick() && !waitingOnRetry && deferredPacketReady()) {
+        if (send_now) {
+            if (timingFenceEnabled) {
+                ++timingFenceGeneration;
+                timingFenceWhen = MaxTick;
+            }
+            if (sendEvent.scheduled()) em.deschedule(sendEvent);
+            processSendEvent();
+        } else if (timingFenceEnabled) {
+            armTimingFence(when);
+        } else if (sendEvent.scheduled() && sendEvent.when() > when) {
+            em.reschedule(sendEvent, when);
+        }
+    }
+}
+
+void
 PacketQueue::schedSendEvent(Tick when)
 {
     // if we are waiting on a retry just hold off
@@ -171,7 +280,9 @@ PacketQueue::schedSendEvent(Tick when)
         when = std::max(when, curTick() + 1);
         // @todo Revisit the +1
 
-        if (!sendEvent.scheduled()) {
+        if (timingFenceEnabled) {
+            armTimingFence(when);
+        } else if (!sendEvent.scheduled()) {
             em.schedule(&sendEvent, when);
         } else if (when < sendEvent.when()) {
             // if the new time is earlier than when the event
@@ -182,7 +293,8 @@ PacketQueue::schedSendEvent(Tick when)
         // we get a MaxTick when there is no more to send, so if we're
         // draining, we may be done at this point
         if (drainState() == DrainState::Draining &&
-            transmitList.empty() && !sendEvent.scheduled()) {
+            transmitList.empty() && !sendEvent.scheduled() &&
+            timingFenceWhen == MaxTick) {
 
             DPRINTF(Drain, "PacketQueue done draining,"
                     "processing drain event\n");

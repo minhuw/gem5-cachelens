@@ -54,6 +54,7 @@
 #include "sim/sim_events.hh"
 #include "sim/sim_exit.hh"
 #include "sim/stat_control.hh"
+#include "sim/timing_fence.hh"
 
 namespace gem5
 {
@@ -62,6 +63,7 @@ namespace gem5
 Event *doSimLoop(EventQueue *);
 
 GlobalSimLoopExitEvent *simulate_limit_event = nullptr;
+GlobalSimLoopExitEvent *global_exit_event = nullptr;
 
 class SimulatorThreads
 {
@@ -166,6 +168,51 @@ class SimulatorThreads
 };
 
 static std::unique_ptr<SimulatorThreads> simulatorThreads;
+// Python exit wrappers use nodelete and may outlive later simulate() calls.
+// Promotion happens once; retain its retired limit for the process lifetime.
+static std::vector<GlobalSimLoopExitEvent *> retiredSimulationLimits;
+
+std::vector<EventQueue *>
+addStoppedEventQueues(unsigned count)
+{
+    fatal_if(count < 2 || count > 8,
+             "Queue promotion requires between 2 and 8 total queues");
+    fatal_if(inParallelMode || numMainEventQueues != 1 ||
+             curEventQueue() != getEventQueue(0),
+             "Queue promotion requires one stopped main queue");
+    fatal_if(global_exit_event &&
+             (global_exit_event == simulate_limit_event ||
+              global_exit_event->getCause() != "workbegin"),
+             "Queue promotion requires a consumed workbegin exit or cold activation");
+    fatal_if(getEventQueue(0)->hasGlobalEventsOtherThan(simulate_limit_event),
+             "Queue promotion has incompatible pending global events");
+    // The one-member worker pool and limit must not survive membership
+    // promotion. The returned, already-consumed workbegin event retains its
+    // original membership and remains a valid Python observation object.
+    if (simulate_limit_event) {
+        if (simulate_limit_event->scheduled()) simulate_limit_event->deschedule();
+        retiredSimulationLimits.push_back(simulate_limit_event);
+        simulate_limit_event = nullptr;
+    }
+    simulatorThreads.reset();
+    Tick now = curTick();
+    std::vector<EventQueue *> workers;
+    workers.reserve(count - 1);
+    for (unsigned index = 1; index < count; ++index) {
+        EventQueue *worker = getEventQueue(index);
+        fatal_if(!worker->empty(),
+                 "New worker queue unexpectedly contains events");
+        worker->setCurTick(now);
+        workers.push_back(worker);
+    }
+    return workers;
+}
+
+EventQueue *
+addStoppedEventQueue()
+{
+    return addStoppedEventQueues(2).front();
+}
 
 struct DescheduleDeleter
 {
@@ -184,7 +231,6 @@ struct DescheduleDeleter
  * via the 'set_max_tick' function prior. This function is exported to Python.
  * @return The SimLoopExitEvent that caused the loop to exit.
  */
-GlobalSimLoopExitEvent *global_exit_event= nullptr;
 GlobalSimLoopExitEvent *
 simulate(Tick num_cycles)
 {
@@ -223,9 +269,14 @@ simulate(Tick num_cycles)
         fatal_if(simQuantum == 0,
                  "Quantum for multi-eventq simulation not specified");
 
-        quantum_event.reset(
-            new GlobalSyncEvent(curTick() + simQuantum, simQuantum,
-                                EventBase::Progress_Event_Pri, 0));
+        fatal_if(timingFenceOwnsQuantumSync &&
+                 (!timingFenceHandoff || !timingFenceIsSafe),
+                 "Fused quantum synchronization has no active timing fence");
+        if (!timingFenceOwnsQuantumSync) {
+            quantum_event.reset(
+                new GlobalSyncEvent(curTick() + simQuantum, simQuantum,
+                                    EventBase::Progress_Event_Pri, 0));
+        }
 
         inParallelMode = true;
     }

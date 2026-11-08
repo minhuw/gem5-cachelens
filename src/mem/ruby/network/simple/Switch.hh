@@ -88,6 +88,7 @@ class Switch : public BasicRouter
     Switch(const Params &p);
     ~Switch() = default;
     void init();
+    void moveConsumersWhileStopped(EventQueue *from, EventQueue *to);
 
     void addInPort(const std::vector<MessageBuffer*>& in);
     void addOutPort(const std::vector<MessageBuffer*>& out,

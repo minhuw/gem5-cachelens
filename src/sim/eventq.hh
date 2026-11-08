@@ -38,14 +38,19 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cstddef>
 #include <functional>
 #include <iosfwd>
 #include <list>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "base/debug.hh"
 #include "base/flags.hh"
+#include "base/logging.hh"
 #include "base/named.hh"
 #include "base/trace.hh"
 #include "base/type_traits.hh"
@@ -59,6 +64,7 @@ namespace gem5
 {
 
 class EventQueue;       // forward declaration
+class EventManager;
 class BaseGlobalEvent;
 
 //! Simulation Quantum for multiple eventq simulation.
@@ -254,6 +260,7 @@ class EventBase
 class Event : public EventBase, public Serializable
 {
     friend class EventQueue;
+    friend class EventManager;
 
   private:
     // The event queue is now a linked list of linked lists.  The
@@ -267,6 +274,10 @@ class Event : public EventBase, public Serializable
     // over the current fully linear insertion.
     Event *nextBin;
     Event *nextInBin;
+
+    // Last EventManager to schedule this event; direct EventQueue users do
+    // not establish ownership for stopped-queue migration.
+    EventManager *schedulingManager;
 
     static Event *insertBefore(Event *event, Event *curr);
     static Event *removeItem(Event *event, Event *last);
@@ -405,7 +416,8 @@ class Event : public EventBase, public Serializable
      * @ingroup api_eventq
      */
     Event(Priority p = Default_Pri, Flags f = 0)
-        : nextBin(nullptr), nextInBin(nullptr), _when(0), _priority(p),
+        : nextBin(nullptr), nextInBin(nullptr), schedulingManager(nullptr),
+          _when(0), _priority(p),
           flags(Initialized | f)
     {
         assert(f.noneSet(~PublicWrite));
@@ -850,6 +862,34 @@ class EventQueue
     Tick getCurTick() const { return _curTick; }
     Event *getHead() const { return head; }
 
+    bool hasGlobalEventsOtherThan(BaseGlobalEvent *allowed) const
+    {
+        if (!async_queue.empty()) return true;
+        for (Event *bin = head; bin; bin = bin->nextBin)
+            for (Event *event = bin; event; event = event->nextInBin)
+                if (event->globalEvent() && event->globalEvent() != allowed)
+                    return true;
+        return false;
+    }
+
+    /**
+     * Move pending events owned by the listed managers to their target queues.
+     * All queues and asynchronous producers must be stopped, with empty async
+     * queues and identical ticks. Each manager must still belong to this queue;
+     * conflicting destinations and selected global events are rejected before
+     * any event is moved. A destination equal to this queue is a no-op.
+     *
+     * Preserves event lifetime, flags, and the source order within each bin on
+     * each destination (ahead of any existing events in that destination bin).
+     * Callers must then update every manager using setEventQueueWhileStopped()
+     * before scheduling or servicing events. Direct EventQueue scheduling,
+     * including checkpointReschedule(), cannot establish a manager owner.
+     *
+     * @return Number of events moved to other queues.
+     */
+    size_t moveManagedEventsWhileStopped(
+        const std::vector<std::pair<EventManager *, EventQueue *>> &moves);
+
     Event *serviceOne();
 
     /**
@@ -1005,12 +1045,21 @@ class EventManager
         return eventq;
     }
 
+    // Only for an explicitly coordinated migration while simulate() is
+    // stopped. Callers must move their scheduled events before using it.
+    void setEventQueueWhileStopped(EventQueue *queue)
+    {
+        assert(!inParallelMode);
+        eventq = queue;
+    }
+
     /**
      * @ingroup api_eventq
      */
     void
     schedule(Event &event, Tick when)
     {
+        event.schedulingManager = this;
         eventq->schedule(&event, when);
     }
 
@@ -1029,6 +1078,7 @@ class EventManager
     void
     reschedule(Event &event, Tick when, bool always = false)
     {
+        event.schedulingManager = this;
         eventq->reschedule(&event, when, always);
     }
 
@@ -1038,6 +1088,7 @@ class EventManager
     void
     schedule(Event *event, Tick when)
     {
+        event->schedulingManager = this;
         eventq->schedule(event, when);
     }
 
@@ -1056,6 +1107,7 @@ class EventManager
     void
     reschedule(Event *event, Tick when, bool always = false)
     {
+        event->schedulingManager = this;
         eventq->reschedule(event, when, always);
     }
 
@@ -1072,6 +1124,61 @@ class EventManager
 
     void setCurTick(Tick newVal) { eventq->setCurTick(newVal); }
 };
+
+inline size_t
+EventQueue::moveManagedEventsWhileStopped(
+    const std::vector<std::pair<EventManager *, EventQueue *>> &moves)
+{
+    fatal_if(inParallelMode,
+             "Event migration requires stopped event queues");
+    fatal_if(!async_queue.empty(),
+             "Event migration requires an empty source async queue");
+
+    std::unordered_map<EventManager *, EventQueue *> destinations;
+    destinations.reserve(moves.size());
+    for (const auto &move : moves) {
+        EventManager *manager = move.first;
+        EventQueue *target = move.second;
+        fatal_if(!manager || !target,
+                 "Event migration requires a manager and destination queue");
+        fatal_if(manager->eventQueue() != this,
+                 "Event migration manager does not belong to the source queue");
+        fatal_if(target->getCurTick() != getCurTick(),
+                 "Event migration requires queues at identical ticks");
+        fatal_if(!target->async_queue.empty(),
+                 "Event migration requires empty destination async queues");
+        auto entry = destinations.emplace(manager, target);
+        fatal_if(!entry.second && entry.first->second != target,
+                 "Event migration manager has conflicting destinations");
+    }
+
+    // Snapshot in service order before changing any links. Validate all
+    // selected events before moving any, including those in later bins.
+    std::vector<std::pair<Event *, EventQueue *>> pending;
+    for (Event *bin = head; bin; bin = bin->nextBin) {
+        for (Event *event = bin; event; event = event->nextInBin) {
+            auto destination = destinations.find(event->schedulingManager);
+            if (destination == destinations.end())
+                continue;
+            fatal_if(event->globalEvent(),
+                     "Event migration cannot move global events");
+            if (destination->second != this)
+                pending.emplace_back(event, destination->second);
+        }
+    }
+
+    // insert() pushes onto a bin's stack, so insert in reverse service order.
+    // Keep Scheduled/Squashed flags and the queue's acquired reference intact:
+    // deschedule()/schedule() could destroy an AutoDelete event or unsquash it.
+    for (auto move = pending.rbegin(); move != pending.rend(); ++move) {
+        Event *event = move->first;
+        EventQueue *target = move->second;
+        remove(event);
+        event->setWhen(event->when(), target);
+        target->insert(event);
+    }
+    return pending.size();
+}
 
 /**
  * @brief Wrap a member function inside MemberEventWrapper to use it as an
@@ -1185,6 +1292,10 @@ class EventFunctionWrapper : public Event
 
 /**
  * \def UNSERIALIZE_EVENT(event)
+ *
+ * This direct EventQueue restore does not identify an EventManager. Restored
+ * events are not tagged for manager-based migration until scheduled or
+ * rescheduled through their EventManager; do not infer an owner from `this`.
  *
  * @ingroup api_serialize
  */

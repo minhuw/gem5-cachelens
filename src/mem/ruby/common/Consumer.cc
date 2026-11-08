@@ -53,6 +53,18 @@ Consumer::Consumer(ClockedObject *_em, Event::Priority ev_prio)
 { }
 
 void
+Consumer::moveWakeupWhileStopped(EventQueue *from, EventQueue *to)
+{
+    fatal_if(inParallelMode || from->getCurTick() != to->getCurTick(),
+             "Consumer migration requires stopped queues at the same tick");
+    if (m_wakeup_event.scheduled()) {
+        Tick when = m_wakeup_event.when();
+        from->deschedule(&m_wakeup_event);
+        to->schedule(&m_wakeup_event, when);
+    }
+}
+
+void
 Consumer::scheduleEvent(Cycles timeDelta)
 {
     m_wakeup_ticks.insert(em->clockEdge(timeDelta));

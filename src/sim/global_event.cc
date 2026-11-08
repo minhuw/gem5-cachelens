@@ -28,6 +28,7 @@
  */
 
 #include "sim/global_event.hh"
+#include "base/logging.hh"
 
 #include "sim/cur_tick.hh"
 
@@ -47,7 +48,7 @@ BaseGlobalEvent::~BaseGlobalEvent()
 {
     // see GlobalEvent::BarrierEvent::~BarrierEvent() comments
     if (barrierEvent[0] != NULL) {
-        for (int i = 0; i < numMainEventQueues; ++i)
+        for (size_t i = 0; i < barrierEvent.size(); ++i)
             delete barrierEvent[i];
     }
 }
@@ -55,6 +56,8 @@ BaseGlobalEvent::~BaseGlobalEvent()
 
 void BaseGlobalEvent::schedule(Tick when)
 {
+    fatal_if(barrierEvent.size() != numMainEventQueues,
+             "Cannot schedule a global event with retired queue membership");
     // This function is scheduling a global event, which actually is a
     // set of local events, one event on each eventq. Global events need
     // to have a total order. A thread cannot start executing events that
@@ -77,7 +80,7 @@ void BaseGlobalEvent::schedule(Tick when)
 
     globalQMutex.lock();
 
-    for (int i = 0; i < numMainEventQueues; ++i) {
+    for (size_t i = 0; i < barrierEvent.size(); ++i) {
         mainEventQueue[i]->schedule(barrierEvent[i], when, true);
     }
 
@@ -87,7 +90,7 @@ void BaseGlobalEvent::schedule(Tick when)
 void BaseGlobalEvent::deschedule()
 {
     EventQueue *q = curEventQueue();
-    for (uint32_t i = 0; i < numMainEventQueues; ++i) {
+    for (size_t i = 0; i < barrierEvent.size(); ++i) {
         if (barrierEvent[i]->scheduled()) {
             curEventQueue(mainEventQueue[i]);
             mainEventQueue[i]->deschedule(barrierEvent[i]);
@@ -99,10 +102,12 @@ void BaseGlobalEvent::deschedule()
 
 void BaseGlobalEvent::reschedule(Tick when)
 {
+    fatal_if(barrierEvent.size() != numMainEventQueues,
+             "Cannot reschedule a global event with retired queue membership");
     // Read the comment in the schedule() function above.
     globalQMutex.lock();
 
-    for (uint32_t i = 0; i < numMainEventQueues; ++i) {
+    for (size_t i = 0; i < barrierEvent.size(); ++i) {
         if (barrierEvent[i]->scheduled())
             mainEventQueue[i]->reschedule(barrierEvent[i], when);
         else

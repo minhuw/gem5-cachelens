@@ -55,9 +55,12 @@ namespace gem5
 GlobalSimLoopExitEvent::GlobalSimLoopExitEvent(Tick when,
                                                const std::string &_cause,
                                                int c, Tick r)
-    : GlobalEvent(when, Sim_Exit_Pri, IsExitEvent),
+    : GlobalEvent(Sim_Exit_Pri, IsExitEvent),
       cause(_cause), code(c), repeat(r)
 {
+    // Publish after the exit's members and dynamic type are initialized.
+    // The checked fused timing fence validates this type at async insertion.
+    schedule(when);
 }
 
 GlobalSimLoopExitEvent::GlobalSimLoopExitEvent(const std::string &_cause,

@@ -40,6 +40,7 @@
  */
 
 #include "mem/ruby/system/RubyPort.hh"
+#include "mem/ruby/network/simple/SplitRubyThreadBridge.hh"
 
 #include "base/compiler.hh"
 #include "cpu/testers/rubytest/RubyTester.hh"
@@ -145,7 +146,8 @@ RubyPort::PioRequestPort::PioRequestPort(const std::string &_name,
 
 RubyPort::PioResponsePort::PioResponsePort(const std::string &_name,
                                            RubyPort& _port)
-    : QueuedResponsePort(_name, queue), owner{_port}, queue(_port, *this)
+    : QueuedResponsePort(_name, queue), owner{_port},
+      responseManager(_port.eventQueue()), queue(responseManager, *this)
 {
     DPRINTF(RubyPort, "Created response pioport on sequencer %s\n", _name);
 }
@@ -154,7 +156,8 @@ RubyPort::MemRequestPort::MemRequestPort(const std::string &_name,
                                          RubyPort& _port):
     QueuedRequestPort(_name, reqQueue, snoopRespQueue),
     owner{_port},
-    reqQueue(_port, *this),
+    requestManager(_port.eventQueue()),
+    reqQueue(requestManager, *this),
     snoopRespQueue(_port, *this)
 {
     DPRINTF(RubyPort, "Created request memport on ruby sequencer %s\n", _name);
@@ -180,8 +183,11 @@ RubyPort::PioRequestPort::recvTimingResp(PacketPtr pkt)
     DPRINTF(RubyPort, "Response for address: 0x%#x\n", pkt->getAddr());
 
     // send next cycle
-    owner.pioResponsePort.schedTimingResp(
-            pkt, curTick() + owner.m_ruby_system->clockPeriod());
+    Tick when = curTick() + owner.m_ruby_system->clockPeriod();
+    auto *outgoing = &owner.pioResponsePort;
+    if (!SplitRubyThreadBridge::defer(outgoing->outgoingManager(), when,
+            [outgoing, pkt, when] { outgoing->schedTimingRespAtFence(pkt, when); }))
+        outgoing->schedTimingResp(pkt, when);
     return true;
 }
 
@@ -204,7 +210,10 @@ bool RubyPort::MemRequestPort::recvTimingResp(PacketPtr pkt)
             pkt->getAddr(), port->name());
 
     // attempt to send the response in the next cycle
-    port->schedTimingResp(pkt, curTick() + owner.m_ruby_system->clockPeriod());
+    Tick when = curTick() + owner.m_ruby_system->clockPeriod();
+    if (!SplitRubyThreadBridge::defer(&owner, when, [port, pkt, when] {
+            port->schedTimingRespAtFence(pkt, when);
+        })) port->schedTimingResp(pkt, when);
 
     return true;
 }
@@ -212,6 +221,14 @@ bool RubyPort::MemRequestPort::recvTimingResp(PacketPtr pkt)
 bool
 RubyPort::PioResponsePort::recvTimingReq(PacketPtr pkt)
 {
+    std::unique_ptr<EventQueue::ScopedMigration> handoff;
+    if (SplitRubyThreadBridge::isActive() && owner.eventQueue() != curEventQueue()) {
+        fatal_if(!SplitRubyThreadBridge::safeHandoffContext(),
+                 "Unsupported zero-lookahead external APIC request outside rendezvous: "
+                 "tick=%llu owner=%s source=%s address=%#x", curTick(), owner.name(),
+                 curEventQueue()->name(), pkt->getAddr());
+        handoff = std::make_unique<EventQueue::ScopedMigration>(owner.eventQueue());
+    }
 
     for (size_t i = 0; i < owner.request_ports.size(); ++i) {
         AddrRangeList l = owner.request_ports[i]->getAddrRanges();
@@ -280,8 +297,11 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
 
             // send next cycle
             RubySystem *rs = owner.m_ruby_system;
-            owner.memRequestPort.schedTimingReq(pkt,
-                curTick() + rs->clockPeriod());
+            Tick when = curTick() + rs->clockPeriod();
+            auto *outgoing = &owner.memRequestPort;
+            if (!SplitRubyThreadBridge::defer(outgoing->outgoingManager(), when,
+                    [outgoing, pkt, when] { outgoing->schedTimingReqAtFence(pkt, when); }, true))
+                outgoing->schedTimingReq(pkt, when);
             return true;
         }
     }
@@ -391,6 +411,7 @@ RubyPort::MemResponsePort::addToRetryList()
 void
 RubyPort::MemResponsePort::recvFunctional(PacketPtr pkt)
 {
+    fatal_if(SplitRubyThreadBridge::isActive(), "Functional access during CPU partition");
     DPRINTF(RubyPort, "Functional access for address: %#x\n", pkt->getAddr());
 
     // In a CPU+dGPU system, GPU functional packets are injected into

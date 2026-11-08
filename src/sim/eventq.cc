@@ -41,6 +41,8 @@
 #include "base/trace.hh"
 #include "cpu/smt.hh"
 #include "debug/Checkpoint.hh"
+#include "sim/sim_events.hh"
+#include "sim/timing_fence.hh"
 
 namespace gem5
 {
@@ -449,9 +451,22 @@ EventQueue::EventQueue(const std::string &n)
 void
 EventQueue::asyncInsert(Event *event)
 {
+    if (timingFenceOwnsQuantumSync) {
+        // All model crossings use the checked bridge. Moving arbitrary native
+        // async model events from an end-of-tick flush to a minimum-priority
+        // fence could reorder equal-priority local events. Fail closed.
+        panic_if(!dynamic_cast<GlobalSimLoopExitEvent *>(event->globalEvent()) ||
+                 event->priority() != Event::Sim_Exit_Pri,
+                 "Fused timing fence permits only delayed native global exits");
+        panic_if(event->when() < curTick() ||
+                 event->when() - curTick() < simQuantum,
+                 "Fused timing fence native exit lacks quantum lookahead");
+    }
     async_queue_mutex.lock();
     async_queue.push_back(event);
     async_queue_mutex.unlock();
+    if (timingFenceOwnsQuantumSync)
+        timingFenceAsyncPublishes.fetch_add(1, std::memory_order_release);
 }
 
 void

@@ -54,3 +54,15 @@ Source('Switch.cc')
 Source('Throttle.cc')
 
 Source('routing/WeightBased.cc')
+
+# RubyPort and the packet queues call the thread bridge in every Ruby build;
+# only the message codec and the multi-process bridge are per protocol.
+SimObject('SplitRubyThreadBridge.py', sim_objects=['SplitRubyThreadBridge'])
+Source('SplitRubyThreadBridge.cc')
+if env['CONF']['RUBY_PROTOCOL_MESI_Three_Level']:
+    SimObject('SplitRubyBridge.py', sim_objects=['SplitRubyBridge'])
+    Source('SplitRubyBridge.cc')
+    Source('SplitMessage.cc')
+    Source('#verification/splitsim/codec_test.cc')
+else:
+    Source('SplitMessageUnsupported.cc')
