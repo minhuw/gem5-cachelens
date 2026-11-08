@@ -256,8 +256,13 @@ SplitRubyThreadBridge::SplitRubyThreadBridge(const Params &p)
              controllers.size() != routers.size() || queueCount < 2 || queueCount > 8 ||
              managers.size() != managerRoles.size() ||
              (!routerRoles.empty() && routerRoles.size() != routers.size()), "Invalid thread partition");
-    fatal_if(!split::supportsProtocol(ruby) ||
-             ruby->getBlockSizeBytes() != 64, "Thread bridge requires 64-byte MESI_Three_Level");
+    fatal_if(!split::supportsProtocol(ruby) || ruby->getBlockSizeBytes() != 64,
+             "Thread bridge requires 64-byte lines and MESI_Three_Level or CHI "
+             "(Ruby protocol: %s)", ruby->getProtocolInfo().getName());
+    // Without a wire codec (CHI), messages can cross only as value clones.
+    fatal_if(mode != "native" && !valueTransport && !split::hasCodec(),
+             "Thread bridge has no %s wire codec; codec/thread modes "
+             "require value_transport", ruby->getProtocolInfo().getName());
     for (unsigned i = 0; i < buffers.size(); ++i) {
         fatal_if(sources[i] < 0 || unsigned(sources[i]) >= queueCount || destinations[i] < 0 ||
                  unsigned(destinations[i]) >= queueCount || destinations[i] == sources[i] ||

@@ -57,6 +57,9 @@ Source('routing/WeightBased.cc')
 
 # RubyPort and the packet queues call the thread bridge in every Ruby build;
 # only the message codec and the multi-process bridge are per protocol.
+# CHI has no wire codec: its thread partitions use value transport only.
+# Exactly one SplitMessage implementation is linked; a build that enables
+# both protocols gets the MESI_Three_Level one.
 SimObject('SplitRubyThreadBridge.py', sim_objects=['SplitRubyThreadBridge'])
 Source('SplitRubyThreadBridge.cc')
 if env['CONF']['RUBY_PROTOCOL_MESI_Three_Level']:
@@ -64,5 +67,7 @@ if env['CONF']['RUBY_PROTOCOL_MESI_Three_Level']:
     Source('SplitRubyBridge.cc')
     Source('SplitMessage.cc')
     Source('#verification/splitsim/codec_test.cc')
+elif env['CONF']['RUBY_PROTOCOL_CHI']:
+    Source('SplitMessageCHI.cc')
 else:
     Source('SplitMessageUnsupported.cc')

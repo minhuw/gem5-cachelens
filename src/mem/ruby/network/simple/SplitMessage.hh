@@ -44,11 +44,20 @@ std::vector<uint8_t> encode(const MsgPtr &message);
 MsgPtr decode(const std::vector<uint8_t> &bytes, RubySystem *ruby_system);
 
 /**
- * Whether this build carries a message codec for the protocol of
- * @p ruby_system. Builds of other protocols link SplitMessageUnsupported.cc,
- * whose functions are unreachable once a bridge has checked this.
+ * Whether this build can carry messages of the protocol of @p ruby_system
+ * across a thread partition: MESI_Three_Level (SplitMessage.cc) or CHI
+ * (SplitMessageCHI.cc). Builds of other protocols link
+ * SplitMessageUnsupported.cc, whose functions are unreachable once a bridge
+ * has checked this.
  */
 bool supportsProtocol(RubySystem *ruby_system);
+
+/**
+ * Whether encode/decode implement a wire codec for the supported protocol.
+ * Only MESI_Three_Level has one; CHI crosses partitions only as shared-
+ * process message clones (value transport), and its encode/decode panic.
+ */
+bool hasCodec();
 
 /** Process-local DMA request provenance, which never enters the codec. */
 struct LocalRequest

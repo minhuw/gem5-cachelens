@@ -488,6 +488,12 @@ supportsProtocol(RubySystem *ruby_system)
     return ruby_system->getProtocolInfo().getName() == "MESI_Three_Level";
 }
 
+bool
+hasCodec()
+{
+    return true;
+}
+
 LocalRequest
 detachLocalRequest(Message &message)
 {
