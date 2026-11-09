@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "base/types.hh"
@@ -18,9 +19,30 @@ namespace gem5
 class EventManager;
 class PacketQueue;
 
+// Direction is part of the domain: request and response producers can belong
+// to different queues even when their RubyPort is the same.
+enum class TimingFenceDomain : uint8_t
+{
+    RubyPioRequest, RubyPioResponse, RubyPioPortResponse, PacketQueueSend, IoTest
+};
+
+// Endpoint IDs are full port names (packet queues use their send-event name),
+// compared lexicographically, never pointer values, queue IDs or hash values.
+// Each endpoint belongs to one producing side. Only that queue thread writes
+// sequence, or the serialized dispatcher while all queue threads are stopped.
+struct TimingFenceEndpoint
+{
+    const TimingFenceDomain domain;
+    const std::string id;
+    uint64_t sequence = 0;
+    TimingFenceEndpoint(TimingFenceDomain d, const std::string &name)
+        : domain(d), id(name) {}
+};
+
 // A successful handoff owns the callback and dispatches it on the destination
 // queue at exactly when. force also fences sends within the same event queue.
-inline bool (*timingFenceHandoff)(EventManager *, Tick, std::function<void()>,
+inline bool (*timingFenceHandoff)(TimingFenceEndpoint &, EventManager *,
+                                 Tick, std::function<void()>,
                                  bool force) = nullptr;
 inline bool (*timingFenceIsSafe)() = nullptr;
 

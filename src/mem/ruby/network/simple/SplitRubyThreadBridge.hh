@@ -9,6 +9,7 @@
 #include "mem/request.hh"
 #include "params/SplitRubyThreadBridge.hh"
 #include "sim/sim_object.hh"
+#include "sim/timing_fence.hh"
 
 namespace gem5 {
 class ClockedObject;
@@ -21,6 +22,7 @@ class SplitRubyThreadBridge : public SimObject
     class Fence;
     class TestPacketQueue;
     std::vector<std::unique_ptr<TestPacketQueue>> testQueues;
+    std::vector<std::unique_ptr<TimingFenceEndpoint>> testEndpoints;
     struct Frame {
         unsigned channel;
         Tick issued, latency;
@@ -52,9 +54,21 @@ class SplitRubyThreadBridge : public SimObject
     std::unique_ptr<Fence> fence;
     std::vector<std::vector<Frame>> pending;
     std::vector<uint64_t> sent;
-    struct Call { EventManager *destination; Tick when; std::function<void()> callback; };
+    struct Call {
+        EventManager *destination;
+        Tick when;
+        TimingFenceDomain domain;
+        std::string endpointId;
+        uint64_t sequence;
+        std::function<void()> callback;
+    };
     std::vector<std::vector<Call>> calls;
     static SplitRubyThreadBridge *running;
+    EventFunctionWrapper dispatcher;
+    unsigned materializedEvents = 0;
+    void armDispatcher();
+    void dispatchCalls();
+    void materializeCalls();
     uint64_t deferredCalls = 0;
     std::vector<uint64_t> stagingTicks;
     uint64_t barriers = 0;
@@ -74,7 +88,9 @@ class SplitRubyThreadBridge : public SimObject
     using Params = SplitRubyThreadBridgeParams;
     explicit SplitRubyThreadBridge(const Params &p);
     ~SplitRubyThreadBridge() override;
-    static bool defer(EventManager *destination, Tick when, std::function<void()> callback, bool force = false);
+    static bool defer(TimingFenceEndpoint &endpoint, EventManager *destination,
+                      Tick when, std::function<void()> callback, bool force = false);
+    DrainState drain() override;
     static bool isActive() { return running != nullptr; }
     static bool safeHandoffContext() { return running && (running->insideFence || !inParallelMode); }
     void activate();

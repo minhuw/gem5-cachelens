@@ -138,6 +138,7 @@ RubyPort::PioRequestPort::PioRequestPort(const std::string &_name,
                                          RubyPort& _port) :
     QueuedRequestPort(_name, reqQueue, snoopRespQueue),
     owner{_port},
+    responseEndpoint(TimingFenceDomain::RubyPioPortResponse, _name),
     reqQueue(_port, *this),
     snoopRespQueue(_port, *this)
 {
@@ -156,6 +157,7 @@ RubyPort::MemRequestPort::MemRequestPort(const std::string &_name,
                                          RubyPort& _port):
     QueuedRequestPort(_name, reqQueue, snoopRespQueue),
     owner{_port},
+    responseEndpoint(TimingFenceDomain::RubyPioResponse, _name),
     requestManager(_port.eventQueue()),
     reqQueue(requestManager, *this),
     snoopRespQueue(_port, *this)
@@ -169,6 +171,7 @@ MemResponsePort::MemResponsePort(const std::string &_name, RubyPort& _port,
                                  bool _no_retry_on_stall):
     QueuedResponsePort(_name, queue, id),
     owner{_port},
+    requestEndpoint(TimingFenceDomain::RubyPioRequest, _name),
     queue(_port, *this),
     access_backing_store(_access_backing_store),
     no_retry_on_stall(_no_retry_on_stall)
@@ -185,8 +188,8 @@ RubyPort::PioRequestPort::recvTimingResp(PacketPtr pkt)
     // send next cycle
     Tick when = curTick() + owner.m_ruby_system->clockPeriod();
     auto *outgoing = &owner.pioResponsePort;
-    if (!SplitRubyThreadBridge::defer(outgoing->outgoingManager(), when,
-            [outgoing, pkt, when] { outgoing->schedTimingRespAtFence(pkt, when); }))
+    if (!SplitRubyThreadBridge::defer(responseEndpoint, outgoing->outgoingManager(), when,
+            [outgoing, pkt, when] { outgoing->schedTimingRespAtFence(pkt, when); }, true))
         outgoing->schedTimingResp(pkt, when);
     return true;
 }
@@ -211,9 +214,9 @@ bool RubyPort::MemRequestPort::recvTimingResp(PacketPtr pkt)
 
     // attempt to send the response in the next cycle
     Tick when = curTick() + owner.m_ruby_system->clockPeriod();
-    if (!SplitRubyThreadBridge::defer(&owner, when, [port, pkt, when] {
+    if (!SplitRubyThreadBridge::defer(responseEndpoint, &owner, when, [port, pkt, when] {
             port->schedTimingRespAtFence(pkt, when);
-        })) port->schedTimingResp(pkt, when);
+        }, true)) port->schedTimingResp(pkt, when);
 
     return true;
 }
@@ -299,7 +302,7 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
             RubySystem *rs = owner.m_ruby_system;
             Tick when = curTick() + rs->clockPeriod();
             auto *outgoing = &owner.memRequestPort;
-            if (!SplitRubyThreadBridge::defer(outgoing->outgoingManager(), when,
+            if (!SplitRubyThreadBridge::defer(requestEndpoint, outgoing->outgoingManager(), when,
                     [outgoing, pkt, when] { outgoing->schedTimingReqAtFence(pkt, when); }, true))
                 outgoing->schedTimingReq(pkt, when);
             return true;

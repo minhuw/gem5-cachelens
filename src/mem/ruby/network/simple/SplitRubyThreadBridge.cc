@@ -9,6 +9,9 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <set>
+#include <tuple>
+#include "sim/partition_participant.hh"
 #include "base/logging.hh"
 #include "base/spin_mailbox_fence.hh"
 #include "cpu/base.hh"
@@ -243,9 +246,13 @@ SplitRubyThreadBridge::SplitRubyThreadBridge(const Params &p)
       managers(p.managers), managerRoles(p.manager_roles), routerRoles(p.router_roles),
       buffers(p.buffers), sources(p.source_roles), destinations(p.destination_roles),
       controllers(p.controllers), routers(p.routers),
-      pending(queueCount), sent(queueCount, 0), calls(queueCount), stagingTicks(buffers.size(), 0)
+      pending(queueCount), sent(queueCount, 0), calls(queueCount),
+      dispatcher([this] { deliver(); armDispatcher(); },
+                 name() + ".dispatcher", false, Event::Minimum_Pri),
+      stagingTicks(buffers.size(), 0)
 {
-    fatal_if(mode != "native" && mode != "codec" && mode != "thread", "Unknown thread bridge mode");
+    fatal_if(mode != "native" && mode != "codec" && mode != "fenced" && mode != "thread", "Unknown thread bridge mode");
+    fatal_if(spinWaitRequested && mode != "thread", "Spin wait requires thread mode");
     fatal_if(fuseSync && mode != "thread", "Fused synchronization requires thread mode");
     fatal_if(mailboxFence && (mode != "thread" || !spinWaitRequested || !fuseSync),
              "Mailbox fence requires thread+spin_wait+fuse_sync");
@@ -260,7 +267,7 @@ SplitRubyThreadBridge::SplitRubyThreadBridge(const Params &p)
              "Thread bridge requires 64-byte lines and MESI_Three_Level or CHI "
              "(Ruby protocol: %s)", ruby->getProtocolInfo().getName());
     // Without a wire codec (CHI), messages can cross only as value clones.
-    fatal_if(mode != "native" && !valueTransport && !split::hasCodec(),
+    fatal_if((mode == "codec" || mode == "thread") && !valueTransport && !split::hasCodec(),
              "Thread bridge has no %s wire codec; codec/thread modes "
              "require value_transport", ruby->getProtocolInfo().getName());
     for (unsigned i = 0; i < buffers.size(); ++i) {
@@ -313,19 +320,36 @@ void SplitRubyThreadBridge::movePartition(bool activate)
     for (const auto &move : moves) move.first->setEventQueueWhileStopped(move.second);
 }
 
-bool SplitRubyThreadBridge::defer(EventManager *destination, Tick when,
+bool SplitRubyThreadBridge::defer(TimingFenceEndpoint &endpoint,
+                                  EventManager *destination, Tick when,
                                   std::function<void()> callback, bool force)
 {
     if (!running || (!force && destination->eventQueue() == curEventQueue())) return false;
     auto &bridge = *running;
     fatal_if(when < curTick() ||
-             ((!bridge.insideFence && inParallelMode) && when - curTick() < bridge.quantum),
+             (!bridge.insideFence && when - curTick() < bridge.quantum),
              "Cross-partition IO lacks native latency lookahead");
     unsigned source = 0;
     while (source < bridge.queueCount && getEventQueue(source) != curEventQueue()) ++source;
     fatal_if(source >= bridge.queueCount, "Unknown IO source queue");
-    bridge.calls[source].push_back({destination, when, std::move(callback)});
+    fatal_if(endpoint.sequence == std::numeric_limits<uint64_t>::max(),
+             "Timing-fence endpoint sequence wrapped: %s", endpoint.id);
+    bridge.calls[source].push_back({destination, when, endpoint.domain,
+        endpoint.id, endpoint.sequence++, std::move(callback)});
+    if (bridge.mode == "fenced" && !bridge.insideFence)
+        bridge.armDispatcher();
     return true;
+}
+
+void SplitRubyThreadBridge::armDispatcher()
+{
+    Tick next = MaxTick;
+    for (const auto &batch : calls)
+        for (const auto &call : batch) next = std::min(next, call.when);
+    if (next == MaxTick) return;
+    fatal_if(next < curTick(), "Late serial dispatcher deadline");
+    if (!dispatcher.scheduled()) schedule(dispatcher, next);
+    else if (next < dispatcher.when()) reschedule(dispatcher, next);
 }
 
 Tick SplitRubyThreadBridge::nextFenceTick() const
@@ -381,7 +405,7 @@ class SplitRubyThreadBridge::TestPacketQueue : public PacketQueue
 void SplitRubyThreadBridge::scheduleIoTests()
 {
     for (unsigned role = 0; role < queueCount; ++role)
-        testManagers.push_back(std::make_unique<EventManager>(getEventQueue(role)));
+        testManagers.push_back(std::make_unique<EventManager>(getEventQueue(mode == "thread" ? role : 0)));
     // These packets exist before activation of the queue gate, including
     // two deadlines only one tick apart (the native anti-recursion gap).
     auto initial = std::make_unique<TestPacketQueue>(*testManagers[0], "initial IRQ test");
@@ -398,6 +422,9 @@ void SplitRubyThreadBridge::scheduleIoTests()
         liveQueue->add(activation + 2344);
     }, "Live IRQ test enqueue", true);
     testManagers[1]->schedule(issue, activation + 1344);
+    for (unsigned index = 0; index < 6; ++index)
+        testEndpoints.push_back(std::make_unique<TimingFenceEndpoint>(
+            TimingFenceDomain::IoTest, name() + ".io" + std::to_string(index)));
     for (unsigned index = 0; index < 4; ++index) {
         unsigned source = index % queueCount;
         unsigned destination = (index + 1) % queueCount;
@@ -405,10 +432,10 @@ void SplitRubyThreadBridge::scheduleIoTests()
         Tick issue = activation + 123 + index * 1777;
         if (index == 2) issue = 1000123; // During the first coherent transaction.
         Tick arrival = issue + quantum;
-        auto *event = new EventFunctionWrapper([this, destination, arrival] {
-            bool queued = defer(testManagers[destination].get(), arrival,
-                [destination, arrival] {
-                    fatal_if(curTick() != arrival || curEventQueue() != getEventQueue(destination),
+        auto *event = new EventFunctionWrapper([this, index, destination, arrival] {
+            bool queued = defer(*testEndpoints[index], testManagers[destination].get(), arrival,
+                [this, destination, arrival] {
+                    fatal_if(curTick() != arrival || curEventQueue() != testManagers[destination]->eventQueue(),
                              "Directed IO changed its native arrival time or owner");
                     std::cout << "SPLIT_CPU_IO_TEST_PASS tick=" << curTick()
                               << " destination=" << destination << std::endl;
@@ -417,15 +444,40 @@ void SplitRubyThreadBridge::scheduleIoTests()
         }, "Split exact IO test", true);
         testManagers[source]->schedule(event, issue);
     }
+    // Two producers publish to the same deadline in opposite temporal orders.
+    // Both rounds must execute io4 before io5, independent of physical queues.
+    for (unsigned round = 0; round < 2; ++round) {
+        auto order = std::make_shared<unsigned>(0);
+        const Tick base = activation + 5000 + round * 5000;
+        for (unsigned index = 0; index < 2; ++index) {
+            auto *event = new EventFunctionWrapper([this, index, round, base, order] {
+                fatal_if(!defer(*testEndpoints[4 + index], testManagers[0].get(),
+                    base + 2000, [index, round, base, order] {
+                        fatal_if(curTick() != base + 2000 || (*order)++ != index,
+                                 "Canonical same-tick IO ordering changed");
+                        std::cout << "SPLIT_CPU_ORDER_TEST_PASS round=" << round
+                                  << " endpoint=" << index << " tick=" << curTick()
+                                  << std::endl;
+                    }, true), "Ordering test failed to enter the handoff");
+            }, "Split canonical ordering test", true);
+            testManagers[index]->schedule(event, base + (index ^ round) * 100);
+        }
+    }
 }
 
 void SplitRubyThreadBridge::activate()
 {
-    fatal_if(active || inParallelMode || curEventQueue() != getEventQueue(0),
+    fatal_if(active || materializedEvents || inParallelMode || curEventQueue() != getEventQueue(0),
              "Thread bridge activation requires stopped main queue");
     if (mode == "native") return;
     fatal_if(ruby->getRandomization(), "Thread bridge requires deterministic Ruby");
     activation = curTick();
+    if (mode == "thread" || mode == "fenced") {
+        fatal_if(running, "Another thread bridge is active");
+        fatal_if(mode == "fenced" && numMainEventQueues != 1,
+                 "Fenced mode requires a single event queue");
+        PartitionParticipant::prepareAllWhileStopped();
+    }
     if (mode == "thread") {
         if (spinWaitRequested) Barrier::useSpinForNewBarriers(true);
         addStoppedEventQueues(queueCount);
@@ -434,15 +486,16 @@ void SplitRubyThreadBridge::activate()
         if (managers.empty()) moveIsland(getEventQueue(0), getEventQueue(1));
         else movePartition(true);
     }
-    for (unsigned i = 0; i < buffers.size(); ++i)
+    if (mode != "fenced")
+      for (unsigned i = 0; i < buffers.size(); ++i)
         buffers[i]->setSplitEnqueue([this, i](MsgPtr message, Tick issued, Tick latency,
                 bool random, bool warmup, bool bypass) {
             capture(i, std::move(message), issued, latency, random, warmup, bypass);
         }, mode == "codec");
     active = true;
-    if (mode == "thread") {
-        fatal_if(running, "Another thread bridge is active");
+    if (mode == "thread" || mode == "fenced") {
         running = this;
+        insideFence = true; // Adopt existing native deadlines while stopped.
         fatal_if(timingFenceHandoff || timingFenceIsSafe || timingFenceOwnsQuantumSync,
                  "Another timing fence is installed");
         timingFenceHandoff = &SplitRubyThreadBridge::defer;
@@ -455,8 +508,13 @@ void SplitRubyThreadBridge::activate()
         for (auto *queue : timingFencePacketQueues()) queue->enableTimingFenceWhileStopped();
         std::cout << "SPLIT_CPU_IRQ_QUEUES count=" << timingFencePacketQueues().size() << std::endl;
         if (exerciseIo) scheduleIoTests();
-        fence = std::make_unique<Fence>(*this);
-        fence->schedule(curTick());
+        insideFence = false;
+        if (mode == "thread") {
+            fence = std::make_unique<Fence>(*this);
+            fence->schedule(curTick());
+        } else {
+            armDispatcher();
+        }
     }
     std::cout << "SPLIT_FS_ACTIVATED mode=" << mode << " tick=" << activation
               << " controllers=" << controllers.size() << std::endl;
@@ -515,6 +573,7 @@ void SplitRubyThreadBridge::importNativeAsync()
 void SplitRubyThreadBridge::deliver()
 {
     Tick now = curTick();
+    PartitionParticipant::checkAllWhileStopped();
     insideFence = true;
     for (unsigned source = 0; source < queueCount; ++source) {
         for (const auto &frame : pending[source]) {
@@ -528,46 +587,82 @@ void SplitRubyThreadBridge::deliver()
         }
         pending[source].clear();
     }
-    bool consumed;
-    unsigned dispatched = 0;
-    do {
-        consumed = false;
-        for (unsigned source = 0; source < queueCount; ++source) {
-            // Detach batches for reentrancy. A same-tick producer can append
-            // to an already-visited source; drain it at this rendezvous too.
-            auto batch = std::move(calls[source]);
-            calls[source].clear();
-            for (auto &call : batch) {
-                fatal_if(call.when < now, "Late cross-partition IO delivery");
-                if (call.when > now) {
-                    calls[source].push_back(std::move(call));
-                    continue;
-                }
-                fatal_if(++dispatched > 16384, "Unbounded same-tick IO callback chain");
-                EventQueue::ScopedMigration context(call.destination->eventQueue());
-                call.callback();
-                consumed = true;
-                ++deferredCalls;
-            }
-        }
-    } while (consumed);
+    dispatchCalls();
     insideFence = false;
     ++barriers;
+}
+
+void SplitRubyThreadBridge::dispatchCalls()
+{
+    unsigned dispatched = 0;
+    while (true) {
+        std::vector<Call> due;
+        for (auto &source : calls) {
+            std::vector<Call> future;
+            for (auto &call : source) {
+                fatal_if(call.when < curTick(), "Late cross-partition IO delivery");
+                (call.when == curTick() ? due : future).push_back(std::move(call));
+            }
+            source = std::move(future);
+        }
+        if (due.empty()) break;
+        std::sort(due.begin(), due.end(), [](const Call &a, const Call &b) {
+            return std::tie(a.when, a.domain, a.endpointId, a.sequence) <
+                   std::tie(b.when, b.domain, b.endpointId, b.sequence);
+        });
+        // Re-entrant same-tick calls join the next collect/sort/run sweep.
+        for (auto &call : due) {
+            fatal_if(++dispatched > 16384, "Unbounded same-tick IO callback chain");
+            EventQueue::ScopedMigration context(active ?
+                call.destination->eventQueue() : getEventQueue(0));
+            call.callback();
+            ++deferredCalls;
+        }
+    }
+}
+
+void SplitRubyThreadBridge::materializeCalls()
+{
+    std::set<Tick> deadlines;
+    for (const auto &batch : calls)
+        for (const auto &call : batch) {
+            fatal_if(call.when < curTick(), "Late stopped IO handoff");
+            deadlines.insert(call.when);
+        }
+    materializedEvents = deadlines.size();
+    for (Tick when : deadlines) {
+        auto *event = new EventFunctionWrapper([this, when] {
+            fatal_if(curTick() != when, "Materialized IO deadline changed");
+            dispatchCalls();
+            if (--materializedEvents == 0 && drainState() == DrainState::Draining)
+                signalDrainDone();
+        }, name() + ".stopped_dispatch", true, Event::Minimum_Pri);
+        schedule(event, when);
+    }
+}
+
+DrainState SplitRubyThreadBridge::drain()
+{
+    return active || materializedEvents ? DrainState::Draining : DrainState::Drained;
 }
 
 void SplitRubyThreadBridge::deactivate()
 {
     fatal_if(inParallelMode, "Thread bridge deactivation requires stopped queues");
     if (!active) return;
-    if (mode == "thread") {
-        // Python has stopped all queues at a native global exit. Remaining
-        // handoffs have future arrival times; inject them without advancing
-        // time before moving all singular state back to the main queue.
+    if (mode == "thread" || mode == "fenced") {
+        PartitionParticipant::checkAllWhileStopped();
         importNativeAsync();
-        if (fence->scheduled()) fence->deschedule();
-        fence->reportStopped();
-        // Restore each queue's pending event before stale callbacks are
-        // flushed; restoration retains its original timestamp exactly.
+        if (fence) {
+            if (fence->scheduled()) fence->deschedule();
+            fence->reportStopped();
+        }
+        if (dispatcher.scheduled()) deschedule(dispatcher);
+        // Stop interception before restoring native packet-queue send events.
+        timingFenceOwnsQuantumSync = false;
+        timingFenceHandoff = nullptr;
+        timingFenceIsSafe = nullptr;
+        running = nullptr;
         for (auto *queue : timingFencePacketQueues()) queue->disableTimingFenceWhileStopped();
         for (auto &queue : testQueues) queue->disableTimingFenceWhileStopped();
         for (unsigned source = 0; source < queueCount; ++source) {
@@ -580,26 +675,21 @@ void SplitRubyThreadBridge::deactivate()
             }
             pending[source].clear();
         }
-        // Flush only the enqueue operation, retaining the original future time.
-        for (auto &batch : calls) {
-            for (auto &call : batch) {
-                fatal_if(call.when < curTick(), "Late stopped IO handoff");
-                EventQueue::ScopedMigration context(call.destination->eventQueue());
-                call.callback();
-                ++deferredCalls;
-            }
-            batch.clear();
+        if (mode == "thread") {
+            if (managers.empty()) moveIsland(getEventQueue(1), getEventQueue(0));
+            else movePartition(false);
+            if (spinWaitRequested) Barrier::useSpinForNewBarriers(false);
+            for (auto &manager : testManagers)
+                manager->setEventQueueWhileStopped(getEventQueue(0));
         }
-        timingFenceOwnsQuantumSync = false;
-        timingFenceHandoff = nullptr;
-        timingFenceIsSafe = nullptr;
-        running = nullptr;
-        if (managers.empty()) moveIsland(getEventQueue(1), getEventQueue(0));
-        else movePartition(false);
-        if (spinWaitRequested) Barrier::useSpinForNewBarriers(false);
+        PartitionParticipant::endAllWhileStopped();
     }
-    for (auto *buffer : buffers) buffer->clearSplitEnqueueWhileStopped();
+    if (mode != "fenced")
+        for (auto *buffer : buffers) buffer->clearSplitEnqueueWhileStopped();
     active = false;
+    materializeCalls();
+    if (!materializedEvents && drainState() == DrainState::Draining)
+        signalDrainDone();
     report();
 }
 
@@ -656,7 +746,7 @@ void SplitRubyThreadBridge::exerciseSync(const std::string &test, Tick issue, Ti
 
 void SplitRubyThreadBridge::serialize(CheckpointOut &cp) const
 {
-    fatal_if(active, "Cannot checkpoint an active HNF thread island");
+    fatal_if(active || materializedEvents, "Cannot checkpoint undrained thread handoffs");
     unsigned version = 1;
     SERIALIZE_SCALAR(version);
 }

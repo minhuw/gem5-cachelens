@@ -68,6 +68,7 @@ class RubyPort : public ClockedObject
     {
       private:
         RubyPort& owner;
+        TimingFenceEndpoint responseEndpoint;
         EventManager requestManager;
         ReqPacketQueue reqQueue;
         SnoopRespPacketQueue snoopRespQueue;
@@ -85,6 +86,7 @@ class RubyPort : public ClockedObject
     {
       private:
         RubyPort& owner;
+        TimingFenceEndpoint requestEndpoint;
         RespPacketQueue queue;
         bool access_backing_store;
         bool no_retry_on_stall;
@@ -118,6 +120,7 @@ class RubyPort : public ClockedObject
     {
       private:
         RubyPort& owner;
+        TimingFenceEndpoint responseEndpoint;
         ReqPacketQueue reqQueue;
         SnoopRespPacketQueue snoopRespQueue;
 

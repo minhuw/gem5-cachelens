@@ -13,7 +13,7 @@ class SplitRubyThreadBridge(SimObject):
                    PyBindMethod("exerciseSync")]
     control_cpu = Param.BaseCPU(NULL, "Guest address space for stopped-state observations")
     ruby_system = Param.RubySystem("The single authoritative Ruby hierarchy")
-    mode = Param.String("native", "native, codec, or thread")
+    mode = Param.String("native", "native, codec, fenced, or thread")
     spin_wait = Param.Bool(False, "Busy-wait host barriers after parallel activation")
     fuse_sync = Param.Bool(False, "Bridge owns quantum sync; native async model events reject")
     mailbox_fence = Param.Bool(False, "Per-queue epoch fence; requires thread+spin_wait+fuse_sync")

@@ -53,6 +53,7 @@ PacketQueue::PacketQueue(EventManager& _em, const std::string& _label,
                          bool force_order,
                          bool disable_sanity_check)
     : em(_em), sendEvent([this]{ processSendEvent(); }, _sendEventName),
+      timingFenceEndpoint(TimingFenceDomain::PacketQueueSend, _sendEventName),
       _disableSanityCheck(disable_sanity_check),
       forceOrder(force_order),
       label(_label), waitingOnRetry(false)
@@ -121,7 +122,7 @@ PacketQueue::armTimingFence(Tick when)
     timingFenceWhen = when;
     const uint64_t generation = ++timingFenceGeneration;
     std::weak_ptr<const bool> lifetime = timingFenceLifetime;
-    const bool handed_off = timingFenceHandoff(&em, when,
+    const bool handed_off = timingFenceHandoff(timingFenceEndpoint, &em, when,
         [this, lifetime, generation, when] {
             // Disable, replacement by an earlier send, and destruction all
             // cancel a callback without touching the event or packet lifetime.

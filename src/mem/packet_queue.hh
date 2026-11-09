@@ -56,6 +56,7 @@
 #include "mem/port.hh"
 #include "sim/drain.hh"
 #include "sim/eventq.hh"
+#include "sim/timing_fence.hh"
 
 namespace gem5
 {
@@ -93,6 +94,7 @@ class PacketQueue : public Drainable
     EventFunctionWrapper sendEvent;
 
     /** Replace the static send event with an exact-deadline handoff. */
+    TimingFenceEndpoint timingFenceEndpoint;
     bool timingFenceEnabled = false;
     Tick timingFenceWhen = MaxTick;
     uint64_t timingFenceGeneration = 0;

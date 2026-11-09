@@ -221,7 +221,7 @@ def stat_sum(stats, pattern):
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--mode", choices=("serial", "codec", "thread"), required=True
+    "--mode", choices=("serial", "native", "codec", "fenced", "thread"), required=True
 )
 parser.add_argument("--layout", choices=("hnf1", "hnf2"), default="hnf1")
 parser.add_argument("--cores", type=int, choices=(2, 3, 4), default=4)
@@ -230,6 +230,8 @@ parser.add_argument("--ticks", type=int, default=200_000_000)
 parser.add_argument("--quantum", type=int, default=1000)
 parser.add_argument("--spin-wait", action="store_true")
 parser.add_argument("--image-only", action="store_true")
+parser.add_argument("--exercise-io", action="store_true")
+parser.add_argument("--deactivate-at", type=int, default=0)
 args = parser.parse_args()
 
 outdir = Path(m5.options.outdir)
@@ -279,6 +281,7 @@ if args.mode != "serial":
         quantum=args.quantum,
         spin_wait=args.spin_wait,
     )
+    root.split_hnf.exercise_io = args.exercise_io
     (outdir / "split.json").write_text(json.dumps(split, indent=2) + "\n")
     print(
         f"CACHELENS_SPLIT_LAYOUT layout={args.layout} "
@@ -290,7 +293,12 @@ m5.instantiate()
 board._post_instantiate()
 if split:
     root.split_hnf.activate()
-event = m5.simulate(args.ticks)
+if args.deactivate_at:
+    assert args.exercise_io and 1_001_000 <= args.deactivate_at < args.ticks
+    early = m5.simulate(args.deactivate_at)
+    assert early.getCause() == "simulate() limit reached"
+    root.split_hnf.deactivate()
+event = m5.simulate(args.ticks - m5.curTick())
 cause = event.getCause()
 if split:
     root.split_hnf.deactivate()

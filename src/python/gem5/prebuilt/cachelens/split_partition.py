@@ -17,6 +17,9 @@ before ``m5.instantiate()``. With the simulation stopped, call
 after the partitioned ``m5.simulate``. Activation must be cold (before the
 first ``m5.simulate``) or follow a consumed workbegin exit.
 
+Fenced mode keeps one event queue and captures no Ruby messages. It dispatches
+forced IO crossings in the same canonical order as thread mode.
+
 CHI has no wire codec, so codec and thread modes use value transport
 (shared-process message clones). Layouts move home nodes only: CPUs, their
 L1/L2 controllers and sequencers, the MiscNode, DMA requestors and memory
@@ -39,7 +42,7 @@ from m5.ticks import fixGlobalFrequency
 
 from gem5.coherence_protocol import CoherenceProtocol
 
-MODES = ("native", "codec", "thread")
+MODES = ("native", "codec", "fenced", "thread")
 OCCUPANCY_CONTRACT = "physical-buffer-plus-explicit-staging-v1"
 
 
@@ -121,7 +124,7 @@ def attach_roles(
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {', '.join(MODES)}")
-    if mode != "native" and not value_transport:
+    if mode in ("codec", "thread") and not value_transport:
         raise ValueError(
             "CHI has no wire codec; codec and thread modes need "
             "value_transport=True"

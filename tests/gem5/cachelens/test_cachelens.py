@@ -806,6 +806,8 @@ for mode, layout in (
     ("serial", "hnf1"),
     ("codec", "hnf1"),
     ("codec", "hnf2"),
+    ("fenced", "hnf1"),
+    ("fenced", "hnf2"),
     ("thread", "hnf1"),
     ("thread", "hnf2"),
 ):
