@@ -14,6 +14,7 @@
 namespace gem5
 {
 using namespace ArmISA;
+namespace { std::mutex probeTraceMutex; }
 
 ArmPartitionTimingProbe::ArmPartitionTimingProbe(const Params &p)
     : SimObject(p), system(*p.system), gic(*p.gic), timer(*p.timer),
@@ -36,6 +37,7 @@ ArmPartitionTimingProbe::irq(bool expected, const char *label)
         tc->getCpuPtr()->getInterruptController(tc->threadId()));
     fatal_if(interrupts->checkRaw(INT_IRQ) != expected,
              "%s: %s raw IRQ mismatch at %llu", name(), label, curTick());
+    std::lock_guard<std::mutex> lock(probeTraceMutex);
     std::cout << "ARM_TIMING_PROBE_PASS label=" << label << " tick="
               << curTick() << " irq=" << expected << std::endl;
 }
@@ -45,6 +47,7 @@ ArmPartitionTimingProbe::ppi(bool expected, const char *label)
 {
     fatal_if(bool(gic.cpuPpiPending[0] & (1 << (27 - 16))) != expected,
              "%s: %s PPI mismatch at %llu", name(), label, curTick());
+    std::lock_guard<std::mutex> lock(probeTraceMutex);
     std::cout << "ARM_TIMING_PROBE_PASS label=" << label << " tick="
               << curTick() << " ppi=" << expected << std::endl;
 }
@@ -65,6 +68,7 @@ ArmPartitionTimingProbe::timerCase(Tick base, int mask_offset, bool disable)
     // At expiry, run the control write BEFORE the timer's Default_Pri event.
     at(cpu, change, [this, disable, mask_offset] {
         timer.setMiscReg(MISCREG_CNTV_CTL_EL0, 0, disable ? 0 : 3);
+        std::lock_guard<std::mutex> lock(probeTraceMutex);
         std::cout << "ARM_TIMING_CONTROL disable=" << disable
                   << " offset=" << mask_offset << " tick=" << curTick()
                   << std::endl;
@@ -98,8 +102,7 @@ ArmPartitionTimingProbe::startup()
     CrossDomainEndpoint::observer = [](const TimingFenceEndpoint &endpoint,
                                      Tick issued, Tick when, bool delivered) {
         fatal_if(when - issued < 1000, "Directed ARM wire has no 1ns lookahead");
-        static std::mutex observerMutex;
-        std::lock_guard<std::mutex> lock(observerMutex);
+        std::lock_guard<std::mutex> lock(probeTraceMutex);
         std::cout << "ARM_WIRE " << (delivered ? "land" : "issue")
                   << " endpoint=" << endpoint.id << " issued=" << issued
                   << " when=" << when << std::endl;
@@ -110,10 +113,10 @@ ArmPartitionTimingProbe::startup()
     const Tick repost_issue = clear_issue + 100;
     const Tick second = repost_issue + gic.intLatency;
     auto &cpu = *system.threads[0]->getCpuPtr();
+    at(cpu, start, [this] { irq(false, "race-initial"); });
     at(gic, start, [this, first] {
         fatal_if(!gic.deliveries.empty() || gic.pendingDelayedInterrupts,
                  "%s: guest not quiescent at probe start", name());
-        irq(false, "race-initial");
         gic.postInt(0, first);
         gic.postInt(0, first + 1); // Same generation: must be deduplicated.
         fatal_if(gic.pendingDelayedInterrupts != 1, "Initial post not deduplicated");
@@ -126,15 +129,17 @@ ArmPartitionTimingProbe::startup()
                  "Post after clear lost or duplicated while old post in flight");
     });
     at(cpu, first - 1, [this] { irq(false, "race-before-first"); });
-    at(cpu, first, [this] {
-        irq(true, "race-first-post");
+    at(cpu, first, [this] { irq(true, "race-first-post"); });
+    at(gic, first, [this] {
         fatal_if(gic.pendingDelayedInterrupts != 1, "First post count mismatch");
     });
     at(cpu, clear_issue + latency - 1, [this] { irq(true, "race-before-clear"); });
     at(cpu, clear_issue + latency, [this] { irq(false, "race-clear"); });
     at(cpu, second - 1, [this] { irq(false, "race-before-second"); });
-    at(cpu, second, [this] {
-        irq(true, "race-second-post");
+    at(cpu, second, [this] { irq(true, "race-second-post"); });
+    // GIC bookkeeping must be observed by its owner. A CPU peer may be
+    // behind queue 0 by a quantum and see a later, legitimate clear.
+    at(gic, second, [this] {
         fatal_if(gic.pendingDelayedInterrupts || !gic.deliveries.empty(),
                  "Race left a duplicate delivery");
     });
@@ -153,6 +158,7 @@ ArmPartitionTimingProbe::startup()
         timer.setMiscReg(MISCREG_CNTV_CTL_EL0, 0, 0);
         timer.setMiscReg(MISCREG_CNTV_CVAL_EL0, 0, count + 1);
         timer.setMiscReg(MISCREG_CNTV_CTL_EL0, 0, 1);
+        std::lock_guard<std::mutex> lock(probeTraceMutex);
         std::cout << "ARM_TIMING_SHORT_CVAL tick=" << curTick()
                   << " expiry=" << short_expiry
                   << " ticks_ahead=" << short_expiry - curTick() << std::endl;
@@ -170,9 +176,10 @@ ArmPartitionTimingProbe::startup()
        [this] { irq(true, "short-cval-post"); });
     at(gic, short_expiry + latency + gic.intLatency + 10,
        [this] { gic.clearInt(ContextID(0), 27); });
-    at(cpu, start + 800000, [this] {
+    at(gic, start + 800000, [this] {
         fatal_if(gic.pendingDelayedInterrupts || !gic.deliveries.empty(),
                  "Probe left a pending interrupt delivery");
+        std::lock_guard<std::mutex> lock(probeTraceMutex);
         std::cout << "ARM_TIMING_PROBE_COMPLETE tick=" << curTick() << std::endl;
     });
 }
