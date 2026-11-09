@@ -51,6 +51,7 @@
 #include "kern/linux/events.hh"
 #include "params/ArmSystem.hh"
 #include "sim/full_system.hh"
+#include "sim/cross_domain.hh"
 #include "sim/sim_object.hh"
 #include "sim/system.hh"
 #include "enums/ArmExtension.hh"
@@ -89,7 +90,7 @@ class ArmRelease : public SimObject
     std::unordered_map<ArmExtension, bool> _extensions;
 };
 
-class ArmSystem : public System
+class ArmSystem : public System, public PartitionParticipant
 {
   protected:
     /**
@@ -149,6 +150,29 @@ class ArmSystem : public System
     PARAMS(ArmSystem);
 
     ArmSystem(const Params &p);
+    void startup() override;
+
+    const bool partitionTiming;
+    const Tick partitionWireLatency;
+    struct CpuWires {
+        CrossDomainEndpoint sev, tlbi, power;
+        explicit CpuWires(const std::string &name)
+            : sev(TimingFenceDomain::ArmSev, name + ".sev"),
+              tlbi(TimingFenceDomain::ArmTlbi, name + ".tlbi"),
+              power(TimingFenceDomain::ArmPower, name + ".wfi") {}
+    };
+    CpuWires &cpuWires(ContextID cpu) { return *wires.at(cpu); }
+    static bool timingEnabled(const System *sys)
+    {
+        auto *arm = dynamic_cast<const ArmSystem *>(sys);
+        return arm && arm->partitionTiming;
+    }
+
+  private:
+    std::vector<std::unique_ptr<CpuWires>> wires;
+    void prepareWhileStopped() override;
+
+  public:
 
     /** true if this a multiprocessor system */
     bool multiProc;

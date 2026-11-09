@@ -98,6 +98,7 @@ PMU::~PMU()
 void
 PMU::setThreadContext(ThreadContext *tc)
 {
+    partitionTiming = ArmSystem::timingEnabled(tc->getSystemPtr());
     DPRINTF(PMUVerbose, "Assigning PMU to ContextID %i.\n", tc->contextId());
     const auto &pmu_params = static_cast<const ArmPMUParams &>(params());
 
@@ -686,6 +687,9 @@ void
 PMU::raiseInterrupt()
 {
     if (exitOnPMUInterrupt) {
+        fatal_if(partitionTiming &&
+                 PartitionParticipant::isPartitioned(),
+                 "exitOnPMUInterrupt is unsupported while partitioned");
         inform("Exiting simulation: PMU interrupt detected");
         exitSimLoop("performance counter interrupt", 0);
     }

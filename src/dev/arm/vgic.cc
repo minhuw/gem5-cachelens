@@ -390,6 +390,9 @@ VGic::processPostVIntEvent(uint32_t cpu)
 void
 VGic::postMaintInt(uint32_t cpu)
 {
+    fatal_if(ArmSystem::timingEnabled(platform->system) &&
+             PartitionParticipant::isPartitioned(),
+             "VGic maintenance PPI is unsupported while partitioned");
     DPRINTF(VGIC, "Posting maintenance PPI to GIC/cpu%d\n", cpu);
     // Linux DT configures this as Level.
     gic->sendPPInt(maintInt, cpu);
@@ -398,6 +401,9 @@ VGic::postMaintInt(uint32_t cpu)
 void
 VGic::unPostMaintInt(uint32_t cpu)
 {
+    fatal_if(ArmSystem::timingEnabled(platform->system) &&
+             PartitionParticipant::isPartitioned(),
+             "VGic maintenance PPI is unsupported while partitioned");
     DPRINTF(VGIC, "Unposting maintenance PPI to GIC/cpu%d\n", cpu);
     gic->clearPPInt(maintInt, cpu);
 }

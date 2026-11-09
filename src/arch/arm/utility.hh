@@ -92,6 +92,7 @@ testPredicate(uint32_t nz, uint32_t c, uint32_t v, ConditionCode code)
 /** Send an event (SEV) to a specific PE if there isn't
  * already a pending event */
 void sendEvent(ThreadContext *tc);
+void sendEvent(ThreadContext *source, ThreadContext *destination);
 
 static inline bool
 inUserMode(CPSR cpsr)

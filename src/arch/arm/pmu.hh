@@ -642,6 +642,7 @@ class PMU : public SimObject, public ArmISA::BaseISADevice
      * Exit simloop on PMU interrupt
      */
     bool exitOnPMUInterrupt;
+    bool partitionTiming = false;
 };
 
 } // namespace ArmISA

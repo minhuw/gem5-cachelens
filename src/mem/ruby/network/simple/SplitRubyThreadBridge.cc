@@ -476,7 +476,7 @@ void SplitRubyThreadBridge::activate()
         fatal_if(running, "Another thread bridge is active");
         fatal_if(mode == "fenced" && numMainEventQueues != 1,
                  "Fenced mode requires a single event queue");
-        PartitionParticipant::prepareAllWhileStopped();
+        PartitionParticipant::prepareAllWhileStopped(quantum, ruby->clockPeriod());
     }
     if (mode == "thread") {
         if (spinWaitRequested) Barrier::useSpinForNewBarriers(true);
@@ -505,6 +505,7 @@ void SplitRubyThreadBridge::activate()
             importedAsyncPublishes = 0;
             timingFenceOwnsQuantumSync = true;
         }
+        PartitionParticipant::beginAllWhileStopped();
         for (auto *queue : timingFencePacketQueues()) queue->enableTimingFenceWhileStopped();
         std::cout << "SPLIT_CPU_IRQ_QUEUES count=" << timingFencePacketQueues().size() << std::endl;
         if (exerciseIo) scheduleIoTests();

@@ -42,6 +42,7 @@
 
 #include "base/bitunion.hh"
 #include "dev/io_device.hh"
+#include "sim/partition_participant.hh"
 
 namespace gem5
 {
@@ -55,7 +56,7 @@ class ThreadContext;
  * This class implements the base power controller for FVP-based
  * platforms. Based on Fast Models version 11.8.
  */
-class FVPBasePwrCtrl : public BasicPioDevice
+class FVPBasePwrCtrl : public BasicPioDevice, public PartitionParticipant
 {
   public:
     FVPBasePwrCtrl(const FVPBasePwrCtrlParams &params);
@@ -98,6 +99,7 @@ class FVPBasePwrCtrl : public BasicPioDevice
     Tick write(PacketPtr pkt) override;
 
   private:
+    void prepareWhileStopped() override;
     BitUnion32(PwrStatus)
         Bitfield<30> l1;
         Bitfield<29> l0;

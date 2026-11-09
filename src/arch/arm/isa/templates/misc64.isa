@@ -406,6 +406,15 @@ def template DvmCompleteAcc {{
     %(class_name)s::completeAcc(PacketPtr pkt, ExecContext *xc,
                                 trace::InstRecord *traceData) const
     {
+        // CacheLens CHI completes its non-sync DVM request before allowing
+        // a following Sync/DSB to complete. Guard that dependency against a
+        // wire configured longer than the protocol path, without changing Ruby.
+        if (ArmSystem::timingEnabled(xc->tcBase()->getSystemPtr())) {
+            auto *system = ArmSystem::getArmSystem(xc->tcBase());
+            fatal_if(system->cpuWires(xc->tcBase()->contextId()).tlbi.pending(),
+                     "DVM completion preceded deferred remote TLBI; "
+                     "reduce partition_wire_latency");
+        }
         return NoFault;
     }
 }};

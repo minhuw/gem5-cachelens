@@ -199,6 +199,7 @@ class ArchTimer : public SystemCounterListener, public Drainable,
 
     /// CPU for core timers, frame for memory-mapped timers.
     EventManager &_eventManager;
+    const bool _partitionTiming;
 
     SystemCounter &_systemCounter;
 
@@ -228,9 +229,10 @@ class ArchTimer : public SystemCounterListener, public Drainable,
               SimObject &parent,
               EventManager &event_manager,
               SystemCounter &sysctr,
-              ArmInterruptPin *interrupt);
+              ArmInterruptPin *interrupt, bool partition_timing = false);
 
     EventManager &eventManager() const { return _eventManager; }
+    bool partitionTimingEnabled() const { return _partitionTiming; }
 
     /// Returns the timer name.
     std::string name() const { return _name; }
@@ -285,7 +287,8 @@ class ArchTimerKvm : public ArchTimer
                  EventManager &event_manager,
                  SystemCounter &sysctr,
                  ArmInterruptPin *interrupt)
-      : ArchTimer(name, parent, event_manager, sysctr, interrupt), system(system) {}
+      : ArchTimer(name, parent, event_manager, sysctr, interrupt, system.partitionTiming),
+        system(system) {}
 
   protected:
     // For ArchTimer's in a GenericTimerISA with Kvm execution about

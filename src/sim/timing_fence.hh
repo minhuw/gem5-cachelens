@@ -23,7 +23,8 @@ class PacketQueue;
 // to different queues even when their RubyPort is the same.
 enum class TimingFenceDomain : uint8_t
 {
-    RubyPioRequest, RubyPioResponse, RubyPioPortResponse, PacketQueueSend, IoTest
+    RubyPioRequest, RubyPioResponse, RubyPioPortResponse, PacketQueueSend, IoTest,
+    ArmPpi, ArmGic, ArmSev, ArmTlbi, ArmPower
 };
 
 // Endpoint IDs are full port names (packet queues use their send-event name),

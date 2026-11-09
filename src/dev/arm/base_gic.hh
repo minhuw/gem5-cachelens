@@ -273,6 +273,7 @@ class ArmPPI : public ArmInterruptPin
     friend class ArmPPIGen;
   private:
     ArmPPI(const ArmPPIParams &p, ThreadContext *tc);
+    CrossDomainEndpoint wire;
 
   public:
     void raise() override;

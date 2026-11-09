@@ -817,7 +817,7 @@ let {{
             continue;
 
         // Wake CPU with interrupt if they were sleeping
-        sendEvent(oc);
+        sendEvent(xc->tcBase(), oc);
     }
     '''
     sevIop = ArmInstObjParams("sev", "SevInst", "PredOp", \

@@ -290,8 +290,9 @@ ArchTimer::ArchTimer(const std::string &name,
                      SimObject &parent,
                      EventManager &event_manager,
                      SystemCounter &sysctr,
-                     ArmInterruptPin *interrupt)
+                     ArmInterruptPin *interrupt, bool partition_timing)
     : _name(name), _parent(parent), _eventManager(event_manager),
+      _partitionTiming(partition_timing),
       _systemCounter(sysctr),
       _interrupt(interrupt),
       _control(0), _counterLimit(0), _offset(0),
@@ -413,6 +414,8 @@ void
 ArchTimer::unserialize(CheckpointIn &cp)
 {
     paramIn(cp, "control_serial", _control);
+    if (partitionTimingEnabled())
+        UNSERIALIZE_SCALAR(_counterLimit);
     // We didn't serialize an offset before we added support for the
     // virtual timer. Consider it optional to maintain backwards
     // compatibility.
@@ -1032,10 +1035,11 @@ GenericTimerFrame::GenericTimerFrame(const GenericTimerFrameParams &p)
       addrRanges({timerRange}),
       systemCounter(*p.counter),
       physTimer(csprintf("%s.phys_timer", name()),
-                *this, *this, systemCounter, p.int_phys->get()),
+                *this, *this, systemCounter, p.int_phys->get(),
+                ArmSystem::timingEnabled(sys)),
       virtTimer(csprintf("%s.virt_timer", name()),
                 *this, *this, systemCounter,
-                p.int_virt->get()),
+                p.int_virt->get(), ArmSystem::timingEnabled(sys)),
       accessBits(0x3f),
       system(*dynamic_cast<ArmSystem *>(sys))
 {

@@ -307,6 +307,9 @@ class ArmSystem(System):
 
     release = Param.ArmRelease(ArmDefaultRelease(), "Arm Release")
 
+    partition_timing = Param.Bool(False, "Model deterministic CPU/shared-device wires")
+    partition_wire_latency = Param.Latency("1ns", "CPU/shared-device wire latency (at least 1ns)")
+
     multi_proc = Param.Bool(True, "Multiprocessor system?")
     gic_cpu_addr = Param.Addr(0, "Addres of the GIC CPU interface")
     reset_addr = Param.Addr(0x0, "Reset address (ARMv8)")

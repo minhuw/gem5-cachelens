@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "base/logging.hh"
+#include "base/types.hh"
 
 namespace gem5
 {
@@ -24,6 +25,7 @@ class PartitionParticipant
         return *objects;
     }
     inline static bool partitioned = false;
+    inline static Tick quantumTicks = 0, rubyPeriodTicks = 0;
 
   protected:
     PartitionParticipant() { registry().push_back(this); }
@@ -34,6 +36,7 @@ class PartitionParticipant
                       objects.end());
     }
     virtual void prepareWhileStopped() {}
+    virtual void beginWhileStopped() {}
     virtual void checkWhileStopped() const {}
     virtual void endWhileStopped() {}
 
@@ -41,12 +44,20 @@ class PartitionParticipant
     PartitionParticipant(const PartitionParticipant &) = delete;
     PartitionParticipant &operator=(const PartitionParticipant &) = delete;
     static bool isPartitioned() { return partitioned; }
-    static void prepareAllWhileStopped()
+    static Tick partitionQuantum() { return quantumTicks; }
+    static Tick partitionRubyPeriod() { return rubyPeriodTicks; }
+    static void prepareAllWhileStopped(Tick quantum, Tick ruby_period)
     {
         fatal_if(partitioned, "Partition participants already active");
+        quantumTicks = quantum;
+        rubyPeriodTicks = ruby_period;
         for (size_t i = 0; i < registry().size(); ++i)
             registry()[i]->prepareWhileStopped();
         partitioned = true;
+    }
+    static void beginAllWhileStopped()
+    {
+        for (auto *object : registry()) object->beginWhileStopped();
     }
     static void checkAllWhileStopped()
     {

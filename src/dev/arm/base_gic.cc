@@ -217,7 +217,9 @@ ArmSPI::clear()
 
 ArmPPI::ArmPPI(
     const ArmPPIParams &p, ThreadContext *tc)
-      : ArmInterruptPin(p, tc)
+      : ArmInterruptPin(p, tc),
+        wire(TimingFenceDomain::ArmPpi, p.name + ".cpu" +
+             std::to_string(tc->contextId()) + ".ppi" + std::to_string(p.num))
 {
     fatal_if(!platform, "Interrupt not connected to a RealView platform");
 }
@@ -226,14 +228,28 @@ void
 ArmPPI::raise()
 {
     _active = true;
-    platform->gic->sendPPInt(intNum, targetContext());
+    if (ArmSystem::timingEnabled(platform->system)) {
+        auto *system = static_cast<ArmSystem *>(platform->system);
+        const auto cpu = targetContext();
+        crossDomainCall(wire, *platform->gic, curTick() + system->partitionWireLatency,
+                        [this, cpu] { platform->gic->sendPPInt(intNum, cpu); });
+    } else {
+        platform->gic->sendPPInt(intNum, targetContext());
+    }
 }
 
 void
 ArmPPI::clear()
 {
     _active = false;
-    platform->gic->clearPPInt(intNum, targetContext());
+    if (ArmSystem::timingEnabled(platform->system)) {
+        auto *system = static_cast<ArmSystem *>(platform->system);
+        const auto cpu = targetContext();
+        crossDomainCall(wire, *platform->gic, curTick() + system->partitionWireLatency,
+                        [this, cpu] { platform->gic->clearPPInt(intNum, cpu); });
+    } else {
+        platform->gic->clearPPInt(intNum, targetContext());
+    }
 }
 
 ArmSigInterruptPin::ArmSigInterruptPin(const ArmSigInterruptPinParams &p)

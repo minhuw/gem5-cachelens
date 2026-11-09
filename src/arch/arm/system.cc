@@ -47,6 +47,7 @@
 #include "base/loader/object_file.hh"
 #include "base/loader/symtab.hh"
 #include "cpu/thread_context.hh"
+#include "cpu/base.hh"
 #include "dev/arm/fvp_base_pwr_ctrl.hh"
 #include "dev/arm/gic_v2.hh"
 #include "mem/physical.hh"
@@ -81,6 +82,8 @@ ArmSystem::ArmSystem(const Params &p)
       _smeVL(p.sme_vl),
       semihosting(p.semihosting),
       release(p.release),
+      partitionTiming(p.partition_timing),
+      partitionWireLatency(p.partition_wire_latency),
       multiProc(p.multi_proc)
 {
     if (p.auto_reset_addr) {
@@ -108,6 +111,29 @@ ArmSystem::ArmSystem(const Params &p)
     {
         fatal("Invalid physical address range (%d)\n", _physAddrRange64);
     }
+}
+
+void
+ArmSystem::startup()
+{
+    System::startup();
+    if (!partitionTiming) return;
+    fatal_if(partitionWireLatency < sim_clock::as_int::ns,
+             "%s: partition_wire_latency must be at least 1ns", name());
+    fatal_if(!dynamic_cast<GicV2 *>(_gic),
+             "%s: partition timing supports GICv2 only", name());
+    for (auto *tc : threads)
+        wires.push_back(std::make_unique<CpuWires>(
+            tc->getCpuPtr()->name() + ".thread" + std::to_string(tc->threadId())));
+}
+
+void
+ArmSystem::prepareWhileStopped()
+{
+    if (!partitionTiming) return;
+    fatal_if(partitionQuantum() > partitionWireLatency ||
+             partitionQuantum() > partitionRubyPeriod(),
+             "%s: quantum exceeds ARM wire or Ruby PIO lookahead", name());
 }
 
 bool
@@ -199,8 +225,15 @@ ArmSystem::callSemihosting(ThreadContext *tc, bool gem5_ops)
 void
 ArmSystem::callSetStandByWfi(ThreadContext *tc)
 {
-    if (FVPBasePwrCtrl *pwr_ctrl = getArmSystem(tc)->getPowerController())
-        pwr_ctrl->setStandByWfi(tc);
+    auto *system = getArmSystem(tc);
+    if (FVPBasePwrCtrl *pwr_ctrl = system->getPowerController()) {
+        if (system->partitionTiming)
+            crossDomainCall(system->cpuWires(tc->contextId()).power, *pwr_ctrl,
+                curTick() + system->partitionWireLatency,
+                [pwr_ctrl, tc] { pwr_ctrl->setStandByWfi(tc); });
+        else
+            pwr_ctrl->setStandByWfi(tc);
+    }
 }
 
 void

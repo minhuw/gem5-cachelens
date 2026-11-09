@@ -70,6 +70,20 @@ sendEvent(ThreadContext *tc)
     }
 }
 
+void
+sendEvent(ThreadContext *source, ThreadContext *destination)
+{
+    if (source != destination &&
+        ArmSystem::timingEnabled(source->getSystemPtr())) {
+        auto *system = ArmSystem::getArmSystem(source);
+        crossDomainCall(system->cpuWires(source->contextId()).sev,
+            *destination->getCpuPtr(), curTick() + system->partitionWireLatency,
+            [destination] { sendEvent(destination); });
+    } else {
+        sendEvent(destination);
+    }
+}
+
 bool
 isSecure(ThreadContext *tc)
 {

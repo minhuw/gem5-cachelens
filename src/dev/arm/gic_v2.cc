@@ -138,6 +138,15 @@ GicV2::GicV2(const Params &p)
       cpuPpiPending {}, cpuPpiActive {},
       pendingDelayedInterrupts(0)
 {
+    if (getSystem()->partitionTiming) {
+        fatal_if(intLatency < sim_clock::as_int::ns,
+                 "%s: partition timing requires int_latency >= 1ns", name());
+        for (unsigned line = 0; line < wires.size(); ++line)
+            wires[line] = std::make_unique<CrossDomainEndpoint>(
+                TimingFenceDomain::ArmGic,
+                name() + ".cpu" + std::to_string(line / 2) +
+                (line % 2 ? ".fiq" : ".irq"));
+    }
     for (int x = 0; x < CPU_MAX; x++) {
         iccrpr[x] = 0xff;
         cpuControl[x] = 0;
@@ -759,6 +768,8 @@ GicV2::writeCpu(ContextID ctx, Addr daddr, uint32_t data)
 void
 GicV2::prepareWhileStopped()
 {
+    fatal_if(getSystem()->partitionTiming && partitionQuantum() > intLatency,
+             "%s: quantum exceeds GIC interrupt lookahead", name());
     runningSnapshot = sys->threads.numRunning();
     for (unsigned cpu = 0; cpu < sys->threads.size(); ++cpu) getBankedRegs(cpu);
 }
@@ -1060,6 +1071,17 @@ GicV2::clearPPInt(uint32_t num, uint32_t cpu)
 void
 GicV2::clearInt(ContextID ctx, uint32_t int_num)
 {
+    if (getSystem()->partitionTiming) {
+        const bool fiq = isFiq(ctx, int_num);
+        auto &generation = wireGeneration.at(2 * ctx + fiq);
+        fatal_if(generation == std::numeric_limits<uint64_t>::max(),
+                 "%s: GIC wire generation wrapped", name());
+        ++generation;
+        scheduleWire(std::make_shared<WireDelivery>(WireDelivery{
+            static_cast<uint32_t>(ctx), fiq, false,
+            curTick() + getSystem()->partitionWireLatency, generation}));
+        return;
+    }
     auto tc = sys->threads[ctx];
     if (isFiq(ctx, int_num)) {
         tc->getCpuPtr()->clearInterrupt(tc->threadId(), ArmISA::INT_FIQ, 0);
@@ -1069,8 +1091,47 @@ GicV2::clearInt(ContextID ctx, uint32_t int_num)
 }
 
 void
+GicV2::postWire(uint32_t cpu, bool fiq, Tick when)
+{
+    const auto generation = wireGeneration.at(cpu * 2 + fiq);
+    for (const auto &delivery : deliveries)
+        if (delivery->post && delivery->cpu == cpu && delivery->fiq == fiq &&
+            delivery->generation == generation)
+            return;
+    scheduleWire(std::make_shared<WireDelivery>(
+        WireDelivery{cpu, fiq, true, when, generation}));
+}
+
+void
+GicV2::scheduleWire(const std::shared_ptr<WireDelivery> &delivery)
+{
+    deliveries.push_back(delivery);
+    if (delivery->post) ++pendingDelayedInterrupts;
+    auto *tc = sys->threads[delivery->cpu];
+    crossDomainCall(*wires.at(delivery->cpu * 2 + delivery->fiq), *tc->getCpuPtr(),
+        delivery->when, [this, tc, delivery] {
+            // Clears change deduplication generations, never cancel a post.
+            const auto type = delivery->fiq ? ArmISA::INT_FIQ : ArmISA::INT_IRQ;
+            if (delivery->post) {
+                tc->getCpuPtr()->postInterrupt(tc->threadId(), type, 0);
+                assert(pendingDelayedInterrupts > 0);
+                --pendingDelayedInterrupts;
+            } else {
+                tc->getCpuPtr()->clearInterrupt(tc->threadId(), type, 0);
+            }
+            deliveries.remove(delivery);
+            if (!pendingDelayedInterrupts && drainState() == DrainState::Draining)
+                signalDrainDone();
+        });
+}
+
+void
 GicV2::postInt(uint32_t cpu, Tick when)
 {
+    if (getSystem()->partitionTiming) {
+        postWire(cpu, false, when);
+        return;
+    }
     if (!(postIntEvent[cpu]->scheduled())) {
         ++pendingDelayedInterrupts;
         eventq->schedule(postIntEvent[cpu], when);
@@ -1091,6 +1152,10 @@ GicV2::postDelayedInt(uint32_t cpu)
 void
 GicV2::postFiq(uint32_t cpu, Tick when)
 {
+    if (getSystem()->partitionTiming) {
+        postWire(cpu, true, when);
+        return;
+    }
     if (!(postFiqEvent[cpu]->scheduled())) {
         ++pendingDelayedInterrupts;
         eventq->schedule(postFiqEvent[cpu], when);
@@ -1230,6 +1295,20 @@ GicV2::serialize(CheckpointOut &cp) const
     SERIALIZE_ARRAY(cpuPpiActive, CPU_MAX);
     SERIALIZE_ARRAY(cpuPpiPending, CPU_MAX);
     SERIALIZE_SCALAR(gem5ExtensionsEnabled);
+    if (getSystem()->partitionTiming) {
+        SERIALIZE_CONTAINER(wireGeneration);
+        const unsigned wire_delivery_count = deliveries.size();
+        SERIALIZE_SCALAR(wire_delivery_count);
+        unsigned index = 0;
+        for (const auto &delivery : deliveries) {
+            ScopedCheckpointSection section(cp, csprintf("wireDelivery%u", index++));
+            paramOut(cp, "cpu", delivery->cpu);
+            paramOut(cp, "fiq", delivery->fiq);
+            paramOut(cp, "post", delivery->post);
+            paramOut(cp, "when", delivery->when);
+            paramOut(cp, "generation", delivery->generation);
+        }
+    }
 
     for (uint32_t i=0; i < bankedRegs.size(); ++i) {
         if (!bankedRegs[i])
@@ -1282,8 +1361,37 @@ GicV2::unserialize(CheckpointIn &cp)
         UNSERIALIZE_ARRAY(interrupt_time, CPU_MAX);
 
         for (uint32_t cpu = 0; cpu < CPU_MAX; cpu++) {
-            if (interrupt_time[cpu])
-                schedule(postIntEvent[cpu], interrupt_time[cpu]);
+            if (interrupt_time[cpu]) {
+                if (getSystem()->partitionTiming)
+                    postWire(cpu, false, interrupt_time[cpu]);
+                else
+                    schedule(postIntEvent[cpu], interrupt_time[cpu]);
+            }
+        }
+    }
+
+    if (getSystem()->partitionTiming) {
+        if (cp.entryExists(Serializable::currentSection(), "fiq_time")) {
+            Tick fiq_time[CPU_MAX];
+            UNSERIALIZE_ARRAY(fiq_time, CPU_MAX);
+            for (unsigned cpu = 0; cpu < CPU_MAX; ++cpu)
+                if (fiq_time[cpu]) postWire(cpu, true, fiq_time[cpu]);
+        }
+        if (cp.entryExists(Serializable::currentSection(), "wire_delivery_count")) {
+            fatal_if(!deliveries.empty(), "%s: mixed legacy and wire interrupt state", name());
+            arrayParamIn(cp, "wireGeneration", wireGeneration.data(), wireGeneration.size());
+            unsigned wire_delivery_count;
+            UNSERIALIZE_SCALAR(wire_delivery_count);
+            for (unsigned index = 0; index < wire_delivery_count; ++index) {
+                ScopedCheckpointSection section(cp, csprintf("wireDelivery%u", index));
+                auto delivery = std::make_shared<WireDelivery>();
+                paramIn(cp, "cpu", delivery->cpu);
+                paramIn(cp, "fiq", delivery->fiq);
+                paramIn(cp, "post", delivery->post);
+                paramIn(cp, "when", delivery->when);
+                paramIn(cp, "generation", delivery->generation);
+                scheduleWire(delivery);
+            }
         }
     }
 

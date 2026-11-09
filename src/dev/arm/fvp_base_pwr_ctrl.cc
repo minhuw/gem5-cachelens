@@ -71,6 +71,16 @@ FVPBasePwrCtrl::startup()
 }
 
 void
+FVPBasePwrCtrl::prepareWhileStopped()
+{
+    if (!system.partitionTiming) return;
+    for (auto status : corePwrStatus)
+        fatal_if(!status.l0 || status.pp || status.pc,
+                 "%s: partition timing requires powered cores without pending power changes",
+                 name());
+}
+
+void
 FVPBasePwrCtrl::setStandByWfi(ThreadContext *const tc)
 {
     PwrStatus *pwrs = getCorePwrStatus(tc);
@@ -270,6 +280,8 @@ FVPBasePwrCtrl::getThreadContextByMPID(uint32_t mpid) const
 void
 FVPBasePwrCtrl::powerCoreOn(ThreadContext *const tc, PwrStatus *const pwrs)
 {
+    fatal_if(system.partitionTiming && isPartitioned(),
+             "%s: core power changes are unsupported while partitioned", name());
     DPRINTF(FVPBasePwrCtrl, "FVPBasePwrCtrl::powerCoreOn: Powering ON "
             "core %d\n", tc->contextId());
     pwrs->l0 = 1;
@@ -289,6 +301,8 @@ FVPBasePwrCtrl::powerCoreOn(ThreadContext *const tc, PwrStatus *const pwrs)
 void
 FVPBasePwrCtrl::powerCoreOff(ThreadContext *const tc, PwrStatus *const pwrs)
 {
+    fatal_if(system.partitionTiming && isPartitioned(),
+             "%s: core power changes are unsupported while partitioned", name());
     DPRINTF(FVPBasePwrCtrl, "FVPBasePwrCtrl::powerCoreOff: Powering OFF "
             "core %d\n", tc->contextId());
     pwrs->l0 = 0;
@@ -304,6 +318,8 @@ FVPBasePwrCtrl::powerCoreOff(ThreadContext *const tc, PwrStatus *const pwrs)
 void
 FVPBasePwrCtrl::startCoreUp(ThreadContext *const tc)
 {
+    fatal_if(system.partitionTiming && isPartitioned(),
+             "%s: core power changes are unsupported while partitioned", name());
     DPRINTF(FVPBasePwrCtrl, "FVPBasePwrCtrl::startCoreUp: Starting core %d "
             "from the power controller\n", tc->contextId());
     clearStandByWfi(tc);

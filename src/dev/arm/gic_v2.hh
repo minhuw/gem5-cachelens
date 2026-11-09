@@ -53,6 +53,8 @@
 #include "base/bitunion.hh"
 #include "dev/arm/base_gic.hh"
 #include "dev/io_device.hh"
+#include <array>
+#include <limits>
 #include "dev/platform.hh"
 #include "params/GicV2.hh"
 
@@ -514,6 +516,18 @@ class GicV2 : public BaseGic, public GicV2Registers, public PartitionParticipant
     EventFunctionWrapper *postIntEvent[CPU_MAX];
     EventFunctionWrapper *postFiqEvent[CPU_MAX];
     int pendingDelayedInterrupts;
+
+    struct WireDelivery {
+        uint32_t cpu;
+        bool fiq, post;
+        Tick when;
+        uint64_t generation;
+    };
+    std::array<uint64_t, CPU_MAX * 2> wireGeneration{};
+    std::array<std::unique_ptr<CrossDomainEndpoint>, CPU_MAX * 2> wires;
+    std::list<std::shared_ptr<WireDelivery>> deliveries;
+    void postWire(uint32_t cpu, bool fiq, Tick when);
+    void scheduleWire(const std::shared_ptr<WireDelivery> &delivery);
 
   public:
     using Params = GicV2Params;

@@ -45,6 +45,24 @@ namespace gem5
 
 namespace ArmISA {
 
+void
+TLBIOp::broadcast(ThreadContext *tc)
+{
+    if (!ArmSystem::timingEnabled(tc->getSystemPtr())) {
+        for (auto *oc : tc->getSystemPtr()->threads) (*this)(oc);
+        return;
+    }
+    auto *system = ArmSystem::getArmSystem(tc);
+    (*this)(tc);
+    for (auto *oc : system->threads) {
+        if (oc == tc) continue;
+        auto operation = clone();
+        crossDomainCall(system->cpuWires(tc->contextId()).tlbi, *oc->getCpuPtr(),
+            curTick() + system->partitionWireLatency,
+            [operation, oc] { (*operation)(oc); });
+    }
+}
+
 bool
 TLBIOp::match(TlbEntry* te, vmid_t vmid) const
 {

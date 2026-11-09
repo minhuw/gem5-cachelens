@@ -68,6 +68,7 @@ class TLBIOp
     {}
 
     virtual ~TLBIOp() {}
+    virtual std::shared_ptr<TLBIOp> clone() const = 0;
     virtual void operator()(ThreadContext* tc) {}
 
     /**
@@ -75,12 +76,7 @@ class TLBIOp
      * TLBs in the Arm system.
      * @param tc Thread Context
      */
-    void
-    broadcast(ThreadContext *tc)
-    {
-        for (auto *oc: tc->getSystemPtr()->threads)
-            (*this)(oc);
-    }
+    void broadcast(ThreadContext *tc);
 
     bool match(TlbEntry *entry, vmid_t curr_vmid) const;
 
@@ -117,6 +113,9 @@ class TLBIOp
 class TLBIALL : public TLBIOp
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIALL>(*this); }
+
     TLBIALL(TranslationRegime _target_regime, SecurityState _ss,
             Attr _attr=Attr::None)
       : TLBIOp(_target_regime, _ss, _attr), el2Enabled(false),
@@ -143,6 +142,9 @@ class TLBIALL : public TLBIOp
 class ITLBIALL : public TLBIALL
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<ITLBIALL>(*this); }
+
     ITLBIALL(TranslationRegime _target_regime, SecurityState _ss)
       : TLBIALL(_target_regime, _ss)
     {}
@@ -156,6 +158,9 @@ class ITLBIALL : public TLBIALL
 class DTLBIALL : public TLBIALL
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<DTLBIALL>(*this); }
+
     DTLBIALL(TranslationRegime _target_regime, SecurityState _ss)
       : TLBIALL(_target_regime, _ss)
     {}
@@ -169,6 +174,9 @@ class DTLBIALL : public TLBIALL
 class TLBIALLEL : public TLBIOp
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIALLEL>(*this); }
+
     TLBIALLEL(TranslationRegime _target_regime, SecurityState _ss, Attr _attr)
       : TLBIOp(_target_regime, _ss, _attr)
     {}
@@ -190,6 +198,9 @@ class TLBIALLEL : public TLBIOp
 class TLBIVMALL : public TLBIOp
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIVMALL>(*this); }
+
     TLBIVMALL(TranslationRegime _target_regime,
               SecurityState _ss, bool _stage2, Attr _attr)
       : TLBIOp(_target_regime, _ss, _attr), el2Enabled(false),
@@ -214,6 +225,9 @@ class TLBIVMALL : public TLBIOp
 class TLBIASID : public TLBIOp
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIASID>(*this); }
+
     TLBIASID(TranslationRegime _target_regime, SecurityState _ss,
              uint16_t _asid, Attr _attr=Attr::None)
       : TLBIOp(_target_regime, _ss, _attr), asid(_asid),
@@ -232,6 +246,9 @@ class TLBIASID : public TLBIOp
 class ITLBIASID : public TLBIASID
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<ITLBIASID>(*this); }
+
     ITLBIASID(TranslationRegime _target_regime,
               SecurityState _ss, uint16_t _asid)
       : TLBIASID(_target_regime, _ss, _asid)
@@ -246,6 +263,9 @@ class ITLBIASID : public TLBIASID
 class DTLBIASID : public TLBIASID
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<DTLBIASID>(*this); }
+
     DTLBIASID(TranslationRegime _target_regime,
               SecurityState _ss, uint16_t _asid)
       : TLBIASID(_target_regime, _ss, _asid)
@@ -260,6 +280,9 @@ class DTLBIASID : public TLBIASID
 class TLBIALLN : public TLBIOp
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIALLN>(*this); }
+
     TLBIALLN(TranslationRegime _target_regime)
       : TLBIOp(_target_regime, SecurityState::NonSecure, Attr::None)
     {}
@@ -281,6 +304,9 @@ class TLBIMVAA : public TLBIOp
   protected:
     TlbEntry::KeyType lookupGen(vmid_t vmid) const;
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIMVAA>(*this); }
+
     TLBIMVAA(TranslationRegime _target_regime, SecurityState _ss,
              Addr _addr, bool last_level, Attr _attr=Attr::None)
       : TLBIOp(_target_regime, _ss, _attr), addr(_addr),
@@ -302,6 +328,9 @@ class TLBIMVA : public TLBIOp
     TlbEntry::KeyType lookupGen(vmid_t vmid) const;
 
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIMVA>(*this); }
+
     TLBIMVA(TranslationRegime _target_regime, SecurityState _ss,
             Addr _addr, uint16_t _asid, bool last_level,
             Attr _attr=Attr::None)
@@ -322,6 +351,9 @@ class TLBIMVA : public TLBIOp
 class ITLBIMVA : public TLBIMVA
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<ITLBIMVA>(*this); }
+
     ITLBIMVA(TranslationRegime _target_regime, SecurityState _ss,
              Addr _addr, uint16_t _asid)
       : TLBIMVA(_target_regime, _ss, _addr, _asid, false)
@@ -336,6 +368,9 @@ class ITLBIMVA : public TLBIMVA
 class DTLBIMVA : public TLBIMVA
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<DTLBIMVA>(*this); }
+
     DTLBIMVA(TranslationRegime _target_regime, SecurityState _ss,
              Addr _addr, uint16_t _asid)
       : TLBIMVA(_target_regime, _ss, _addr, _asid, false)
@@ -407,6 +442,9 @@ class TLBIIPA : public TLBIOp
   protected:
     TlbEntry::KeyType lookupGen(vmid_t vmid) const;
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIIPA>(*this); }
+
     TLBIIPA(TranslationRegime _target_regime, SecurityState _ss, Addr _addr,
             bool last_level, Attr _attr=Attr::None)
       : TLBIOp(_target_regime, _ss, _attr),
@@ -459,6 +497,9 @@ class TLBIIPA : public TLBIOp
 class TLBIRMVA : public TLBIRange, public TLBIMVA
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIRMVA>(*this); }
+
     TLBIRMVA(TranslationRegime _target_regime, SecurityState _ss,
              RegVal val, uint16_t _asid, bool last_level, Attr _attr)
       : TLBIRange(val),
@@ -472,6 +513,9 @@ class TLBIRMVA : public TLBIRange, public TLBIMVA
 class TLBIRMVAA : public TLBIRange, public TLBIMVAA
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIRMVAA>(*this); }
+
     TLBIRMVAA(TranslationRegime _target_regime, SecurityState _ss,
               RegVal val, bool last_level, Attr _attr)
       : TLBIRange(val),
@@ -485,6 +529,9 @@ class TLBIRMVAA : public TLBIRange, public TLBIMVAA
 class TLBIRIPA : public TLBIRange, public TLBIIPA
 {
   public:
+    std::shared_ptr<TLBIOp> clone() const override
+    { return std::make_shared<TLBIRIPA>(*this); }
+
     TLBIRIPA(ThreadContext *tc, TranslationRegime _target_regime, SecurityState _ss,
              RegVal val, bool last_level, Attr _attr)
       : TLBIRange(val),
