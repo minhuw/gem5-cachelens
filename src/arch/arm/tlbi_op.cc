@@ -37,6 +37,7 @@
 
 #include "arch/arm/tlbi_op.hh"
 
+#include "arch/arm/decoder.hh"
 #include "arch/arm/mmu.hh"
 #include "cpu/checker/cpu.hh"
 
@@ -52,6 +53,9 @@ TLBIOp::broadcast(ThreadContext *tc)
         for (auto *oc : tc->getSystemPtr()->threads) (*this)(oc);
         return;
     }
+    fatal_if(!inAArch64(tc) ||
+             !static_cast<Decoder *>(tc->getDecoderPtr())->dvmEnabled,
+             "Partition timing requires AArch64 DVM for broadcast TLBI");
     auto *system = ArmSystem::getArmSystem(tc);
     (*this)(tc);
     for (auto *oc : system->threads) {

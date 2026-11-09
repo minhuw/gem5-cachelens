@@ -828,3 +828,34 @@ for mode, layout in (
         protocol="CHI",
         gem5_fixture_factory=CacheLensExactProtocolFixture,
     )
+
+
+# Opt-in ARM CPU/shared-device wires. Cross-run equality is checked by the
+# bounded validation harness; each test checks guest semantics and raw wires.
+for mode, timing, deactivate in (
+    ("native", False, 0),
+    ("native", True, 0),
+    ("fenced", True, 0),
+    ("thread", True, 0),
+    ("fenced", True, 80_001_000),
+    ("thread", True, 80_001_000),
+):
+    arguments = ["--mode", mode]
+    if timing:
+        arguments += ["--partition-timing", "--probe"]
+    if deactivate:
+        arguments += ["--deactivate-at", str(deactivate)]
+    gem5_verify_config(
+        name=f"cachelens-arm-split-timing-{mode}-{int(timing)}-{deactivate}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(
+            f"CACHELENS_ARM_TIMING_OK mode={mode} timing={int(timing)}"
+        )),),
+        config=joinpath(absdirpath(__file__), "configs", "arm_split_timing.py"),
+        config_args=arguments,
+        valid_isas=(constants.arm_tag,),
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+        protocol="CHI",
+        gem5_fixture_factory=CacheLensExactProtocolFixture,
+    )

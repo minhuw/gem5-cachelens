@@ -25,7 +25,7 @@ class CrossDomainEndpoint : public TimingFenceEndpoint, public Drainable,
 {
     struct Call {
         EventManager *destination;
-        Tick when;
+        Tick when, issued;
         std::function<void()> callback;
         Event *native = nullptr;
     };
@@ -37,6 +37,7 @@ class CrossDomainEndpoint : public TimingFenceEndpoint, public Drainable,
                  curEventQueue() != call->destination->eventQueue(),
                  "%s: cross-domain delivery changed deadline or owner", id);
         call->native = nullptr;
+        if (observer) observer(*this, call->issued, call->when, true);
         call->callback();
         calls.remove(call);
         if (calls.empty() && drainState() == DrainState::Draining)
@@ -65,6 +66,9 @@ class CrossDomainEndpoint : public TimingFenceEndpoint, public Drainable,
     }
 
   public:
+    // Optional directed-test observer, installed only with simulation stopped.
+    inline static void (*observer)(const TimingFenceEndpoint &, Tick, Tick, bool)
+        = nullptr;
     CrossDomainEndpoint(TimingFenceDomain domain, const std::string &id)
         : TimingFenceEndpoint(domain, id) {}
 
@@ -77,7 +81,9 @@ class CrossDomainEndpoint : public TimingFenceEndpoint, public Drainable,
     void call(EventManager &destination, Tick when, std::function<void()> fn)
     {
         fatal_if(when < curTick(), "%s: cross-domain call in the past", id);
-        auto call = std::make_shared<Call>(Call{&destination, when, std::move(fn)});
+        auto call = std::make_shared<Call>(
+            Call{&destination, when, curTick(), std::move(fn)});
+        if (observer) observer(*this, call->issued, when, false);
         calls.push_back(call);
         auto callback = [this, call] { deliver(call); };
         if (timingFenceHandoff) {

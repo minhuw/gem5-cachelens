@@ -92,6 +92,7 @@ class GicV2Registers
 
 class GicV2 : public BaseGic, public GicV2Registers, public PartitionParticipant
 {
+    friend class ArmPartitionTimingProbe;
   protected:
     // distributor memory addresses
     enum
