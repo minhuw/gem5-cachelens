@@ -141,6 +141,32 @@ ArmPartitionTimingProbe::startup()
     for (bool disable : {false, true})
         for (int offset : {-1, 0, 1})
             timerCase(start + (++index) * 100000, offset, disable);
+    const Tick short_base = start + 700000;
+    const Tick short_expiry = (short_base / 500 + 1) * 500;
+    at(cpu, short_base, [this, short_expiry] {
+        const auto count = timer.readMiscReg(MISCREG_CNTVCT_EL0, 0);
+        fatal_if((count + 1) * 500 != short_expiry,
+                 "Probe counter phase changed");
+        timer.setMiscReg(MISCREG_CNTV_CTL_EL0, 0, 0);
+        timer.setMiscReg(MISCREG_CNTV_CVAL_EL0, 0, count + 1);
+        timer.setMiscReg(MISCREG_CNTV_CTL_EL0, 0, 1);
+        std::cout << "ARM_TIMING_SHORT_CVAL tick=" << curTick()
+                  << " expiry=" << short_expiry
+                  << " ticks_ahead=" << short_expiry - curTick() << std::endl;
+    });
+    at(gic, short_expiry + latency - 1,
+       [this] { ppi(false, "short-cval-before-wire"); });
+    at(gic, short_expiry + latency,
+       [this] { ppi(true, "short-cval-at-wire"); });
+    at(cpu, short_expiry + latency + 10, [this] {
+        timer.setMiscReg(MISCREG_CNTV_CTL_EL0, 0, 0);
+    });
+    at(gic, short_expiry + 2 * latency + 10,
+       [this] { ppi(false, "short-cval-clear"); });
+    at(cpu, short_expiry + latency + gic.intLatency,
+       [this] { irq(true, "short-cval-post"); });
+    at(gic, short_expiry + latency + gic.intLatency + 10,
+       [this] { gic.clearInt(ContextID(0), 27); });
     at(cpu, start + 800000, [this] {
         fatal_if(gic.pendingDelayedInterrupts || !gic.deliveries.empty(),
                  "Probe left a pending interrupt delivery");

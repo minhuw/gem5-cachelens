@@ -28,7 +28,8 @@ checks real GIC input and CPU raw interrupt state, including the first post,
 clear, and re-post while the first post is still in flight. Same-generation
 posts must deduplicate; the second generation must survive. It also changes
 timer control one tick before, exactly at (before the timer event), and one
-tick after expiry for both masking and disabling. It observes PPI delivery
+tick after expiry for both masking and disabling. A separate case programs
+CVAL exactly 377 ticks in the future (0.377 ns). It observes PPI delivery
 at expiry + 1000 ticks and clear delivery at issue + 1000 ticks. An in-flight
 GIC assert still lands at its original 10000-tick latency. The observer emits
 `ARM_WIRE` issue/land records with endpoint, issue and delivery ticks.
@@ -52,3 +53,12 @@ translations on TLBI_EXT_SYNC before returning TLBI_EXT_SYNC_COMP. This means
 neither that sync nor the source DSB can complete before these deferred
 invalidations. Broadcast with the wire model fails closed outside AArch64
 DVM; a longer wire that outruns protocol completion also fails closed.
+
+`arm_split_timing_checkpoint.py` runs the guest to its parked state, takes a
+normal drained checkpoint, then uses isolated GIC/timer object restore fixtures
+to exercise four in-flight wire records (including IRQ, FIQ, clear and different
+generations), all four virtual CVALs, and legacy `interrupt_time`/`fiq_time`
+conversion. The stopped object state is serialized again and byte values are
+compared by section; after resuming, drain must wait for all restored posts.
+This tests object serialization and accounting, not full-system checkpointing
+without drain. Normal checkpoints drain the helper's arbitrary closures.

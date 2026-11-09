@@ -859,3 +859,19 @@ for mode, timing, deactivate in (
         protocol="CHI",
         gem5_fixture_factory=CacheLensExactProtocolFixture,
     )
+
+
+gem5_verify_config(
+    name="cachelens-arm-split-timing-checkpoint",
+    fixtures=(),
+    verifiers=(verifier.MatchRegex(re.compile(
+        "ARM_TIMING_CHECKPOINT_PASS legacy_posts=2 drained=1"
+    )),),
+    config=joinpath(absdirpath(__file__), "configs", "arm_split_timing_checkpoint.py"),
+    config_args=(),
+    valid_isas=(constants.arm_tag,),
+    valid_hosts=constants.supported_hosts,
+    length=constants.quick_tag,
+    protocol="CHI",
+    gem5_fixture_factory=CacheLensExactProtocolFixture,
+)
