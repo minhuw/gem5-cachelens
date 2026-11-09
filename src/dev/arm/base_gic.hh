@@ -49,6 +49,7 @@
 #include "arch/arm/system.hh"
 #include "dev/intpin.hh"
 #include "dev/io_device.hh"
+#include "sim/partition_participant.hh"
 
 #include "enums/ArmInterruptType.hh"
 
@@ -169,7 +170,7 @@ class ArmSPIGen : public ArmInterruptPinGen
  * Since PPIs are banked in the GIC, this class is capable of generating
  * more than one interrupt (one per ContextID).
  */
-class ArmPPIGen : public ArmInterruptPinGen
+class ArmPPIGen : public ArmInterruptPinGen, public PartitionParticipant
 {
   public:
     PARAMS(ArmPPI);
@@ -177,6 +178,7 @@ class ArmPPIGen : public ArmInterruptPinGen
 
     ArmInterruptPin* get(ThreadContext* tc = nullptr) override;
   protected:
+    void prepareWhileStopped() override;
     std::unordered_map<ContextID, ArmPPI*> pins;
 };
 

@@ -88,7 +88,7 @@ class GicV2Registers
     static void clearDistRange(GicV2Registers* to, Addr daddr, size_t size);
 };
 
-class GicV2 : public BaseGic, public GicV2Registers
+class GicV2 : public BaseGic, public GicV2Registers, public PartitionParticipant
 {
   protected:
     // distributor memory addresses
@@ -243,6 +243,13 @@ class GicV2 : public BaseGic, public GicV2Registers
             intGroup(0), intConfig {0}, intPriority {0}
           {}
     };
+    int runningSnapshot = 0;
+    void prepareWhileStopped() override;
+    void checkWhileStopped() const override;
+    int numRunning() const
+    {
+        return isPartitioned() ? runningSnapshot : sys->threads.numRunning();
+    }
     std::vector<BankedRegs*> bankedRegs;
 
     BankedRegs& getBankedRegs(ContextID);
@@ -362,7 +369,7 @@ class GicV2 : public BaseGic, public GicV2Registers
     uint8_t
     getCpuTarget(ContextID ctx, uint32_t ix) const
     {
-        assert(ctx < sys->threads.numRunning());
+        assert(ctx < numRunning());
         assert(ix < INT_LINES_MAX);
         if (ix < SGI_MAX + PPI_MAX) {
             // "GICD_ITARGETSR0 to GICD_ITARGETSR7 are read-only, and each

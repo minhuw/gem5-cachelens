@@ -49,6 +49,7 @@
 #include "dev/arm/base_gic.hh"
 #include "dev/arm/generic_timer_miscregs_types.hh"
 #include "sim/drain.hh"
+#include "sim/partition_participant.hh"
 #include "sim/eventq.hh"
 #include "sim/serialize.hh"
 #include "sim/sim_object.hh"
@@ -83,9 +84,12 @@ class SystemCounterListener
 
 /// Global system counter.  It is shared by the architected and memory-mapped
 /// timers.
-class SystemCounter : public SimObject
+class SystemCounter : public SimObject, public PartitionParticipant
 {
   protected:
+    void prepareWhileStopped() override;
+    uint64_t partitionValue() const;
+
     /// Indicates if the counter is enabled
     bool _enabled;
     /// Counter frequency (as specified by CNTFRQ).
@@ -193,6 +197,9 @@ class ArchTimer : public SystemCounterListener, public Drainable,
     /// Pointer to parent class.
     SimObject &_parent;
 
+    /// CPU for core timers, frame for memory-mapped timers.
+    EventManager &_eventManager;
+
     SystemCounter &_systemCounter;
 
     ArmInterruptPin * const _interrupt;
@@ -219,8 +226,11 @@ class ArchTimer : public SystemCounterListener, public Drainable,
   public:
     ArchTimer(const std::string &name,
               SimObject &parent,
+              EventManager &event_manager,
               SystemCounter &sysctr,
               ArmInterruptPin *interrupt);
+
+    EventManager &eventManager() const { return _eventManager; }
 
     /// Returns the timer name.
     std::string name() const { return _name; }
@@ -272,9 +282,10 @@ class ArchTimerKvm : public ArchTimer
     ArchTimerKvm(const std::string &name,
                  ArmSystem &system,
                  SimObject &parent,
+                 EventManager &event_manager,
                  SystemCounter &sysctr,
                  ArmInterruptPin *interrupt)
-      : ArchTimer(name, parent, sysctr, interrupt), system(system) {}
+      : ArchTimer(name, parent, event_manager, sysctr, interrupt), system(system) {}
 
   protected:
     // For ArchTimer's in a GenericTimerISA with Kvm execution about
@@ -283,7 +294,7 @@ class ArchTimerKvm : public ArchTimer
     bool scheduleEvents() override;
 };
 
-class GenericTimer : public SimObject
+class GenericTimer : public SimObject, public PartitionParticipant
 {
   public:
     PARAMS(GenericTimer);
@@ -298,6 +309,9 @@ class GenericTimer : public SimObject
     RegVal readMiscReg(int misc_reg, unsigned cpu);
 
   protected:
+    void prepareWhileStopped() override;
+    void checkWhileStopped() const override;
+
     class CoreTimers : public SystemCounterListener, public Serializable
     {
       public:
@@ -312,6 +326,7 @@ class GenericTimer : public SimObject
 
         /// Generic Timer parent reference
         GenericTimer &parent;
+        EventManager &eventManager;
 
         /// System counter frequency as visible from this core
         uint32_t cntfrq;

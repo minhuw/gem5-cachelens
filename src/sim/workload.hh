@@ -37,6 +37,8 @@
 #include "gdbremote/signals.hh"
 #include "params/StubWorkload.hh"
 #include "params/Workload.hh"
+#include <mutex>
+
 #include "sim/sim_object.hh"
 #include "sim/stats.hh"
 
@@ -79,6 +81,7 @@ class Workload : public SimObject
     std::set<ThreadContext *> threads;
 
     System *system = nullptr;
+    std::mutex instStatsMutex;
 
   public:
     Workload(const WorkloadParams &params) : SimObject(params), stats(this),
@@ -87,8 +90,16 @@ class Workload : public SimObject
 
     virtual void setSystem(System *sys) { system = sys; }
 
-    void recordQuiesce() { stats.instStats.quiesce++; }
-    void recordArm() { stats.instStats.arm++; }
+    void recordQuiesce()
+    {
+        std::lock_guard<std::mutex> lock(instStatsMutex);
+        stats.instStats.quiesce++;
+    }
+    void recordArm()
+    {
+        std::lock_guard<std::mutex> lock(instStatsMutex);
+        stats.instStats.arm++;
+    }
 
     // Once trapping into GDB is no longer a special case routed through the
     // system object, this helper can be removed.

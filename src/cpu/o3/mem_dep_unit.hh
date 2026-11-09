@@ -41,6 +41,7 @@
 #ifndef __CPU_O3_MEM_DEP_UNIT_HH__
 #define __CPU_O3_MEM_DEP_UNIT_HH__
 
+#include <atomic>
 #include <list>
 #include <memory>
 #include <set>
@@ -211,9 +212,9 @@ class MemDepUnit
 
         /** For debugging. */
 #ifdef GEM5_DEBUG
-        static int memdep_count;
-        static int memdep_insert;
-        static int memdep_erase;
+        static std::atomic<int> memdep_count;
+        static std::atomic<int> memdep_insert;
+        static std::atomic<int> memdep_erase;
 #endif
     };
 

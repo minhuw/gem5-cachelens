@@ -1347,6 +1347,12 @@ ISA::setMiscRegReset(RegIndex idx, RegVal val)
     InitReg(flat_idx).reset(val);
 }
 
+void
+ISA::prepareWhileStopped()
+{
+    if (system && tc && system->getGenericTimer()) getGenericTimer();
+}
+
 BaseISADevice &
 ISA::getGenericTimer()
 {
@@ -1362,6 +1368,7 @@ ISA::getGenericTimer()
               "been configured to use a generic timer.\n");
     }
 
+    fatal_if(isPartitioned(), "%s: Lazy ISA timer allocation while partitioned", name());
     timer.reset(new GenericTimerISA(*generic_timer, tc->contextId()));
     timer->setThreadContext(tc);
 

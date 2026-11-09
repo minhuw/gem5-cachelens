@@ -101,6 +101,14 @@ ArmPPIGen::ArmPPIGen(const ArmPPIParams &p)
 {
 }
 
+void
+ArmPPIGen::prepareWhileStopped()
+{
+    auto *platform = params().platform;
+    fatal_if(!platform || !platform->system, "%s: PPI has no system", name());
+    for (auto *tc : platform->system->threads) get(tc);
+}
+
 ArmInterruptPin*
 ArmPPIGen::get(ThreadContext* tc)
 {
@@ -113,6 +121,7 @@ ArmPPIGen::get(ThreadContext* tc)
         // PPI Pin Already generated
         return pin_it->second;
     } else {
+        fatal_if(isPartitioned(), "%s: Lazy PPI allocation while partitioned", name());
         // Generate PPI Pin
         ArmPPI *pin = new ArmPPI(ArmPPIGen::params(), tc);
 

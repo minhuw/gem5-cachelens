@@ -53,6 +53,7 @@
 #include "arch/arm/types.hh"
 #include "arch/arm/utility.hh"
 #include "arch/generic/isa.hh"
+#include "sim/partition_participant.hh"
 #include "base/random.hh"
 #include "debug/Checkpoint.hh"
 #include "enums/DecoderFlavor.hh"
@@ -68,7 +69,7 @@ class EventManager;
 
 namespace ArmISA
 {
-    class ISA : public BaseISA
+    class ISA : public BaseISA, public PartitionParticipant
     {
       protected:
         // Parent system
@@ -122,6 +123,7 @@ namespace ArmISA
 
         void initializeMiscRegMetadata();
 
+        void prepareWhileStopped() override;
         BaseISADevice &getGenericTimer();
         BaseISADevice &getGICv3CPUInterface();
         BaseISADevice *getGICv3CPUInterface(ThreadContext *tc);

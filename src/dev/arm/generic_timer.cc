@@ -95,8 +95,27 @@ SystemCounter::validateCounterRef(SystemCounter *const sys_cnt)
 }
 
 void
+SystemCounter::prepareWhileStopped()
+{
+    fatal_if(!_period || _updateTick % _period,
+             "%s: partitioned system counter requires a period-aligned anchor",
+             name());
+}
+
+uint64_t
+SystemCounter::partitionValue() const
+{
+    if (!_enabled) return _value;
+    const uint64_t new_value =
+        _value + ((curTick() - _updateTick) / _period) * _increment;
+    // Preserve updateValue's guard, including its unsigned wrap semantics.
+    return new_value > _value ? new_value : _value;
+}
+
+void
 SystemCounter::enable()
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     DPRINTF(Timer, "SystemCounter::enable: Counter enabled\n");
     _enabled = true;
     updateTick();
@@ -105,6 +124,7 @@ SystemCounter::enable()
 void
 SystemCounter::disable()
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     DPRINTF(Timer, "SystemCounter::disable: Counter disabled\n");
     updateValue();
     _enabled = false;
@@ -113,6 +133,7 @@ SystemCounter::disable()
 uint64_t
 SystemCounter::value()
 {
+    if (isPartitioned()) return partitionValue();
     if (_enabled)
         updateValue();
     return _value;
@@ -121,6 +142,7 @@ SystemCounter::value()
 void
 SystemCounter::updateValue()
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     uint64_t new_value =
         _value + ((curTick() - _updateTick) / _period) * _increment;
     if (new_value > _value) {
@@ -132,6 +154,7 @@ SystemCounter::updateValue()
 void
 SystemCounter::setValue(uint64_t new_value)
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     if (_enabled)
         warn("Explicit value set with counter enabled, UNKNOWNN result\n");
     _value = new_value;
@@ -166,12 +189,14 @@ SystemCounter::whenValue(uint64_t target_val)
 void
 SystemCounter::updateTick()
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     _updateTick = curTick() - (curTick() % _period);
 }
 
 void
 SystemCounter::freqUpdateSchedule(size_t new_freq_entry)
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     if (new_freq_entry < _freqTable.size()) {
         auto &new_freq = _freqTable[new_freq_entry];
         if (new_freq != _freq) {
@@ -190,6 +215,7 @@ SystemCounter::freqUpdateSchedule(size_t new_freq_entry)
 void
 SystemCounter::freqUpdateCallback()
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     DPRINTF(Timer, "SystemCounter::freqUpdateCallback: Changing counter "
             "frequency\n");
     if (_enabled)
@@ -204,12 +230,14 @@ SystemCounter::freqUpdateCallback()
 void
 SystemCounter::registerListener(SystemCounterListener *listener)
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     _listeners.push_back(listener);
 }
 
 void
 SystemCounter::notifyListeners() const
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     for (auto &listener : _listeners)
         listener->notify();
 }
@@ -237,6 +265,7 @@ SystemCounter::serialize(CheckpointOut &cp) const
 void
 SystemCounter::unserialize(CheckpointIn &cp)
 {
+    fatal_if(isPartitioned(), "%s: system counter mutation while partitioned", name());
     DPRINTF(Timer, "SystemCounter::unserialize: Unserializing\n");
     UNSERIALIZE_SCALAR(_enabled);
     UNSERIALIZE_SCALAR(_freq);
@@ -259,9 +288,11 @@ SystemCounter::unserialize(CheckpointIn &cp)
 
 ArchTimer::ArchTimer(const std::string &name,
                      SimObject &parent,
+                     EventManager &event_manager,
                      SystemCounter &sysctr,
                      ArmInterruptPin *interrupt)
-    : _name(name), _parent(parent), _systemCounter(sysctr),
+    : _name(name), _parent(parent), _eventManager(event_manager),
+      _systemCounter(sysctr),
       _interrupt(interrupt),
       _control(0), _counterLimit(0), _offset(0),
       _counterLimitReachedEvent([this]{ counterLimitReached(); }, name)
@@ -291,7 +322,7 @@ void
 ArchTimer::updateCounter()
 {
     if (_counterLimitReachedEvent.scheduled())
-        _parent.deschedule(_counterLimitReachedEvent);
+        _eventManager.deschedule(_counterLimitReachedEvent);
     if (value() >= _counterLimit) {
         counterLimitReached();
     } else {
@@ -304,7 +335,7 @@ ArchTimer::updateCounter()
         _control.istatus = 0;
 
         if (scheduleEvents()) {
-            _parent.schedule(_counterLimitReachedEvent,
+            _eventManager.schedule(_counterLimitReachedEvent,
                              whenValue(_counterLimit));
         }
     }
@@ -396,7 +427,7 @@ DrainState
 ArchTimer::drain()
 {
     if (_counterLimitReachedEvent.scheduled())
-        _parent.deschedule(_counterLimitReachedEvent);
+        _eventManager.deschedule(_counterLimitReachedEvent);
 
     return DrainState::Drained;
 }
@@ -472,6 +503,22 @@ GenericTimer::unserialize(CheckpointIn &cp)
     }
 }
 
+void
+GenericTimer::prepareWhileStopped()
+{
+    createTimers(system.threads.size());
+    checkWhileStopped();
+}
+
+void
+GenericTimer::checkWhileStopped() const
+{
+    for (unsigned cpu = 0; cpu < timers.size(); ++cpu)
+        fatal_if(timers[cpu]->threadContext != system.threads[cpu] ||
+                 &timers[cpu]->eventManager != system.threads[cpu]->getCpuPtr(),
+                 "%s: CPU switching is unsupported while partitioned", name());
+}
+
 GenericTimer::CoreTimers &
 GenericTimer::getTimers(int cpu_id)
 {
@@ -484,7 +531,8 @@ GenericTimer::getTimers(int cpu_id)
 void
 GenericTimer::createTimers(unsigned cpus)
 {
-    assert(timers.size() < cpus);
+    if (timers.size() >= cpus) return;
+    fatal_if(isPartitioned(), "Lazy core timer creation while partitioned");
     auto &p = params();
 
     const unsigned old_cpu_count(timers.size());
@@ -523,11 +571,11 @@ GenericTimer::handleStream(CoreTimers::EventStream *ev_stream,
 
         Tick when = timer->whenValue(
             ev_stream->eventTargetValue(timer->value()));
-        reschedule(ev_stream->event, when, true);
+        timer->eventManager().reschedule(ev_stream->event, when, true);
     } else if (old_evnten && !evnten) {
         // Event Stream generation disabled
         if (ev_stream->event.scheduled())
-            deschedule(ev_stream->event);
+            timer->eventManager().deschedule(ev_stream->event);
     }
 }
 
@@ -814,6 +862,7 @@ GenericTimer::CoreTimers::CoreTimers(GenericTimer &_parent,
     ArmInterruptPin *irq_el2_ns_virt, ArmInterruptPin *irq_el2_s_phys,
     ArmInterruptPin *irq_el2_s_virt)
       : parent(_parent),
+        eventManager(*system.threads[cpu]->getCpuPtr()),
         cntfrq(parent.params().cntfrq),
         cntkctl(0), cnthctl(0),
         threadContext(system.threads[cpu]),
@@ -825,25 +874,25 @@ GenericTimer::CoreTimers::CoreTimers(GenericTimer &_parent,
         irqPhysSEL2(irq_el2_s_phys),
         irqVirtSEL2(irq_el2_s_virt),
         physEL3(csprintf("%s.el3_phys_timer%d", parent.name(), cpu),
-                system, parent, parent.systemCounter,
+                system, parent, eventManager, parent.systemCounter,
                 irq_el3_phys),
         physEL1(csprintf("%s.el1_phys_timer%d", parent.name(), cpu),
-                system, parent, parent.systemCounter,
+                system, parent, eventManager, parent.systemCounter,
                 irq_el1_phys),
         virtEL1(csprintf("%s.el1_virt_timer%d", parent.name(), cpu),
-                system, parent, parent.systemCounter,
+                system, parent, eventManager, parent.systemCounter,
                 irq_el1_virt),
         physNsEL2(csprintf("%s.el2_ns_phys_timer%d", parent.name(), cpu),
-                  system, parent, parent.systemCounter,
+                  system, parent, eventManager, parent.systemCounter,
                   irq_el2_ns_phys),
         virtNsEL2(csprintf("%s.el2_ns_virt_timer%d", parent.name(), cpu),
-                  system, parent, parent.systemCounter,
+                  system, parent, eventManager, parent.systemCounter,
                   irq_el2_ns_virt),
         physSEL2(csprintf("%s.el2_s_phys_timer%d", parent.name(), cpu),
-                 system, parent, parent.systemCounter,
+                 system, parent, eventManager, parent.systemCounter,
                  irq_el2_s_phys),
         virtSEL2(csprintf("%s.el2_s_virt_timer%d", parent.name(), cpu),
-                 system, parent, parent.systemCounter,
+                 system, parent, eventManager, parent.systemCounter,
                  irq_el2_s_virt),
         physEvStream{
            EventFunctionWrapper([this]{ physEventStreamCallback(); },
@@ -881,7 +930,7 @@ void
 GenericTimer::CoreTimers::schedNextEvent(EventStream &ev_stream,
                                          ArchTimer &timer)
 {
-    parent.reschedule(ev_stream.event, timer.whenValue(
+    eventManager.reschedule(ev_stream.event, timer.whenValue(
         ev_stream.eventTargetValue(timer.value())), true);
 }
 
@@ -938,7 +987,7 @@ GenericTimer::CoreTimers::unserialize(CheckpointIn &cp)
     if (phys_ev_scheduled) {
         Tick phys_ev_when;
         UNSERIALIZE_SCALAR(phys_ev_when);
-        parent.reschedule(physEvStream.event, phys_ev_when, true);
+        eventManager.reschedule(physEvStream.event, phys_ev_when, true);
     }
     UNSERIALIZE_SCALAR(physEvStream.transitionTo);
     UNSERIALIZE_SCALAR(physEvStream.transitionBit);
@@ -948,7 +997,7 @@ GenericTimer::CoreTimers::unserialize(CheckpointIn &cp)
     if (virt_ev_scheduled) {
         Tick virt_ev_when;
         UNSERIALIZE_SCALAR(virt_ev_when);
-        parent.reschedule(virtEvStream.event, virt_ev_when, true);
+        eventManager.reschedule(virtEvStream.event, virt_ev_when, true);
     }
     UNSERIALIZE_SCALAR(virtEvStream.transitionTo);
     UNSERIALIZE_SCALAR(virtEvStream.transitionBit);
@@ -983,9 +1032,9 @@ GenericTimerFrame::GenericTimerFrame(const GenericTimerFrameParams &p)
       addrRanges({timerRange}),
       systemCounter(*p.counter),
       physTimer(csprintf("%s.phys_timer", name()),
-                *this, systemCounter, p.int_phys->get()),
+                *this, *this, systemCounter, p.int_phys->get()),
       virtTimer(csprintf("%s.virt_timer", name()),
-                *this, systemCounter,
+                *this, *this, systemCounter,
                 p.int_virt->get()),
       accessBits(0x3f),
       system(*dynamic_cast<ArmSystem *>(sys))
@@ -1545,6 +1594,8 @@ GenericTimerMem::counterCtrlWrite(Addr addr, size_t size, uint64_t data,
         for (int i = 0; i < (freq_table.size() - 1); i++) {
             Addr offset = COUNTER_CTRL_CNTFID + (i * 0x4);
             if (addr == offset) {
+                fatal_if(PartitionParticipant::isPartitioned(),
+                         "System counter frequency table mutation while partitioned");
                 freq_table[i] = data;
                 // This is changing the currently selected frequency
                 if (i == systemCounter.activeFreqEntry()) {

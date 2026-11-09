@@ -47,9 +47,9 @@ namespace o3
 {
 
 #ifdef GEM5_DEBUG
-int MemDepUnit::MemDepEntry::memdep_count = 0;
-int MemDepUnit::MemDepEntry::memdep_insert = 0;
-int MemDepUnit::MemDepEntry::memdep_erase = 0;
+std::atomic<int> MemDepUnit::MemDepEntry::memdep_count{0};
+std::atomic<int> MemDepUnit::MemDepEntry::memdep_insert{0};
+std::atomic<int> MemDepUnit::MemDepEntry::memdep_erase{0};
 #endif
 
 MemDepUnit::MemDepUnit() : iqPtr(NULL), stats(nullptr) {}
@@ -499,7 +499,7 @@ MemDepUnit::MemDepEntry::MemDepEntry(const DynInstPtr &new_inst) :
 
     DPRINTF(MemDepUnit,
             "Memory dependency entry created. memdep_count=%i %s\n",
-            memdep_count, inst->pcState());
+            memdep_count.load(std::memory_order_relaxed), inst->pcState());
 #endif
 }
 
@@ -513,7 +513,7 @@ MemDepUnit::MemDepEntry::~MemDepEntry()
 
     DPRINTF(MemDepUnit,
             "Memory dependency entry deleted. memdep_count=%i %s\n",
-            memdep_count, inst->pcState());
+            memdep_count.load(std::memory_order_relaxed), inst->pcState());
 #endif
 }
 
@@ -636,7 +636,7 @@ MemDepUnit::dumpLists()
     cprintf("Memory dependence hash size: %i\n", memDepHash.size());
 
 #ifdef GEM5_DEBUG
-    cprintf("Memory dependence entries: %i\n", MemDepEntry::memdep_count);
+    cprintf("Memory dependence entries: %i\n", MemDepEntry::memdep_count.load(std::memory_order_relaxed));
 #endif
 }
 

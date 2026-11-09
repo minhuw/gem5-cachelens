@@ -332,7 +332,7 @@ GicV2::readDistributor(ContextID ctx, Addr daddr, size_t resp_sz)
          * are available,
          * write 0x200 to this register to enable it.  */
         DPRINTF(GIC, "gic distributor read GICD_TYPER (%#x)\n", daddr);
-        return (((sys->threads.numRunning() - 1) << 5) |
+        return (((numRunning() - 1) << 5) |
                 (itLines/INT_BITS_MAX -1) |
                 (haveGem5Extensions ? 0x100 : 0x0));
       case GICD_PIDR0:
@@ -365,7 +365,7 @@ GicV2::readCpu(PacketPtr pkt)
 
     assert(pkt->req->hasContextId());
     const ContextID ctx = pkt->req->contextId();
-    assert(ctx < sys->threads.numRunning());
+    assert(ctx < numRunning());
 
     pkt->setLE<uint32_t>(readCpu(ctx, daddr));
 
@@ -407,7 +407,7 @@ GicV2::readCpu(ContextID ctx, Addr daddr)
                     panic_if(!cpuSgiPending[active_int],
                             "Interrupt %d active but no CPU generated it?\n",
                             active_int);
-                    for (int x = 0; x < sys->threads.numRunning(); x++) {
+                    for (int x = 0; x < numRunning(); x++) {
                         // See which CPU generated the interrupt
                         uint8_t cpugen =
                             bits(cpuSgiPending[active_int], 7 + 8 * x, 8 * x);
@@ -756,8 +756,24 @@ GicV2::writeCpu(ContextID ctx, Addr daddr, uint32_t data)
     if (cpuEnabled(ctx)) updateIntState(-1);
 }
 
+void
+GicV2::prepareWhileStopped()
+{
+    runningSnapshot = sys->threads.numRunning();
+    for (unsigned cpu = 0; cpu < sys->threads.size(); ++cpu) getBankedRegs(cpu);
+}
+
+void
+GicV2::checkWhileStopped() const
+{
+    fatal_if(sys->threads.numRunning() != runningSnapshot,
+             "%s: running CPU count changed while partitioned", name());
+}
+
 GicV2::BankedRegs&
 GicV2::getBankedRegs(ContextID ctx) {
+    fatal_if(isPartitioned() && (bankedRegs.size() <= ctx || !bankedRegs[ctx]),
+             "%s: Lazy GIC bank allocation while partitioned", name());
     if (bankedRegs.size() <= ctx)
         bankedRegs.resize(ctx + 1);
 
@@ -899,7 +915,7 @@ GicV2::updateIntState(int hint)
             }
         }
 
-        bool mp_sys = sys->threads.numRunning() > 1;
+        bool mp_sys = numRunning() > 1;
         // Check other ints
         for (int x = 0; x < (itLines/INT_BITS_MAX); x++) {
             if (getIntEnabled(cpu, x) & getPendingInt(cpu, x)) {
