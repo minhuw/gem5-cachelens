@@ -90,7 +90,11 @@ class CrossDomainEndpoint : public TimingFenceEndpoint, public Drainable,
             fatal_if(!timingFenceHandoff(*this, &destination, when, callback, true),
                      "%s: active dispatcher refused forced wire delivery", id);
         } else {
-            fatal_if(inParallelMode, "%s: native wire needs a stopped/serial queue", id);
+            // Deactivation restores owners to queue 0, but gem5 retains the
+            // idle worker queues and still enters parallel simulate(). Native
+            // events are safe within the producer's queue in that state.
+            fatal_if(inParallelMode && curEventQueue() != destination.eventQueue(),
+                     "%s: native wire crosses event queues without a dispatcher", id);
             fatal_if(sequence == std::numeric_limits<uint64_t>::max(),
                      "%s: wire sequence wrapped", id);
             ++sequence;
