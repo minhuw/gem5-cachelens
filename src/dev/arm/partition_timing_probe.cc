@@ -2,6 +2,7 @@
 #include "dev/arm/partition_timing_probe.hh"
 
 #include <iostream>
+#include <mutex>
 
 #include "arch/arm/interrupts.hh"
 #include "arch/arm/system.hh"
@@ -97,6 +98,8 @@ ArmPartitionTimingProbe::startup()
     CrossDomainEndpoint::observer = [](const TimingFenceEndpoint &endpoint,
                                      Tick issued, Tick when, bool delivered) {
         fatal_if(when - issued < 1000, "Directed ARM wire has no 1ns lookahead");
+        static std::mutex observerMutex;
+        std::lock_guard<std::mutex> lock(observerMutex);
         std::cout << "ARM_WIRE " << (delivered ? "land" : "issue")
                   << " endpoint=" << endpoint.id << " issued=" << issued
                   << " when=" << when << std::endl;

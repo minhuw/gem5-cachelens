@@ -28,7 +28,7 @@ from arm_split_timing_image import SIZE, SOURCE_SHA256, WORDS
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', choices=('native', 'fenced', 'thread'), required=True)
 parser.add_argument('--partition-timing', action='store_true')
-parser.add_argument('--layout', choices=('hnf1', 'hnf2'), default='hnf1')
+parser.add_argument('--layout', choices=('hnf1', 'hnf2', 'cpu3-control-hnf1', 'cpu3-control-hnf2'), default='hnf1')
 parser.add_argument('--ticks', type=int, default=100_000_000)
 parser.add_argument('--deactivate-at', type=int, default=0)
 parser.add_argument('--quantum', type=int, default=1000)

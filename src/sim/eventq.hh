@@ -890,6 +890,11 @@ class EventQueue
     size_t moveManagedEventsWhileStopped(
         const std::vector<std::pair<EventManager *, EventQueue *>> &moves);
 
+    // Audit the actual scheduled-event lists after stopped ownership changes.
+    // Names only reject untracked events; they never infer migration ownership.
+    void verifyManagerOwnershipWhileStopped(
+        const std::vector<std::pair<EventManager *, std::string>> &managers) const;
+
     Event *serviceOne();
 
     /**
@@ -1178,6 +1183,28 @@ EventQueue::moveManagedEventsWhileStopped(
         target->insert(event);
     }
     return pending.size();
+}
+
+inline void
+EventQueue::verifyManagerOwnershipWhileStopped(
+    const std::vector<std::pair<EventManager *, std::string>> &managers) const
+{
+    fatal_if(inParallelMode || !async_queue.empty(),
+             "Ownership audit requires stopped queues without async events");
+    for (Event *bin = head; bin; bin = bin->nextBin) {
+        for (Event *event = bin; event; event = event->nextInBin) {
+            fatal_if(event->schedulingManager &&
+                     event->schedulingManager->eventQueue() != this,
+                     "Scheduled event %s remains on the wrong manager queue", event->name());
+            if (event->schedulingManager || event->globalEvent()) continue;
+            for (const auto &manager : managers) {
+                const auto prefix = manager.second + ".";
+                fatal_if(event->name() == manager.second ||
+                         event->name().compare(0, prefix.size(), prefix) == 0,
+                         "Moved object %s has untracked event %s", manager.second, event->name());
+            }
+        }
+    }
 }
 
 /**

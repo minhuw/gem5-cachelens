@@ -144,11 +144,12 @@ parser.add_argument(
 )
 parser.add_argument("--max-ticks", type=int, default=2_000_000_000)
 parser.add_argument("--l1d-max-outstanding", type=int, default=4)
+parser.add_argument("--split-mode", choices=("fenced", "thread"))
 args = parser.parse_args()
 
-hierarchy = CacheLensCHIHierarchy()
+hierarchy = CacheLensCHIHierarchy(core_clock="2GHz") if args.split_mode else CacheLensCHIHierarchy()
 board = CacheLensArmBoard(
-    clk_freq="2GHz",
+    clk_freq="1GHz" if args.split_mode else "2GHz",
     processor=SimpleProcessor(
         cpu_type=CPUTypes.O3, isa=ISA.ARM, num_cores=2
     ),
@@ -158,6 +159,7 @@ board = CacheLensArmBoard(
 elf = Path(m5.options.outdir) / f"{args.scenario}.elf"
 write_elf(elf, image(args.scenario))
 
+board.partition_timing = bool(args.split_mode)
 board._set_fullsystem(True)
 board._bootloader = []
 board._add_pci_device(IdeController(disks=[]))
@@ -170,9 +172,18 @@ for cluster in hierarchy.core_clusters:
 for core in board.get_processor().get_cores():
     assert all(bool(d.dvm_enabled) for d in core.get_simobject().decoder)
 
+if args.split_mode:
+    import json
+    from gem5.prebuilt.cachelens.split_partition import attach_chi
+    meta = attach_chi(Root.getInstance(), board, args.split_mode, "cpu1-control-hnf1")
+    (Path(m5.options.outdir) / "split.json").write_text(json.dumps(meta, indent=2) + "\n")
 m5.instantiate()
 board._post_instantiate()
+if args.split_mode:
+    Root.getInstance().split_hnf.activate()
 event = m5.simulate(args.max_ticks)
+if args.split_mode:
+    Root.getInstance().split_hnf.deactivate()
 cause = event.getCause()
 m5.stats.dump()
 if cause != "m5_exit instruction encountered":

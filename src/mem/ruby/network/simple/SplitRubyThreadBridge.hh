@@ -10,13 +10,14 @@
 #include "params/SplitRubyThreadBridge.hh"
 #include "sim/sim_object.hh"
 #include "sim/timing_fence.hh"
+#include "sim/partition_participant.hh"
 
 namespace gem5 {
 class ClockedObject;
 class BaseCPU;
 namespace ruby {
 class RubySystem;
-class SplitRubyThreadBridge : public SimObject
+class SplitRubyThreadBridge : public SimObject, private PartitionParticipant
 {
   private:
     class Fence;
@@ -82,6 +83,7 @@ class SplitRubyThreadBridge : public SimObject
     MsgPtr decode(const Frame &frame);
     void moveIsland(EventQueue *from, EventQueue *to);
     void movePartition(bool activate);
+    void beginWhileStopped() override;
     Tick nextFenceTick() const;
     void scheduleIoTests();
   public:

@@ -300,6 +300,21 @@ void SplitRubyThreadBridge::moveIsland(EventQueue *from, EventQueue *to)
     }
 }
 
+void SplitRubyThreadBridge::beginWhileStopped()
+{
+    if (mode != "thread") return;
+    std::vector<std::pair<EventManager *, std::string>> owners;
+    for (unsigned i = 0; i < managers.size(); ++i) {
+        fatal_if(managers[i]->eventQueue() != getEventQueue(managerRoles[i]),
+                 "Partition manager %s has the wrong queue", managers[i]->name());
+        owners.emplace_back(managers[i], managers[i]->name());
+    }
+    for (unsigned q = 0; q < queueCount; ++q)
+        getEventQueue(q)->verifyManagerOwnershipWhileStopped(owners);
+    std::cout << "SPLIT_OWNERSHIP_PASS managers=" << managers.size()
+              << " queues=" << queueCount << std::endl;
+}
+
 void SplitRubyThreadBridge::movePartition(bool activate)
 {
     std::vector<std::pair<EventManager *, EventQueue *>> moves;

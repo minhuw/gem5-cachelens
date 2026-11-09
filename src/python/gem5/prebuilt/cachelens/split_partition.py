@@ -21,10 +21,9 @@ Fenced mode keeps one event queue and captures no Ruby messages. It dispatches
 forced IO crossings in the same canonical order as thread mode.
 
 CHI has no wire codec, so codec and thread modes use value transport
-(shared-process message clones). Layouts move home nodes only: CPUs, their
-L1/L2 controllers and sequencers, the MiscNode, DMA requestors and memory
-controllers stay on queue 0, because CPU-side interrupts and timers and the
-device/memory ports do not cross queues yet.
+(shared-process message clones). CPU layouts require ARM partition_timing and
+move whole CPU/private-cache subtrees. Devices, MiscNode, DMA requestors and
+memory controllers remain on queue 0; their crossings use the timed handoffs.
 
 In thread mode a cut buffer holds a message only from its delivery at the
 fence; the staging time before is reported per buffer by ``SPLIT_FS_STAGE``
@@ -64,6 +63,32 @@ LAYOUTS = {
 }
 
 
+# (number of RX cores, expected total cores, number of HNF queues).
+CPU_LAYOUTS = {
+    "cpu4-control-hnf1": (4, 8, 1),
+    "cpu4-control-hnf2": (4, 8, 2),
+    "cpu3-control-hnf1": (3, 4, 1),
+    "cpu3-control-hnf2": (3, 4, 2),
+    "cpu1-control-hnf1": (1, 2, 1),
+}
+
+
+def _cpu_roles(board, layout):
+    workers, total, groups = CPU_LAYOUTS[layout]
+    cores = board.get_processor().get_cores()
+    hierarchy = board.get_cache_hierarchy()
+    if len(cores) != total or len(hierarchy.core_clusters) != total:
+        raise ValueError(f"{layout} requires {total} complete CPU/cache clusters")
+    cpu_roles = {0: workers + 1, **{i: i for i in range(1, workers + 1)}}
+    controllers = []
+    for cpu, role in cpu_roles.items():
+        cluster = hierarchy.core_clusters[cpu]
+        controllers.extend((cache, role) for cache in (cluster.l1i, cluster.l1d, cluster.l2))
+    controllers.extend((hnf, role + workers + 1)
+                       for hnf, role in _hnf_queues(hierarchy, groups))
+    return cpu_roles, controllers
+
+
 def _clock_period(obj):
     """Ticks per cycle of ``obj``'s fixed clock domain."""
     domain = obj.clk_domain
@@ -82,7 +107,7 @@ def _clock_period(obj):
         return int(domain.clock[0].getValue()) * divider
 
 
-def _pinned_objects(board, hierarchy):
+def _pinned_objects(board, hierarchy, cpu_roles):
     """Objects that must stay on queue 0, with the reason."""
     pinned = {}
 
@@ -91,11 +116,13 @@ def _pinned_objects(board, hierarchy):
             pinned[obj.path()] = reason
 
     cpu = "CPU partitions are not supported yet (CPU-side interrupts/timers)"
-    for core in board.get_processor().get_cores():
-        pin(core.get_simobject(), cpu)
-    for cluster in hierarchy.core_clusters:
-        for cache in (cluster.l1i, cluster.l1d, cluster.l2):
-            pin(cache, cpu)
+    for index, core in enumerate(board.get_processor().get_cores()):
+        if index not in cpu_roles:
+            pin(core.get_simobject(), cpu)
+    for index, cluster in enumerate(hierarchy.core_clusters):
+        if index not in cpu_roles:
+            for cache in (cluster.l1i, cluster.l1d, cluster.l2):
+                pin(cache, cpu)
     port = "controllers with device or memory ports cannot move"
     for controller in (
         list(hierarchy.memory_controllers)
@@ -115,6 +142,8 @@ def attach_roles(
     quantum=1000,
     value_transport=True,
     spin_wait=False,
+    fuse_sync=False,
+    mailbox_fence=False,
 ):
     """Partition CHI controllers by an explicit ``(controller, queue)`` map.
 
@@ -135,7 +164,21 @@ def attach_roles(
         raise ValueError("quantum must be a positive number of ticks")
     if getattr(root, "split_hnf", None) is not None:
         raise ValueError("root already has a thread bridge")
+    if fuse_sync and mode != "thread":
+        raise ValueError("fuse_sync requires thread mode")
+    if mailbox_fence and not (mode == "thread" and spin_wait and fuse_sync):
+        raise ValueError("mailbox_fence requires thread, spin_wait and fuse_sync")
     hierarchy = board.get_cache_hierarchy()
+    cpu_roles = {}
+    if layout in CPU_LAYOUTS:
+        if mode not in ("codec", "fenced", "thread"):
+            raise ValueError("CPU layouts require codec, fenced or thread mode")
+        if not bool(getattr(board, "partition_timing", False)):
+            raise ValueError("CPU layouts require ArmSystem.partition_timing=True")
+        cpu_roles, expected = _cpu_roles(board, layout)
+        roles = list(roles)
+        if {(c.path(), q) for c, q in roles} != {(c.path(), q) for c, q in expected}:
+            raise ValueError("Partial CPU/cache ownership is unsupported")
     if hierarchy.get_coherence_protocol() != CoherenceProtocol.CHI or not (
         hasattr(hierarchy, "hnfs") and hasattr(hierarchy, "core_clusters")
     ):
@@ -156,7 +199,7 @@ def attach_roles(
     if sorted(set(role_of.values())) != list(range(1, queue_count)):
         raise ValueError("queues must be numbered 1..N-1 without gaps")
 
-    pinned = _pinned_objects(board, hierarchy)
+    pinned = _pinned_objects(board, hierarchy, cpu_roles)
     managers = {}
 
     def own(tree, role):
@@ -168,6 +211,10 @@ def attach_roles(
             if previous and previous[1] != role:
                 raise ValueError(f"Conflicting ownership: {path}")
             managers[path] = (obj, role)
+
+    for cpu, role in cpu_roles.items():
+        own(board.get_processor().get_cores()[cpu].get_simobject(), role)
+        own(hierarchy.core_clusters[cpu], role)
 
     routers, router_role = [], {}
     for controller, role in controllers:
@@ -188,14 +235,26 @@ def attach_roles(
             )
 
     fixGlobalFrequency()
+    ruby_period = _clock_period(hierarchy.ruby_system) if cpu_roles else None
+    if cpu_roles:
+        wire_latency = int(board.partition_wire_latency.getValue())
+        gic_latency = int(board.realview.gic.int_latency.getValue())
+        if ruby_period != 1000 or quantum > min(ruby_period, wire_latency, gic_latency):
+            raise ValueError("CPU partitions require 1GHz Ruby and quantum <= wire/PIO/GIC lookahead")
     buffers, sources, destinations, links = [], [], [], []
     for index, link in enumerate(network.int_links):
         source = router_role.get(link.src_node.path(), 0)
         destination = router_role.get(link.dst_node.path(), 0)
+        if cpu_roles and destination:
+            # Link buffers are parented under int_links, not their consumers.
+            own(link, destination)
         if source == destination:
             continue
         # The source router's throttle enqueues with the link latency.
-        latency = int(link.latency) * _clock_period(link.src_node)
+        period = _clock_period(link.src_node)
+        if cpu_roles and (period != ruby_period or _clock_period(link.dst_node) != ruby_period):
+            raise ValueError(f"{link.path()}: cut endpoints must use the Ruby clock")
+        latency = int(link.latency) * period
         if quantum > latency:
             raise ValueError(
                 f"quantum {quantum} exceeds the {latency}-tick lookahead of "
@@ -229,6 +288,8 @@ def attach_roles(
         mode=mode,
         quantum=quantum,
         spin_wait=spin_wait,
+        fuse_sync=fuse_sync,
+        mailbox_fence=mailbox_fence,
         queue_count=queue_count,
         managers=[obj for obj, _ in ordered],
         manager_roles=[role for _, role in ordered],
@@ -247,6 +308,10 @@ def attach_roles(
         quantum=quantum,
         value_transport=value_transport,
         spin_wait=spin_wait,
+        cpu_roles=cpu_roles,
+        ruby_period=ruby_period,
+        fuse_sync=fuse_sync,
+        mailbox_fence=mailbox_fence,
         roles={controller.path(): role for controller, role in controllers},
         routers=dict(router_role),
         links=links,
@@ -264,14 +329,16 @@ def attach_chi(
     quantum=1000,
     value_transport=True,
     spin_wait=False,
+    fuse_sync=False,
+    mailbox_fence=False,
 ):
     """Partition the CacheLens CHI hierarchy with a named layout.
 
     hnf1: every HNF and its router on queue 1, the rest on queue 0.
     hnf2: the first half of the HNFs on queue 1, the second half on queue 2.
     """
-    if layout not in LAYOUTS:
-        raise ValueError(f"layout must be one of {', '.join(LAYOUTS)}")
+    if layout not in (*LAYOUTS, *CPU_LAYOUTS):
+        raise ValueError(f"layout must be one of {', '.join((*LAYOUTS, *CPU_LAYOUTS))}")
     hierarchy = board.get_cache_hierarchy()
     if not hasattr(hierarchy, "hnfs"):
         raise ValueError("attach requires the CacheLens CHI hierarchy")
@@ -280,8 +347,10 @@ def attach_chi(
         board,
         mode,
         layout,
-        LAYOUTS[layout](hierarchy),
+        _cpu_roles(board, layout)[1] if layout in CPU_LAYOUTS else LAYOUTS[layout](hierarchy),
         quantum=quantum,
         value_transport=value_transport,
         spin_wait=spin_wait,
+        fuse_sync=fuse_sync,
+        mailbox_fence=mailbox_fence,
     )

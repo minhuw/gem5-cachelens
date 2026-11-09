@@ -223,7 +223,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--mode", choices=("serial", "native", "codec", "fenced", "thread"), required=True
 )
-parser.add_argument("--layout", choices=("hnf1", "hnf2"), default="hnf1")
+parser.add_argument("--layout", choices=("hnf1", "hnf2", "cpu3-control-hnf1", "cpu3-control-hnf2"), default="hnf1")
 parser.add_argument("--cores", type=int, choices=(2, 3, 4), default=4)
 parser.add_argument("--iterations", type=int, default=2000)
 parser.add_argument("--ticks", type=int, default=200_000_000)
@@ -232,6 +232,7 @@ parser.add_argument("--spin-wait", action="store_true")
 parser.add_argument("--image-only", action="store_true")
 parser.add_argument("--exercise-io", action="store_true")
 parser.add_argument("--deactivate-at", type=int, default=0)
+parser.add_argument("--partition-timing", action="store_true")
 args = parser.parse_args()
 
 outdir = Path(m5.options.outdir)
@@ -261,6 +262,7 @@ board = CacheLensArmBoard(
     memory=DualChannelDDR4_2400(size="1GiB"),
     cache_hierarchy=hierarchy,
 )
+board.partition_timing = args.partition_timing
 board._set_fullsystem(True)
 board._bootloader = []
 board._add_pci_device(IdeController(disks=[]))
