@@ -63,29 +63,34 @@ LAYOUTS = {
 }
 
 
-# (number of RX cores, expected total cores, number of HNF queues).
+# (number of RX cores, expected total cores, number of HNF queues, whether
+# CPU0 gets its own queue). Unmoved CPUs and HNFs stay on queue 0.
 CPU_LAYOUTS = {
-    "cpu4-control-hnf1": (4, 8, 1),
-    "cpu4-control-hnf2": (4, 8, 2),
-    "cpu3-control-hnf1": (3, 4, 1),
-    "cpu3-control-hnf2": (3, 4, 2),
-    "cpu1-control-hnf1": (1, 2, 1),
+    "cpu4": (4, 8, 0, False),
+    "cpu4-control-hnf1": (4, 8, 1, True),
+    "cpu4-control-hnf2": (4, 8, 2, True),
+    "cpu3-control-hnf1": (3, 4, 1, True),
+    "cpu3-control-hnf2": (3, 4, 2, True),
+    "cpu1-control-hnf1": (1, 2, 1, True),
 }
 
 
 def _cpu_roles(board, layout):
-    workers, total, groups = CPU_LAYOUTS[layout]
+    workers, total, groups, control = CPU_LAYOUTS[layout]
     cores = board.get_processor().get_cores()
     hierarchy = board.get_cache_hierarchy()
     if len(cores) != total or len(hierarchy.core_clusters) != total:
         raise ValueError(f"{layout} requires {total} complete CPU/cache clusters")
-    cpu_roles = {0: workers + 1, **{i: i for i in range(1, workers + 1)}}
+    cpu_roles = {i: i for i in range(1, workers + 1)}
+    if control:
+        cpu_roles[0] = workers + 1
     controllers = []
     for cpu, role in cpu_roles.items():
         cluster = hierarchy.core_clusters[cpu]
         controllers.extend((cache, role) for cache in (cluster.l1i, cluster.l1d, cluster.l2))
-    controllers.extend((hnf, role + workers + 1)
-                       for hnf, role in _hnf_queues(hierarchy, groups))
+    if groups:
+        controllers.extend((hnf, role + max(cpu_roles.values()))
+                           for hnf, role in _hnf_queues(hierarchy, groups))
     return cpu_roles, controllers
 
 
@@ -115,7 +120,7 @@ def _pinned_objects(board, hierarchy, cpu_roles):
         for obj in tree.descendants():
             pinned[obj.path()] = reason
 
-    cpu = "CPU partitions are not supported yet (CPU-side interrupts/timers)"
+    cpu = "CPUs and private caches outside the layout stay on queue 0"
     for index, core in enumerate(board.get_processor().get_cores()):
         if index not in cpu_roles:
             pin(core.get_simobject(), cpu)
