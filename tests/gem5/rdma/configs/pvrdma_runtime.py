@@ -25,6 +25,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--mode",
     choices=(
+        "public-pair",
+        "timing-public-pair",
         "timing-mr",
         "timing-queues",
         "timing-observation",
@@ -129,7 +131,8 @@ system.rdma = Pvrdma(
     transport_window_segments=args.transport_window_segments,
 )
 if (
-    args.mode.endswith("transport-pair")
+    args.mode.endswith("public-pair")
+    or args.mode.endswith("transport-pair")
     or args.mode.endswith("semantic-pair")
     or args.mode
     in (
@@ -196,7 +199,7 @@ system.memory.port = system.bus.mem_side_ports
 system.tester.port = system.bus.cpu_side_ports
 system.pci_host.pio = system.bus.mem_side_ports
 system.rdma.pio = system.bus.mem_side_ports
-if args.mode == "request-observation-pair":
+if args.mode in ("request-observation-pair", "public-pair", "timing-public-pair"):
     system.rdma_dma_monitor = CommMonitor()
     system.peer_rdma_dma_monitor = CommMonitor()
     system.rdma.dma = system.rdma_dma_monitor.cpu_side_port
@@ -216,7 +219,10 @@ m5.instantiate(
 )
 exit_event = m5.simulate()
 
-if args.mode in ("transport-pair", "timing-transport-pair"):
+if args.mode in ("public-pair", "timing-public-pair"):
+    assert exit_event.getCause() == "PVRDMA public pair test passed"
+    print("PVRDMA_PUBLIC_PAIR_OK device_functional_only=1")
+elif args.mode in ("transport-pair", "timing-transport-pair"):
     assert exit_event.getCause() == "PVRDMA transport pair test passed"
     print("PVRDMA_TRANSPORT_PAIR_OK")
 elif args.mode in ("semantic-pair", "timing-semantic-pair"):

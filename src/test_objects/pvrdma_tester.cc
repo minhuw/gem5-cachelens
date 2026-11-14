@@ -211,7 +211,8 @@ PvrdmaTester::getPort(const std::string &if_name, PortID idx)
 void
 PvrdmaTester::regProbeListeners()
 {
-    if (testMode != "request-observation-pair")
+    if (testMode != "request-observation-pair" &&
+        testMode != "public-pair" && testMode != "timing-public-pair")
         return;
 
     auto *sender = SimObject::find("system.rdma_dma_monitor");
@@ -265,7 +266,8 @@ PvrdmaTester::startup()
         testMode == "timing-reliability-commit-pair" ||
         testMode == "timing-reliability-commit-boundary-pair" ||
         testMode.find("transport-review-") != std::string::npos;
-    if (testMode == "transport-pair" ||
+    if (testMode == "public-pair" || testMode == "timing-public-pair" ||
+        testMode == "transport-pair" ||
         testMode == "timing-transport-pair" ||
         testMode == "semantic-pair" ||
         testMode == "timing-semantic-pair" ||
@@ -303,6 +305,7 @@ template <typename T>
 void
 PvrdmaTester::write(Addr addr, const T &value, Request::Flags flags)
 {
+    checkPublicPayloadAccess(addr, sizeof(T));
     auto request = std::make_shared<Request>(addr, sizeof(T), flags,
                                              requestorId);
     Packet packet(request, MemCmd::WriteReq);
@@ -317,6 +320,7 @@ template <typename T>
 T
 PvrdmaTester::read(Addr addr, Request::Flags flags)
 {
+    checkPublicPayloadAccess(addr, sizeof(T));
     auto request = std::make_shared<Request>(addr, sizeof(T), flags,
                                              requestorId);
     Packet packet(request, MemCmd::ReadReq);
@@ -2018,6 +2022,304 @@ PvrdmaTester::testCheckpointObservationRestore()
 }
 
 void
+PvrdmaTester::checkPublicPayloadAccess(Addr addr, size_t size) const
+{
+    if ((testMode == "public-pair" || testMode == "timing-public-pair") &&
+        publicStage >= 11 && publicStage <= 13) {
+        const Addr payload = MrLeafAddress + 0x1000000;
+        panic_if(addr < payload + pvrdma::PageSize && addr + size > payload,
+                 "Public pair tester touched receiver payload during transfer");
+    }
+}
+
+// Public PCI/DSR/WQE path only: no access to a Pvrdma object's state.
+// This is a device functional proof; no Linux guest or CPU is simulated.
+void
+PvrdmaTester::runPublicPair()
+{
+    constexpr Addr PeerOffset = 0x1000000;
+    constexpr uint32_t Length = 1537;
+    constexpr unsigned Rounds = 18; // Wrap both ring slot and phase bits.
+    const Addr offset = publicEndpoint ? PeerOffset : 0;
+    const Addr bar = publicEndpoint ? PeerRegisterBarAddress :
+                                     RegisterBarAddress;
+    const Addr uar = publicEndpoint ? PeerUarBarAddress : UarBarAddress;
+    const auto gid = [](unsigned endpoint) {
+        pvrdma::rocev2::Gid result{};
+        result[0] = 0xfd;
+        result[15] = endpoint + 1;
+        return result;
+    };
+    const auto later = [this] {
+        schedule(testEvent, curTick() + microseconds(100));
+    };
+    if (publicStage < 11) {
+        panic_if(publicStage && letoh(read<uint32_t>(
+                     bar + pvrdma::RegError, MmioFlags)),
+                 "Public pair endpoint %u stage %u device error",
+                 publicEndpoint, publicStage);
+        if (publicAwaitResponse) {
+            const auto response = read<pvrdma::CommandResponse>(
+                ResponseAddress + offset);
+            panic_if(response.header.error ||
+                         letoh(response.header.response) != publicStage ||
+                         letoh(response.header.acknowledgement) !=
+                             pvrdma::responseCommand(publicCommand),
+                     "Public pair endpoint %u command %u failed at stage %u",
+                     publicEndpoint, static_cast<unsigned>(publicCommand),
+                     publicStage);
+            // Each endpoint is a fresh device; public handles/keys are 1.
+            if (publicCommand == pvrdma::Command::CreateQp)
+                panic_if(letoh(response.createQpV2.qpn) != 1 ||
+                             letoh(response.createQpV2.qpHandle) != 1,
+                         "Public pair unexpected QPN/handle");
+            if (publicCommand == pvrdma::Command::CreateMr)
+                panic_if(letoh(response.createMr.lkey) != 1,
+                         "Public pair unexpected lkey");
+            publicAwaitResponse = false;
+        }
+        pvrdma::CommandRequest request{};
+        switch (publicStage) {
+          case 0: {
+            const Addr config = publicEndpoint ? PeerPciConfigAddress :
+                                                PciConfigAddress;
+            write(config + PCI0_BASE_ADDR0, htole(static_cast<uint32_t>(
+                publicEndpoint ? PeerMsixBarAddress : MsixBarAddress)),
+                MmioFlags);
+            write(config + PCI0_BASE_ADDR1,
+                  htole(static_cast<uint32_t>(bar)), MmioFlags);
+            write(config + PCI0_BASE_ADDR2,
+                  htole(static_cast<uint32_t>(uar)), MmioFlags);
+            write(config + PCI_COMMAND,
+                  htole(static_cast<uint16_t>(PCI_CMD_MSE | PCI_CMD_BME)),
+                  MmioFlags);
+            pvrdma::DeviceSharedRegion dsr{};
+            dsr.driverVersion = htole(pvrdma::Version);
+            dsr.commandSlotDma = htole(uint64_t{CommandAddress + offset});
+            dsr.responseSlotDma = htole(uint64_t{ResponseAddress + offset});
+            dsr.asyncRingPages.numPages = htole(pvrdma::NumRingPages);
+            dsr.asyncRingPages.pageDirectoryDma = htole(uint64_t{0x4000 + offset});
+            dsr.completionRingPages.numPages = htole(pvrdma::NumRingPages);
+            dsr.completionRingPages.pageDirectoryDma = htole(uint64_t{0x5000 + offset});
+            write(DsrAddress + offset, dsr);
+            write(bar + pvrdma::RegDsrLow,
+                  htole(static_cast<uint32_t>(DsrAddress + offset)), MmioFlags);
+            write(bar + pvrdma::RegDsrHigh, uint32_t{0}, MmioFlags);
+            ++publicStage;
+            later();
+            return;
+          }
+          case 1:
+            write(bar + pvrdma::RegControl,
+                  htole(static_cast<uint32_t>(pvrdma::DeviceControl::Activate)),
+                  MmioFlags);
+            publicCommand = pvrdma::Command::CreateUc;
+            request.createUc.pfn64 = htole(uint64_t{uar / pvrdma::UarPageSize + 1});
+            break;
+          case 2:
+            publicCommand = pvrdma::Command::CreatePd;
+            request.createPd.contextHandle = htole(uint32_t{1});
+            break;
+          case 3:
+            prepareQueuePages(CqDirectoryAddress + offset,
+                              CqTableAddress + offset, CqLeafAddress + offset, 2);
+            publicCommand = pvrdma::Command::CreateCq;
+            request.createCq.pageDirectoryDma = htole(uint64_t{CqDirectoryAddress + offset});
+            request.createCq.contextHandle = htole(uint32_t{1});
+            request.createCq.cqe = htole(uint32_t{8});
+            request.createCq.numChunks = htole(uint32_t{2});
+            break;
+          case 4:
+            prepareQueuePages(QpDirectoryAddress + offset,
+                              QpTableAddress + offset, QpLeafAddress + offset, 3);
+            publicCommand = pvrdma::Command::CreateQp;
+            request.createQp.pageDirectoryDma = htole(uint64_t{QpDirectoryAddress + offset});
+            request.createQp.pdHandle = htole(uint32_t{1});
+            request.createQp.sendCqHandle = request.createQp.recvCqHandle = htole(uint32_t{1});
+            request.createQp.maxSendWr = request.createQp.maxRecvWr = htole(uint32_t{8});
+            request.createQp.maxSendSge = request.createQp.maxRecvSge = htole(uint32_t{1});
+            request.createQp.accessFlags = htole(pvrdma::AccessLocalWrite);
+            request.createQp.totalChunks = htole(uint16_t{3});
+            request.createQp.sendChunks = htole(uint16_t{1});
+            request.createQp.qpType = static_cast<uint8_t>(pvrdma::QpType::Rc);
+            break;
+          case 5:
+            prepareQueuePages(MrDirectoryAddress + offset,
+                              MrTableAddress + offset, MrLeafAddress + offset, 1);
+            publicCommand = pvrdma::Command::CreateMr;
+            request.createMr.start = htole(uint64_t{MrLeafAddress + offset});
+            request.createMr.length = htole(uint64_t{pvrdma::PageSize});
+            request.createMr.pageDirectoryDma = htole(uint64_t{MrDirectoryAddress + offset});
+            request.createMr.pdHandle = htole(uint32_t{1});
+            request.createMr.accessFlags = htole(pvrdma::AccessLocalWrite);
+            request.createMr.numChunks = htole(uint32_t{1});
+            break;
+          case 6: {
+            publicCommand = pvrdma::Command::CreateBind;
+            request.createBind.mtu = htole(pvrdma::FixedMtu);
+            request.createBind.gidType = pvrdma::GidTypeRoceV2;
+            const auto local = gid(publicEndpoint);
+            std::copy(local.begin(), local.end(), request.createBind.newGid);
+            break;
+          }
+          case 7:
+          case 8:
+          case 9: {
+            publicCommand = pvrdma::Command::ModifyQp;
+            request.modifyQp.qpHandle = htole(uint32_t{1});
+            auto &attrs = request.modifyQp.attributes;
+            uint32_t mask = pvrdma::QpAttrState;
+            if (publicStage == 7) {
+                attrs.qpState = pvrdma::QpState::Init;
+                attrs.qpAccessFlags = htole(pvrdma::AccessLocalWrite);
+                attrs.portNumber = 1;
+                mask |= pvrdma::QpAttrAccessFlags | pvrdma::QpAttrPkeyIndex |
+                        pvrdma::QpAttrPort;
+            } else if (publicStage == 8) {
+                attrs.qpState = pvrdma::QpState::ReadyToReceive;
+                attrs.pathMtu = pvrdma::Mtu::Mtu1024;
+                attrs.destinationQpNumber = htole(uint32_t{1});
+                attrs.receivePsn = htole(uint32_t{publicEndpoint ? 0x100U : 0x200U});
+                attrs.maxDestinationReadAtomic = 1;
+                attrs.minRnrTimer = 12;
+                attrs.addressHandle.portNumber = 1;
+                attrs.addressHandle.globalRoute.hopLimit = TestHopLimit;
+                const auto remote = gid(1 - publicEndpoint);
+                std::copy(remote.begin(), remote.end(),
+                          attrs.addressHandle.globalRoute.destinationGid.raw);
+                attrs.addressHandle.destinationMac[0] = 2;
+                attrs.addressHandle.destinationMac[5] = publicEndpoint ? 1 : 2;
+                mask |= pvrdma::QpAttrAddressVector | pvrdma::QpAttrPathMtu |
+                        pvrdma::QpAttrReceivePsn | pvrdma::QpAttrMaxDestReadAtomic |
+                        pvrdma::QpAttrMinRnrTimer | pvrdma::QpAttrDestinationQpn;
+            } else {
+                attrs.qpState = pvrdma::QpState::ReadyToSend;
+                attrs.timeout = 14;
+                attrs.retryCount = 6;
+                attrs.rnrRetry = 7;
+                attrs.sendPsn = htole(uint32_t{publicEndpoint ? 0x200U : 0x100U});
+                attrs.maxReadAtomic = 1;
+                mask |= pvrdma::QpAttrTimeout | pvrdma::QpAttrRetryCount |
+                        pvrdma::QpAttrRnrRetry | pvrdma::QpAttrSendPsn |
+                        pvrdma::QpAttrMaxQpReadAtomic;
+            }
+            attrs.qpState = static_cast<pvrdma::QpState>(htole(static_cast<uint32_t>(attrs.qpState)));
+            attrs.pathMtu = static_cast<pvrdma::Mtu>(htole(static_cast<uint32_t>(attrs.pathMtu)));
+            request.modifyQp.attributeMask = htole(mask);
+            break;
+          }
+          case 10:
+            if (!publicEndpoint) {
+                publicEndpoint = 1;
+                publicStage = 0;
+            } else {
+                // Payload initialization ends before the no-touch interval.
+                std::array<uint8_t, Length> payload{};
+                for (size_t i = 0; i < payload.size(); ++i)
+                    payload[i] = i ^ 0x5a;
+                write(MrLeafAddress, payload);
+                write(MrLeafAddress + PeerOffset, std::array<uint8_t, Length>{});
+                publicStage = 11;
+            }
+            later();
+            return;
+        }
+        request.header.command = htole(static_cast<uint32_t>(publicCommand));
+        request.header.response = htole(uint64_t{publicStage + 1});
+        write(CommandAddress + offset, request);
+        write(ResponseAddress + offset, pvrdma::CommandResponse{});
+        write(bar + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+        publicAwaitResponse = publicCommand != pvrdma::Command::CreateBind;
+        ++publicStage;
+        later();
+        return;
+    }
+    if (publicStage == 11) {
+        const uint32_t slot = publicRound & 7;
+        pvrdma::ReceiveWqeHeader receive{};
+        // Slot zero is reused every round; cookie is a local generation.
+        receive.workRequestId = htole(uint64_t{0x90000000 + publicRound});
+        receive.numSge = htole(uint32_t{1});
+        pvrdma::Sge receive_sge{htole(uint64_t{MrLeafAddress + PeerOffset}),
+                               htole(Length), htole(uint32_t{1})};
+        std::array<uint8_t, pvrdma::RqStride> rq{};
+        std::memcpy(rq.data(), &receive, sizeof(receive));
+        std::memcpy(rq.data() + sizeof(receive), &receive_sge, sizeof(receive_sge));
+        write(QpLeafAddress + PeerOffset + 2 * pvrdma::PageSize + slot * pvrdma::RqStride, rq);
+        write(QpLeafAddress + PeerOffset + offsetof(pvrdma::RingState, rx) +
+                  offsetof(pvrdma::Ring, producerTail), htole((publicRound + 1) & 15));
+        write(PeerUarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::RqDoorbellAction | 1), MmioFlags);
+        publicStage = 12;
+        later();
+        return;
+    }
+    if (publicStage == 12) {
+        pvrdma::SendWqeHeader send{};
+        send.workRequestId = htole(uint64_t{0x10000000 + publicRound});
+        send.numSge = htole(uint32_t{1});
+        send.opcode = htole(static_cast<uint32_t>(pvrdma::WorkRequestOpcode::Send));
+        send.sendFlags = htole(pvrdma::SendSignaled);
+        pvrdma::Sge sge{htole(uint64_t{MrLeafAddress}), htole(Length), htole(uint32_t{1})};
+        std::array<uint8_t, pvrdma::SqStride> sq{};
+        std::memcpy(sq.data(), &send, sizeof(send));
+        std::memcpy(sq.data() + sizeof(send), &sge, sizeof(sge));
+        write(QpLeafAddress + pvrdma::PageSize + (publicRound & 7) * pvrdma::SqStride, sq);
+        write(QpLeafAddress + offsetof(pvrdma::RingState, tx) +
+                  offsetof(pvrdma::Ring, producerTail), htole((publicRound + 1) & 15));
+        write(UarBarAddress + pvrdma::UarPageSize,
+              htole(pvrdma::SqDoorbellAction | 1), MmioFlags);
+        busyPolls = 0;
+        publicStage = 13;
+        later();
+        return;
+    }
+    if (publicStage == 13) {
+        const uint32_t expected = (publicRound + 1) & 15;
+        for (unsigned endpoint = 0; endpoint < 2; ++endpoint) {
+            const Addr base = endpoint ? PeerOffset : 0;
+            const auto cq = read<pvrdma::Ring>(CqLeafAddress + base + offsetof(pvrdma::RingState, rx));
+            if (letoh(cq.producerTail) != expected) {
+                panic_if(++busyPolls > 1000, "Public pair completion timeout round %u", publicRound);
+                later();
+                return;
+            }
+            const auto cqe = read<pvrdma::CompletionQueueElement>(
+                CqLeafAddress + base + pvrdma::PageSize + (publicRound & 7) * pvrdma::CqeSize);
+            panic_if(letoh(cqe.workRequestId) != (endpoint ? 0x90000000U : 0x10000000U) + publicRound ||
+                         letoh(cqe.status) ||
+                         letoh(cqe.opcode) != (endpoint ? 128 : 0) ||
+                         (endpoint && (letoh(cqe.byteLength) != Length || letoh(cqe.sourceQp) != 1)),
+                     "Public pair CQE mismatch endpoint %u round %u", endpoint, publicRound);
+        }
+        // Reclaim metadata only. No receiver CPU payload access or validation DMA.
+        for (unsigned endpoint = 0; endpoint < 2; ++endpoint) {
+            const Addr base = endpoint ? PeerOffset : 0;
+            write(CqLeafAddress + base + offsetof(pvrdma::RingState, rx) +
+                      offsetof(pvrdma::Ring, consumerHead), htole(expected));
+            write((endpoint ? PeerUarBarAddress : UarBarAddress) + pvrdma::UarPageSize + pvrdma::CqDoorbellOffset,
+                  htole(pvrdma::CqPollAction | 1), MmioFlags);
+        }
+        publicStage = ++publicRound == Rounds ? 14 : 11;
+        later();
+        return;
+    }
+    // Both endpoints completed and CQ reclaim has quiesced before payload verification.
+    const auto payload = read<std::array<uint8_t, Length>>(MrLeafAddress + PeerOffset);
+    for (size_t i = 0; i < payload.size(); ++i)
+        panic_if(payload[i] != static_cast<uint8_t>(i ^ 0x5a),
+                 "Public pair quiescent payload mismatch at %u", i);
+    panic_if(publicPayloadBytes != Rounds * Length,
+             "Public pair payload DMA bytes mismatch: %llu", publicPayloadBytes);
+    inform("PVRDMA_PUBLIC_PAIR rounds=%u recv_cqes=%u send_cqes=%u "
+           "payload_dma_bytes=%llu receiver_payload_dma_reads=0 "
+           "tester_payload_accesses_during_transfer=0 buffer_reuse=1 "
+           "public_commands_only=1 device_functional_only=1", Rounds, Rounds,
+           Rounds, publicPayloadBytes);
+    exitSimLoop("PVRDMA public pair test passed");
+}
+
+void
 PvrdmaTester::setupPairEndpoint(
     Pvrdma &device, Addr qp_page, Addr cq_page, Addr mr_page,
     const pvrdma::rocev2::MacAddress &remote_mac,
@@ -2404,6 +2706,19 @@ void
 PvrdmaTester::observeDmaRequest(
     const probing::PacketInfo &packet, bool receiver)
 {
+    if (testMode == "public-pair" || testMode == "timing-public-pair") {
+        const Addr base = MrLeafAddress + (receiver ? 0x1000000 : 0);
+        if (packet.addr >= base && packet.addr < base + pvrdma::PageSize) {
+            panic_if(packet.addr + packet.size > base + pvrdma::PageSize ||
+                         packet.flags ||
+                         packet.cmd != (receiver ? MemCmd::WriteReq :
+                                                   MemCmd::ReadReq),
+                     "Public pair payload DMA classification mismatch");
+            if (receiver)
+                publicPayloadBytes += packet.size;
+        }
+        return;
+    }
     const auto inRange = [&packet](Addr base, Addr size) {
         return packet.addr >= base &&
             packet.addr + packet.size <= base + size;
@@ -6021,6 +6336,10 @@ PvrdmaTester::runFaultLink()
 void
 PvrdmaTester::run()
 {
+    if (testMode == "public-pair" || testMode == "timing-public-pair") {
+        runPublicPair();
+        return;
+    }
     if (testMode == "fault-link" || testMode == "timing-fault-link") {
         runFaultLink();
         return;

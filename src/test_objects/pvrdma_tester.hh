@@ -264,6 +264,14 @@ class PvrdmaTester : public Platform
                            Addr mr_page,
                            const pvrdma::rocev2::MacAddress &remote_mac,
                            uint32_t send_psn, uint32_t receive_psn);
+    void runPublicPair();
+    void checkPublicPayloadAccess(Addr addr, size_t size) const;
+    unsigned publicStage = 0;
+    unsigned publicEndpoint = 0;
+    unsigned publicRound = 0;
+    uint64_t publicPayloadBytes = 0;
+    bool publicAwaitResponse = false;
+    pvrdma::Command publicCommand{};
     void setupPair();
     void setupReliabilityPair();
     bool sendAwaitingAck(uint16_t acknowledged, uint16_t segments,

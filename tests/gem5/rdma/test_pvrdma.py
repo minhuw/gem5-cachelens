@@ -28,6 +28,8 @@ for name, args, marker in (
 
 
 for name, mode, marker in (
+    ("public-pair", "public-pair", "PVRDMA_PUBLIC_PAIR_OK"),
+    ("timing-public-pair", "timing-public-pair", "PVRDMA_PUBLIC_PAIR_OK"),
     ("transport-pair", "transport-pair", "PVRDMA_TRANSPORT_PAIR_OK"),
     (
         "transport-pair-timing",
