@@ -142,9 +142,9 @@ Adapter::handleInMsg(volatile union SimbricksProtoNetMsg *msg)
     ethernetStats.incomingBytes += len;
     if (rxPending.size() == rxBufferPackets) {
         ethernetStats.overflowPackets++;
-        fatal("SimBricks Ethernet receive FIFO full: %zu pending packets, "
+        fatal("SimBricks Ethernet receive FIFO full: %u pending packets, "
               "rx_buffer_packets=%u; cannot suspend SimBricks input",
-              rxPending.size(), rxBufferPackets);
+              static_cast<unsigned>(rxPending.size()), rxBufferPackets);
     }
 
     EthPacketPtr packet = std::make_shared<EthPacketData>(len);
