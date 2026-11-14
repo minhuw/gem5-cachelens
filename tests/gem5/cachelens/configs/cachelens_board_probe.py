@@ -141,6 +141,7 @@ assert [int(loadgen.loadgen_id) for loadgen in board.loadgens] == list(
 )
 
 if isa == ISA.X86:
+    assert not board.pc.pci_host.aggregate_intx
     assert len(board.rdmas) == int(args.enable_pvrdma)
     assert len(board.get_dma_ports()) == 1 + args.num_nics + len(board.rdmas)
     assert board.get_dma_ports()[0] is board.pc.south_bridge.ide.dma

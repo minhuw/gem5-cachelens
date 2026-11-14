@@ -257,6 +257,22 @@ GenericPciHost::intxSource(const PciBusAddr &addr, PciIntPin pin)
 }
 
 void
+GenericPciHost::startup()
+{
+    PciHost::startup();
+    // Device config (including guest-written InterruptLine) is restored
+    // independently. Validate routes only after every object was restored.
+    for (const auto &entry : intxSources) {
+        const auto source = entry.first;
+        const PciBusAddr addr((source >> 16) & 0xff,
+                             (source >> 8) & 0x1f, (source >> 3) & 7);
+        fatal_if(mapPciInterrupt(addr, static_cast<PciIntPin>(source & 7)) !=
+                     entry.second,
+                 "PCI INTx checkpoint route differs from restored device");
+    }
+}
+
+void
 GenericPciHost::serialize(CheckpointOut &cp) const
 {
     PciHost::serialize(cp);
@@ -294,7 +310,6 @@ GenericPciHost::unserialize(CheckpointIn &cp)
                              (source >> 8) & 0x1f, (source >> 3) & 7);
         fatal_if(!getDevice(addr) || pin == PciIntPin::NO_INT ||
                      (source & 7) > 4 || intxSource(addr, pin) != source ||
-                     mapPciInterrupt(addr, pin) != lines[i] ||
                      !intxSources.emplace(source, lines[i]).second,
                  "Invalid PCI INTx checkpoint source");
     }

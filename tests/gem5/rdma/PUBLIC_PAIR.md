@@ -96,37 +96,11 @@ uses that requestor, including control/ring metadata: eligibility is not a
 payload-byte counter. The public test uses SystemXBar/SimpleMemory and does not
 claim a CacheLens cache geometry or DDIO measurement.
 
-## ARM attachment remains blocked
+## ARM attachment follow-up
 
-Keep the current ARM CLI guard. Merely removing it would not produce a valid
-paired device:
-
-1. `ArmBoard._add_pci_device`/`RealView.attachPciDevice` assign each device a
-   new slot at function 0. PVRDMA needs explicit same-slot function 1 ownership,
-   multifunction bit on the E1000, a BAR-capable host, and a distinct coherent
-   DMA requestor in both ordinary and eligible network port lists.
-2. VExpress's `ARM_PCI_INT_DEV` maps both functions of slot 2 to SPI 102.
-   `GenericPciHost::postInt/clearInt` directly post/clear the mapped line,
-   and `RealView::clearPciInt` clears the GIC input unconditionally. Concurrent
-   companion/PVRDMA interrupts can deassert each other's line. A tested
-   per-source level aggregation or a consistent per-function host/DT interrupt
-   route is required before lifting the guard. Linux allows shared INTx, but
-   that cannot repair lost simulated line state.
-3. Build ARM guest INFINIBAND/USER_VERBS/VMWARE_PVRDMA and the E1000 companion
-   patch/provider; verify the actual ARM kernel configuration, coherent PCI
-   device-tree node and little-endian ABI. The inspected rdma-core 60.0 provider
-   CMakeLists has no ISA gate, but `pvrdma_ring.h` explicitly assumes x86-only
-   atomic ordinary 32-bit accesses. `qp.c:614–635` posts RQ WQE/SGE, advances
-   producer and writes the doorbell without either `udma_to_device_barrier`
-   used by SEND (`qp.c:539,551`). `pvrdma.h:231–239` uses plain nonvolatile
-   little-endian pointer stores for UAR MMIO. Guest-owned changes must add
-   WQE→producer and producer→doorbell ordering for receive plus a suitable
-   ordered MMIO accessor and review shared-ring access semantics on ARM.
-   CQ acquisition already calls `udma_from_device_barrier` (`cq.c:112`);
-   udma_barrier.h supplies ARM `dmb oshst`/`dmb oshld`. No ARM image or guest
-   validation is supplied by this device proof.
-
-The next bounded native slice should add/test shared INTx aggregation plus
-explicit ARM multifunction attachment, then coordinate a two-guest x86 run
-only after the live DPDK smoke is safe. Parent source pins and frozen artifacts
-must be updated to a new committed native hash only during that integration.
+The next native slice adds opt-in ARM same-slot function1 attachment and
+shared INTx aggregation, preserving default x86 and PVRDMA-disabled routing.
+See `ARM_PLATFORM.md` for its focused configuration/host proof boundary and
+`GUEST_ARM_HANDOFF.md` for exact kernel/provider prerequisites. Native source
+attachment support does not supply an ARM RDMA kernel, provider ordering fix,
+normal network setup, or Linux driver/GIC runtime proof.

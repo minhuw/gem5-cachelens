@@ -154,3 +154,51 @@ standalone provider create_ah resolution generally. Normal IPv4 TCP control
 setup remains separate. The packaging manifest still truthfully records ARM
 `kernel_missing=true`, `runtime_ready=false`; native source enablement does
 not change those guest artifact claims or supply a replacement kernel.
+
+## Can i40e function0 replace the E1000 companion?
+
+Checked the ACTUAL PATCHED Linux tree (not just upstream):
+`/home/minhuw/cachelens/.pi/workspaces/ddio-linux-image-impl/repo/.pi/workspaces/linux-x86-build-v2/kernel-source/linux-6.18.2`,
+including its vmw_pvrdma Kconfig and main source, against the maintained 0003
+patch. Patched `pvrdma_is_supported_netdev` is at 768–774; probe same-slot
+lookup/identity/assignment is at 953–976, and notifier comparison at 707–716.
+Read-only source snapshots/hashes are preserved with this slice's artifacts.
+
+Not with the current guest driver contract. This is a concrete ABI mismatch,
+not a native RDMA payload dependency:
+
+* Inspected Linux 6.18.2 `drivers/net/ethernet/intel/e1000/e1000_main.c:958`
+  sets `pci_set_drvdata(pdev, netdev)`. This matches PVRDMA's cast/assignment.
+* `drivers/net/ethernet/intel/i40e/i40e_main.c::i40e_probe`, line 15783, sets
+  `pci_set_drvdata(pdev, pf)` with a `struct i40e_pf *`; its remove path at
+  16137 reads that PF back. The net_device is owned by a VSI
+  (`pf->vsi[pf->lan_vsi]->netdev` / main-VSI helper), not the PCI drvdata.
+* patched `pvrdma_main.c::pvrdma_pci_probe` at 953–976 gets same-slot function0,
+  checks accepted device identity, then assigns `pci_get_drvdata(pdev_net)`
+  DIRECTLY to `dev->netdev` and calls `dev_hold`. Merely adding i40e's PCI ID
+  would misinterpret a PF pointer as a net_device. That is invalid.
+* Its `pvrdma_netdevice_event_handle` NETDEV_REGISTER path at 707–716 also
+  compares `pci_get_drvdata(pdev_net) == ndev`; i40e can never satisfy that
+  comparison. Both initial association and re-registration need a guest fix.
+
+A possible guest-owned extension is a reference-safe generic netdev lookup by
+PCI device parent for this same-slot function0 (select the physical main
+interface, exclude representors/VFs, handle probe order, unregister, and device
+removal), and the same association rule in the netdevice notifier. An i40e-
+specific PF/VSI accessor would instead introduce a private-driver dependency.
+Do not pass the PF pointer through or call it a compatible netdev ABI. Update
+accepted identity/Kconfig only together with this association change.
+
+The native `Pvrdma` transport does not inspect a companion PciDevice or require
+IGbE. It gets its MAC through its own registers/parameter and accepts Ethernet
+frames on its own EtherInt. Current `network.py` constructs IGbE_e1000 and
+`board.py` attaches it as same-slot function0 with multifunction bit; this is
+the tested native fixture and matches the existing guest patch. Changing to an
+i40e companion additionally needs an explicit native i40e/function0 attachment,
+multifunction advertisement, independent coherent DMA requestors, correct
+shared IRQ routing, and correct actual MAC/register-byte policy (do NOT carry
+over `companion_mac_word_swap=True` blindly). Its normal netdev supplies GID,
+neighbor and IPv4 control setup only; PVRDMA payload still uses its separate
+native EtherInt. Such a replacement is possible in principle after those
+changes, but is neither implemented nor proven by this slice. Existing
+DPDK/Linux i40e sources and live fixtures remain unchanged.

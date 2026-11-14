@@ -22,6 +22,9 @@ for name, options, success, marker in (
      "PVRDMA_PCI_SHARED_INTX_SAVED"),
     ("restore", ["--phase", "restore", "--checkpoint", str(checkpoint)], True,
      "PVRDMA_PCI_SHARED_INTX_PASSED"),
+    ("reject-mode-change", ["--phase", "restore", "--checkpoint", str(checkpoint),
+                            "--no-aggregate"], False,
+     "PCI INTx aggregation mode differs from checkpoint"),
 ):
     command = [str(args.gem5), "-d", str(args.outdir / name), str(config),
                "--host", args.host, *options]

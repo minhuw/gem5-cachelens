@@ -285,6 +285,7 @@ class GenericPciHost : public PciHost
 
     AddrRangeList getAddrRanges() const override;
 
+    void startup() override;
     void serialize(CheckpointOut &cp) const override;
     void unserialize(CheckpointIn &cp) override;
 
