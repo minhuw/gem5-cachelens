@@ -57,6 +57,7 @@ class EtherDump : public SimObject
     typedef EtherDumpParams Params;
     EtherDump(const Params &p);
 
+    unsigned maxLength() const { return maxlen; }
     inline void dump(EthPacketPtr &pkt) { dumpPacket(pkt); }
 };
 

@@ -12,6 +12,7 @@
 
 namespace gem5 {
 
+class EtherDump;
 class LoadGenPcapInt;
 
 class LoadGeneratorPcap : public SimObject {
@@ -31,6 +32,7 @@ class LoadGeneratorPcap : public SimObject {
   // General configs.
   StackMode stackMode;
   LoadGenPcapInt *interface;
+  EtherDump *const returnDump;
   const Tick startTick;
   const Tick stopTick;
   const bool deferredStart;

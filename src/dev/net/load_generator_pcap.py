@@ -16,6 +16,11 @@ class LoadGeneratorPcap(SimObject):
     deferred_start = Param.Bool(False, "Wait for startReplay; checkpoints only before first start")
 
     interface = EtherInt("interface")
+    return_dump = Param.EtherDump(
+        NULL,
+        "Optional NIC-to-peer capture before response filters; set EtherDump "
+        "maxlen to cover full received frames (including any supplied FCS)",
+    )
     loadgen_id = Param.UInt8(0, "For match NIC")
     start_tick = Param.Tick(1, "Tick at which to start loadgenerator")
     stop_tick = Param.Tick(1, "Tick at which to stop loadgenerator")

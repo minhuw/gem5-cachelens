@@ -18,6 +18,7 @@
 
 #include "base/trace.hh"
 #include "debug/LoadgenDebug.hh"
+#include "dev/net/etherdump.hh"
 #include "dev/net/load_generator_mac.hh"
 #include "sim/core.hh"
 #include "sim/sim_exit.hh"
@@ -79,6 +80,7 @@ LoadGeneratorPcap::LoadGeneratorPcapStats::LoadGeneratorPcapStats(
 LoadGeneratorPcap::LoadGeneratorPcap(const LoadGeneratorPcapParams &p)
     : SimObject(p),
       loadgenId(p.loadgen_id),
+      returnDump(p.return_dump),
       startTick(p.start_tick),
       stopTick(p.stop_tick),
       deferredStart(p.deferred_start),
@@ -114,6 +116,8 @@ LoadGeneratorPcap::LoadGeneratorPcap(const LoadGeneratorPcapParams &p)
       sendPacketEvent([this] { sendPacket(); }, name()),
       checkLossEvent([this] { checkLoss(); }, name()),
       loadGeneratorPcapStats(this) {
+  fatal_if(returnDump && returnDump->maxLength() == 0,
+           "return_dump maxlen must be positive");
   fatal_if(p.loadgen_id > 254,
            "loadgen_id must be in [0, 254]");
   fatal_if(p.max_packetsize < kEtherHeaderSize ||
@@ -675,6 +679,14 @@ void LoadGeneratorPcap::endTest() const {
 }
 
 bool LoadGeneratorPcap::processRxPkt(EthPacketPtr pkt) {
+  // This boundary establishes direction even for byte-preserving forwarding.
+  // Capture once per callback, before short-frame/MAC response filtering.
+  if (returnDump) {
+    fatal_if(pkt->length > returnDump->maxLength(),
+             "return_dump maxlen %u would truncate a %u-byte return frame",
+             returnDump->maxLength(), pkt->length);
+    returnDump->dump(pkt);
+  }
   if (pkt->length < kEtherHeaderSize) {
     warn("Ignoring short PCAP load-generator response (%u bytes)",
          pkt->length);
