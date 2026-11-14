@@ -42,6 +42,9 @@ class SimBricksEthernet(SimObject):
     cxx_header = "simbricks/ethernet.hh"
 
     int0 = EtherInt("interface 0")
+    rx_buffer_packets = Param.Unsigned(
+        1024, "Maximum unsent owned NIC frames (positive; overflow is fatal)"
+    )
     initialized_checkpoint = Param.Bool(False, "Opt-in post-probe, pre-data-queue checkpoint")
 
     listen = Param.Bool(False, "Open listening instead of connecting")

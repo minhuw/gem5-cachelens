@@ -45,7 +45,11 @@ Adapter::EthernetStats::EthernetStats(statistics::Group *parent)
       ADD_STAT(droppedPackets, statistics::units::Count::get(), "NIC packets dropped on gem5 backpressure"),
       ADD_STAT(droppedBytes, statistics::units::Byte::get(), "NIC bytes dropped on gem5 backpressure"),
       ADD_STAT(outgoingPackets, statistics::units::Count::get(), "gem5 to NIC packets"),
-      ADD_STAT(outgoingBytes, statistics::units::Byte::get(), "gem5 to NIC bytes")
+      ADD_STAT(outgoingBytes, statistics::units::Byte::get(), "gem5 to NIC bytes"),
+      ADD_STAT(pendingPackets, statistics::units::Count::get(), "Owned NIC packets awaiting gem5 acceptance"),
+      ADD_STAT(pendingHighWatermark, statistics::units::Count::get(), "Maximum pending NIC packets"),
+      ADD_STAT(retryAttempts, statistics::units::Count::get(), "Completion-driven NIC packet retry attempts"),
+      ADD_STAT(overflowPackets, statistics::units::Count::get(), "Fatal NIC receive FIFO overflows")
 {}
 
 Adapter::Adapter(const Params &p)
@@ -54,9 +58,11 @@ Adapter::Adapter(const Params &p)
         Interface(*this),
     adapter(*this, *this, p.sync),
     sync(p.sync),
+    rxBufferPackets(p.rx_buffer_packets),
     ethernetStats(this)
 {
     DPRINTF(SimBricksEthernet, "device constructed\n");
+    fatal_if(!rxBufferPackets, "rx_buffer_packets must be positive");
 
     interface = new Interface(name() + ".int0", this);
 
@@ -70,6 +76,9 @@ Adapter::Adapter(const Params &p)
 
 Adapter::~Adapter()
 {
+    // No retry events are owned here. The deque releases any unsent frames;
+    // accepted frames are owned by the peer, independent of this interface.
+    delete interface;
 }
 
 size_t
@@ -128,24 +137,75 @@ Adapter::handleInMsg(volatile union SimbricksProtoNetMsg *msg)
 
     unsigned len = pkt->len;
     panic_if(!len || len > adapter.inPayload(), "Invalid SimBricks Ethernet length");
+    DPRINTF(SimBricksEthernet, "real->sim len=%d\n", len);
+    ethernetStats.incomingPackets++;
+    ethernetStats.incomingBytes += len;
+    if (rxPending.size() == rxBufferPackets) {
+        ethernetStats.overflowPackets++;
+        fatal("SimBricks Ethernet receive FIFO full: %zu pending packets, "
+              "rx_buffer_packets=%u; cannot suspend SimBricks input",
+              rxPending.size(), rxBufferPackets);
+    }
+
     EthPacketPtr packet = std::make_shared<EthPacketData>(len);
     packet->length = len;
     packet->simLength = len;
     memcpy(packet->data, (const void *) pkt->data, len);
-
-    DPRINTF(SimBricksEthernet, "real->sim len=%d\n", len);
-    ethernetStats.incomingPackets++;
-    ethernetStats.incomingBytes += len;
-    // The consumed SimBricks message cannot be retried. Explicitly account
-    // for a busy gem5 peer rather than silently losing or buffering frames.
-    if (interface->sendPacket(packet)) {
-        ethernetStats.acceptedPackets++;
-        ethernetStats.acceptedBytes += len;
-    } else {
-        ethernetStats.droppedPackets++;
-        ethernetStats.droppedBytes += len;
-    }
+    // Never retain ring storage: enqueue the deep copy before releasing it.
+    rxPending.push_back(packet);
+    ethernetStats.pendingPackets = rxPending.size();
+    if (rxPending.size() > ethernetStats.pendingHighWatermark.value())
+        ethernetStats.pendingHighWatermark = rxPending.size();
     adapter.inDone(msg);
+    pumpRx();
+}
+
+void
+Adapter::pumpRx()
+{
+    if (rxPumping || rxBlocked)
+        return;
+
+    // recvDone() may call sendDone() synchronously from sendPacket(). Keep
+    // the front frame until the return value establishes peer acceptance.
+    rxPumping = true;
+    while (!rxPending.empty()) {
+        EthPacketPtr packet = rxPending.front();
+        if (!interface->sendPacket(packet)) {
+            rxBlocked = true;
+            break;
+        }
+        rxPending.pop_front();
+        ethernetStats.pendingPackets = rxPending.size();
+        ethernetStats.acceptedPackets++;
+        ethernetStats.acceptedBytes += packet->length;
+    }
+    rxPumping = false;
+    if (rxPending.empty())
+        signalDrainDone();
+}
+
+void
+Adapter::sendDone()
+{
+    // EtherInt completion can be synchronous; an idle notification is also
+    // harmless. A failed send waits here instead of spinning or overtaking.
+    rxBlocked = false;
+    if (rxPumping)
+        return;
+    if (!rxPending.empty())
+        ethernetStats.retryAttempts++;
+    pumpRx();
+}
+
+DrainState
+Adapter::drain()
+{
+    // A true sendPacket() transfers ownership to the peer. Not all EtherInt
+    // peers issue a completion for accepted frames; only our owned work drains
+    // here. sendDone() can finish draining the pending FIFO asynchronously.
+    return rxPending.empty() && !rxPumping ?
+        DrainState::Drained : DrainState::Draining;
 }
 
 bool

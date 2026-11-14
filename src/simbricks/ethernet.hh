@@ -25,6 +25,8 @@
 #ifndef __SIMBRICKS_ETHERNET_HH__
 #define __SIMBRICKS_ETHERNET_HH__
 
+#include <deque>
+
 #include "base/statistics.hh"
 
 #include "dev/net/etherint.hh"
@@ -50,12 +52,19 @@ protected:
         <SimbricksProtoNetMsg, SimbricksProtoNetMsg> adapter;
     bool sync;
     bool packetHistory = false;
+    // Only owned, not-yet-accepted frames count against this capacity.
+    const unsigned rxBufferPackets;
+    std::deque<EthPacketPtr> rxPending;
+    bool rxPumping = false;
+    bool rxBlocked = false;
     struct EthernetStats : public statistics::Group {
         EthernetStats(statistics::Group *parent);
         statistics::Scalar incomingPackets, incomingBytes;
         statistics::Scalar acceptedPackets, acceptedBytes;
         statistics::Scalar droppedPackets, droppedBytes;
         statistics::Scalar outgoingPackets, outgoingBytes;
+        statistics::Scalar pendingPackets, pendingHighWatermark;
+        statistics::Scalar retryAttempts, overflowPackets;
     } ethernetStats;
 
     virtual size_t introOutPrepare(void *data, size_t maxlen) override;
@@ -64,6 +73,8 @@ protected:
     virtual void handleInMsg(volatile SimbricksProtoNetMsg *msg) override;
 
     bool recvPacket(EthPacketPtr packet);
+    void pumpRx();
+    void sendDone();
 
     class Interface : public EtherInt
     {
@@ -77,7 +88,7 @@ protected:
             return adapter->recvPacket(pkt);
         }
 
-        void sendDone() override {}
+        void sendDone() override { adapter->sendDone(); }
     };
 
     Interface *interface;
@@ -97,6 +108,7 @@ public:
     void unserialize(CheckpointIn &cp) override;
     void init() override;
     virtual void startup() override;
+    DrainState drain() override;
 };
 
 } // namespace ethernet
