@@ -1,0 +1,132 @@
+{
+  "binary_sha256": "74c4f9d1cbdd983245cec7c97842f2023f9173bb79076981d92cb1c0a0a4cecc",
+  "cases": [
+    {
+      "name": "epoch",
+      "command": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/epoch",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/epoch/p",
+        "--protocol",
+        "mesi",
+        "--trace",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/epoch/trace.jsonl",
+        "--epoch",
+        ""
+      ],
+      "exit": 1,
+      "expected": "requires explicit NIC and fresh epoch"
+    },
+    {
+      "name": "nic",
+      "command": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/nic",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/nic/p",
+        "--protocol",
+        "mesi",
+        "--trace",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/nic/trace.jsonl",
+        "--nic",
+        ""
+      ],
+      "exit": 1,
+      "expected": "requires explicit NIC and fresh epoch"
+    },
+    {
+      "name": "path",
+      "command": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/path",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/path/p",
+        "--protocol",
+        "mesi",
+        "--trace",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/path/trace.jsonl"
+      ],
+      "exit": 1,
+      "expected": "Cannot exclusively create DMA trace"
+    },
+    {
+      "name": "atomic",
+      "command": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/atomic",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/atomic/p",
+        "--protocol",
+        "mesi",
+        "--trace",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/atomic/trace.jsonl",
+        "--atomic"
+      ],
+      "exit": 1,
+      "expected": "DMA observation requires timing mode"
+    },
+    {
+      "name": "checkpoint",
+      "command": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/checkpoint",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/checkpoint/p",
+        "--protocol",
+        "mesi",
+        "--trace",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/checkpoint/trace.jsonl",
+        "--checkpoint-mode"
+      ],
+      "exit": 1,
+      "expected": "DMA observation does not support checkpoint mode"
+    },
+    {
+      "name": "multiple",
+      "command": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/multiple",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/multiple/p",
+        "--protocol",
+        "mesi",
+        "--trace",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/multiple/trace.jsonl",
+        "--two-nics"
+      ],
+      "exit": 1,
+      "expected": "supports exactly one SimBricks PCI endpoint"
+    },
+    {
+      "name": "duplicate",
+      "command": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/duplicate",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/duplicate/p",
+        "--protocol",
+        "mesi",
+        "--trace",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/n1/duplicate/trace.jsonl"
+      ],
+      "exit": 1,
+      "expected": "duplicate active wire request ID"
+    }
+  ],
+  "passed": true
+}

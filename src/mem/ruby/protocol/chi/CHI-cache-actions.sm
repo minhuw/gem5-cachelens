@@ -270,7 +270,7 @@ action(Initiate_Request, desc="") {
   if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.dma_lookup_profiled) {
     cache.profileDmaLookup(tbe.is_ddio_read, is_valid(cache_entry),
                            dmaProfileState(initial), tbe.dataDirty,
-                           tbe.dir_ownerExists);
+                           tbe.dir_ownerExists, tbe.seqReq, address, tbe.isSeqReqValid);
     tbe.dma_lookup_profiled := true;
   }
   if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.ddio_access_profiled && is_valid(cache_entry)) {
@@ -336,7 +336,7 @@ action(Initiate_Request_Stale, desc="") {
   if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.dma_lookup_profiled) {
     cache.profileDmaLookup(tbe.is_ddio_read, is_valid(cache_entry),
                            dmaProfileState(initial), tbe.dataDirty,
-                           tbe.dir_ownerExists);
+                           tbe.dir_ownerExists, tbe.seqReq, address, tbe.isSeqReqValid);
     tbe.dma_lookup_profiled := true;
   }
   if ((tbe.is_ddio_write || tbe.is_ddio_read) && !tbe.ddio_access_profiled && is_valid(cache_entry)) {

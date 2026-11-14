@@ -547,7 +547,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         }
         L2cache.profileDmaLookup(in_msg.Type == CoherenceRequestType:DMA_READ,
                                  is_valid(cache_entry), dmaProfileState(initial),
-                                 dirty, initial == State:MT);
+                                 dirty, initial == State:MT, in_msg.seqReq, address,
+                                 in_msg.isSeqReqValid);
         if (is_valid(cache_entry)) {
           L2cache.profileDdioWayAccess(cache_entry.getWay());
         }

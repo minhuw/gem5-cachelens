@@ -1,0 +1,96 @@
+{
+  "binary": "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+  "binary_sha256": "74c4f9d1cbdd983245cec7c97842f2023f9173bb79076981d92cb1c0a0a4cecc",
+  "protocol": "mesi",
+  "commands": [
+    [
+      "cc",
+      "-std=gnu11",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "-Wno-unused-parameter",
+      "-I/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/deps/lib",
+      "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/peer.c",
+      "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/deps/lib/libsimbricks.a",
+      "-pthread",
+      "-o",
+      "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/peer"
+    ],
+    {
+      "peer": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/peer",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/off/p",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/off/s",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/off/wire.jsonl"
+      ],
+      "gem5": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/off",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/off/p",
+        "--protocol",
+        "mesi"
+      ]
+    },
+    {
+      "peer": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/peer",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/on/p",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/on/s",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/on/wire.jsonl"
+      ],
+      "gem5": [
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/build/DMA_OBSERVE_MESI/gem5.fast",
+        "-d",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/on",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/verification/dma-observe/config.py",
+        "--socket",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/on/p",
+        "--protocol",
+        "mesi",
+        "--trace",
+        "/home/minhuw/cachelens/.pi/workspaces/gem5-dma-observe/.pi/e/m4/on/trace.jsonl"
+      ]
+    }
+  ],
+  "cases": {
+    "off": {
+      "gem5_exit": 0,
+      "peer_readback_bytes": 400,
+      "peer_exit": 0
+    },
+    "on": {
+      "gem5_exit": 0,
+      "peer_readback_bytes": 400,
+      "peer_exit": 0
+    }
+  },
+  "source_sha256": {
+    "verification/dma-observe/capture_source.py": "d626b97215b911a304a7730cc9f3ba939ad22aaf3b3e92e0997d69540516a885",
+    "verification/dma-observe/SCHEMA.md": "ef90193790d1be4891906f5e78bb281b5a286833dd968cabec0bb68a4d9e52eb",
+    "verification/dma-observe/config.py": "d61bf389bb936bebb5bb78f31db2b0664218892f957a8026c296b5b1e824eeee",
+    "verification/dma-observe/API_OWNERSHIP.md": "9f06176a12c7b099743b11f474e25899771002861963a249f33ea6430ff1ffa4",
+    "verification/dma-observe/peer.c": "44ff12775988a527e4485079584dbd2a30eae6eabc259191862cce2b46ad99c9",
+    "verification/dma-observe/run.py": "f0816468c166c4e33f20a0476c9cc806a814fd4a8b778c7454b1afd930125fd5",
+    "verification/dma-observe/API_HANDOFF.md": "53e2c4425c15e80d00d648864e2d4a6efd0543670ae4777e59d59a1125f47658",
+    "src/mem/dma_trace.hh": "4fd73ffdb6fe6a1d0d7943c813bd79d3291a40f33cef1c3e9489eb3891c8b170",
+    "src/mem/dma_trace.cc": "48cceb5386d608ec10517f172387af66bc5d5ee2c97b302f2910b1d53e950f6e"
+  },
+  "join_checks": {
+    "wire_operations": 6,
+    "prepared": 22,
+    "accepted_fragments": 22,
+    "rejected_attempts": 18,
+    "accepted_cache_lookups": 24,
+    "matched_cache_lookups": 22,
+    "unmatched_cache_lookups": 2,
+    "all_counter_events_equal": true
+  },
+  "default_off_equivalent_stats": 820,
+  "default_off_equivalent_wire_ticks": true,
+  "passed": true
+}

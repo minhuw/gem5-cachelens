@@ -138,6 +138,13 @@ DmaPort::DmaReqState::createPacket()
     if (data)
         pkt->dataStatic(data + gen.complete());
 
+    if (trace) {
+        auto ext = std::make_shared<DmaTraceExtension>(
+            trace, pkt->getAddr(), pkt->getSize(), gen.complete(),
+            pkt->getAddr() - pkt->getAddr() % traceLineSize);
+        req->setExtension(ext);
+        ext->emit("fragment_prepared");
+    }
     pkt->senderState = this;
     return pkt;
 }
@@ -188,8 +195,10 @@ DmaPort::recvReqRetry()
 void
 DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
                    uint8_t *data, uint32_t sid, uint32_t ssid, Tick delay,
-                   Request::Flags flag)
+                   Request::Flags flag, DmaTraceOperationPtr trace)
 {
+    fatal_if(trace && !sys->isTimingMode(),
+             "DMA observation currently requires timing mode (no atomic/backdoor coverage)");
     DPRINTF(DMA, "Starting DMA for addr: %#x size: %d sched: %d\n", addr, size,
             event ? event->scheduled() : -1);
 
@@ -198,7 +207,8 @@ DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
     // i.e. cache line size.
     transmitList.push_back(
             new DmaReqState(cmd, addr, cacheLineSize, size,
-                data, flag, requestorId, sid, ssid, event, delay));
+                data, flag, requestorId, sid, ssid, event, delay,
+                nullptr, std::move(trace)));
 
     // In zero time, also initiate the sending of the packets for the request
     // we have just created. For atomic this involves actually completing all
@@ -208,10 +218,11 @@ DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
 
 void
 DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
-                   uint8_t *data, Tick delay, Request::Flags flag)
+                   uint8_t *data, Tick delay, Request::Flags flag,
+                   DmaTraceOperationPtr trace)
 {
     dmaAction(cmd, addr, size, event, data,
-              defaultSid, defaultSSid, delay, flag);
+              defaultSid, defaultSSid, delay, flag, std::move(trace));
 }
 
 void
@@ -266,9 +277,13 @@ DmaPort::trySendTimingReq()
     // Check if this was the last packet now, since hypothetically the packet
     // response may come immediately, and state may be deleted.
     bool last = state->gen.last();
+    // Retain the extension before handing ownership to the receiver.
+    auto trace = state->trace ? pkt->req->getExtension<DmaTraceExtension>() : nullptr;
     if (sendTimingReq(pkt)) {
+        if (trace) trace->emit("fragment_accepted");
         pendingCount++;
     } else {
+        if (trace) trace->emit("fragment_rejected_wait_retry");
         retryPending = true;
         inRetry = pkt;
     }

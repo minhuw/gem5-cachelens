@@ -39,6 +39,7 @@
  */
 
 #include "mem/ruby/system/DMASequencer.hh"
+#include "mem/dma_trace.hh"
 
 #include <limits>
 #include <memory>
@@ -231,6 +232,19 @@ DMASequencer::issueRequestFragment(const Addr &request_address)
                 msg, clockEdge(), cyclesToTicks(Cycles(1)),
                 m_ruby_system->getRandomization(),
                 m_ruby_system->getWarmupEnabled());
+
+            auto trace = candidate.seqReq ?
+                candidate.seqReq->getExtension<DmaTraceExtension>() : nullptr;
+            if (trace) {
+                trace->operation->sink->emit("ruby_fragment_enqueued",
+                    trace->fields() + ",\"ruby_physical_address\":" +
+                    std::to_string(candidate.physicalAddress) +
+                    ",\"ruby_line\":" + std::to_string(candidate.lineAddress) +
+                    ",\"ruby_size\":" + std::to_string(candidate.len) +
+                    ",\"ruby_request_offset\":" +
+                    std::to_string(candidate.requestOffset) +
+                    ",\"population\":\"enabled_ruby_dma_sequencer_fragments\"");
+            }
 
             DPRINTF(RubyDma,
                     "DMA fragment issued: request %p, line %p, "

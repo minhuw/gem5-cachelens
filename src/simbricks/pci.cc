@@ -39,6 +39,8 @@ namespace gem5 {
 namespace simbricks {
 namespace pci {
 
+unsigned Device::deviceCount = 0;
+
 constexpr uint16_t PciCommandIntxDisable = 1U << 10;
 
 extern "C" {
@@ -55,6 +57,14 @@ Device::Device(const Params &p)
     sync(p.sync),
     writesPosted(true)
 {
+    ++deviceCount;
+    if (!p.dma_observe_file.empty()) {
+        dmaTrace = std::make_shared<DmaTraceSink>(p.dma_observe_file,
+            p.dma_observe_nic, p.dma_observe_epoch);
+        DmaTraceSink::activate(dmaTrace);
+        fatal_if(p.initialized_checkpoint,
+                 "DMA observation does not support checkpoint mode");
+    }
     DPRINTF(SimBricksPci, "simbricks-pci: device constructed\n");
 
     fatal_if(p.initialized_checkpoint != bool(p.checkpoint_ethernet),
@@ -69,6 +79,7 @@ Device::Device(const Params &p)
 
 Device::~Device()
 {
+    --deviceCount;
 }
 
 size_t
@@ -188,6 +199,10 @@ ResponsePort
 void
 Device::init()
 {
+    fatal_if(dmaTrace && !sys->isTimingMode(),
+             "DMA observation requires timing mode");
+    fatal_if(DmaTraceSink::active() && deviceCount != 1,
+             "DMA observation supports exactly one SimBricks PCI endpoint");
     /* not calling parent init on purpose, as that will cause problems because
      * PIO port is not connected */
     if (!overridePort.isConnected())
@@ -411,6 +426,23 @@ Device::DMACompl::done()
     dev->dmaDone(*this);
 }
 
+DmaTraceOperationPtr
+Device::traceWireAccept(uint64_t id, Addr address, Addr target,
+                       uint64_t length, bool read)
+{
+    if (!dmaTrace) return nullptr;
+    fatal_if(traceActive.count(id),
+             "DMA observation: duplicate active wire request ID %llu", id);
+    fatal_if(observedInstance == UINT64_MAX, "DMA observation instance overflow");
+    auto trace = std::make_shared<const DmaTraceOperation>(DmaTraceOperation{
+        dmaTrace, id, ++observedInstance, address, target, length, read});
+    traceActive.emplace(id, trace);
+    dmaTrace->emit("wire_accept", trace->fields() +
+        ",\"population\":\"all_accepted_simbricks_pci_dma_requests\","
+        "\"translation_stage\":\"pciToDma_host_bridge_before_downstream_translation\"");
+    return trace;
+}
+
 void
 Device::dmaDone(DMACompl &comp)
 {
@@ -436,6 +468,11 @@ Device::dmaDone(DMACompl &comp)
     } else {
         panic("simbricks-pci: invalid completion");
     }
+    if (comp.trace) {
+        comp.trace->sink->emit("wire_completion_publish", comp.trace->fields() +
+            ",\"population\":\"all_accepted_simbricks_pci_dma_requests\"");
+        panic_if(traceActive.erase(comp.id) != 1, "Missing DMA trace lifecycle");
+    }
 }
 
 void
@@ -449,6 +486,7 @@ Device::handleInMsg(volatile union SimbricksProtoPcieD2H *msg)
     DMACompl *dc;
     PciPioCompl *pc;
     uint64_t rid, addr, len;
+    Addr target;
     uint8_t ty;
 
     ty = adapter.inType(msg);
@@ -466,8 +504,10 @@ Device::handleInMsg(volatile union SimbricksProtoPcieD2H *msg)
             panic_if(!validDma(addr, len, adapter.outPayload()) ||
                      !validDma(pciToDma(addr), len, adapter.outPayload()),
                      "Invalid SimBricks DMA range/length");
+            target = pciToDma(addr);
             dc = new DMACompl(this, rid, len, DMACompl::READ, name());
-            dmaPort.dmaAction(MemCmd::ReadReq, pciToDma(addr), len, dc, dc->buf, 0);
+            dc->trace = traceWireAccept(rid, addr, target, len, true);
+            dmaPort.dmaAction(MemCmd::ReadReq, target, len, dc, dc->buf, 0, 0, dc->trace);
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_WRITE:
@@ -483,9 +523,11 @@ Device::handleInMsg(volatile union SimbricksProtoPcieD2H *msg)
             panic_if(!validDma(addr, len, adapter.inPayload()) ||
                      !validDma(pciToDma(addr), len, adapter.inPayload()),
                      "Invalid SimBricks DMA range/length");
+            target = pciToDma(addr);
             dc = new DMACompl(this, rid, len, DMACompl::WRITE, name());
+            dc->trace = traceWireAccept(rid, addr, target, len, false);
             memcpy(dc->buf, (void *) write->data, len);
-            dmaPort.dmaAction(MemCmd::WriteReq, pciToDma(addr), len, dc, dc->buf, 0);
+            dmaPort.dmaAction(MemCmd::WriteReq, target, len, dc, dc->buf, 0, 0, dc->trace);
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_INTERRUPT:
@@ -754,6 +796,7 @@ Device::initializedCheckpointFinish()
 void
 Device::serialize(CheckpointOut &cp) const
 {
+    fatal_if(dmaTrace, "DMA observation checkpoint serialization unsupported");
     checkInitializedCheckpoint();
     fatal_if(checkpointBody.empty(), "NIC checkpoint missing acknowledged device snapshot");
     adapter.checkpointSerialize(cp);
@@ -784,6 +827,7 @@ Device::serialize(CheckpointOut &cp) const
 void
 Device::unserialize(CheckpointIn &cp)
 {
+    fatal_if(dmaTrace, "DMA observation checkpoint restore unsupported; use a fresh run");
     checkInitializedCheckpoint();
     adapter.checkpointUnserialize(cp);
     uint64_t length, hash;

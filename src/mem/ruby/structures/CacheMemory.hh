@@ -330,7 +330,9 @@ class CacheMemory : public SimObject
 
       // State indices are fixed explicitly in the protocol SLICC mappings.
       void profileDmaLookup(bool is_read, bool hit, int state,
-                            bool local_dirty, bool private_owner);
+                            bool local_dirty, bool private_owner,
+                            RequestPtr req=nullptr, Addr line=0,
+                            bool req_valid=false);
 
       void profileDmaRoutingProxy()
       {

@@ -165,6 +165,12 @@ private:
     void checkInitializedCheckpoint() const;
     std::string checkpointBody;
     uint64_t dmaOutstanding = 0;
+    static unsigned deviceCount;
+    std::shared_ptr<DmaTraceSink> dmaTrace;
+    uint64_t observedInstance = 0;
+    std::unordered_map<uint64_t, DmaTraceOperationPtr> traceActive;
+    DmaTraceOperationPtr traceWireAccept(uint64_t id, Addr address,
+                                        Addr target, uint64_t length, bool read);
     class DMACompl : public EventFunctionWrapper
     {
         protected:
@@ -172,6 +178,7 @@ private:
 
             void done();
         public:
+            DmaTraceOperationPtr trace;
             uint64_t id;
             enum ctype
             {

@@ -40,6 +40,7 @@
  */
 
 #include "mem/ruby/structures/CacheMemory.hh"
+#include "mem/dma_trace.hh"
 
 #include <algorithm>
 
@@ -852,10 +853,13 @@ const std::vector<std::string> dmaStateLabels = {
 
 void
 CacheMemory::profileDmaLookup(bool is_read, bool hit, int state,
-                              bool local_dirty, bool private_owner)
+                              bool local_dirty, bool private_owner,
+                              RequestPtr req, Addr line, bool req_valid)
 {
     panic_if(state < 0 || state >= dmaStateLabels.size(),
              "Invalid accepted DMA native state index: %d", state);
+    observeDmaLookup(req, req_valid, line, name(), is_read, hit,
+                     dmaStateLabels[state], local_dirty, private_owner);
     auto &s = cacheMemoryStats;
     if (is_read) {
         s.dmaReadRequests++;
