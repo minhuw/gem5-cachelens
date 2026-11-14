@@ -54,6 +54,7 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
         hnf_size: str = "1MiB",
         hnf_assoc: int = 8,
         num_hnfs: int = 1,
+        cache_line_size: int = 64,
         ddio_way_part: Optional[int] = None,
         indexing_policy: str = "linear",
         model_profile: str = "abstract",
@@ -63,6 +64,11 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
         network_buffer_size: int = 4,
     ) -> None:
         requires(coherence_protocol_required=CoherenceProtocol.MESI_THREE_LEVEL)
+        if (
+            type(cache_line_size) is not int
+            or cache_line_size not in (32, 64, 128)
+        ):
+            raise ValueError("cache_line_size must be an int: 32, 64, or 128.")
 
         model_profile = PROFILE_ALIASES.get(model_profile, model_profile)
         if model_profile not in MODEL_PROFILES:
@@ -115,7 +121,6 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
                 "hnf_assoc >= 2."
             )
 
-        cache_line_size = 64
         l1i_size_bytes = self._validate_cache_geometry(
             "l1i_size", l1i_size, l1i_assoc, cache_line_size
         )
@@ -192,7 +197,8 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
         self.validate_architecture(board.get_processor().get_isa())
         if int(board.get_cache_line_size()) != self._cache_line_size:
             raise ValueError(
-                "CacheLens MESI_Three_Level requires 64-byte cache lines."
+                "Board cache line size must match cache_line_size "
+                f"({self._cache_line_size} bytes)."
             )
         super().incorporate_cache(board)
 
@@ -207,7 +213,10 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
     def _create_ruby_system(self) -> RubySystem:
         # CacheLens checkpoints publish authoritative cache data to backing
         # memory, validate the trace on restore, and intentionally start cold.
-        return RubySystem(cache_trace_warmup=False)
+        return RubySystem(
+            block_size_bytes=self._cache_line_size,
+            cache_trace_warmup=False,
+        )
 
     def _create_network(self) -> SimplePt2Pt:
         return SimplePt2Pt(

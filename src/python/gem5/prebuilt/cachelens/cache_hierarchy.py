@@ -313,6 +313,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         hnf_size: str = "1MiB",
         hnf_assoc: int = 8,
         num_hnfs: int = 1,
+        cache_line_size: int = 64,
         ddio_way_part: Optional[int] = None,
         indexing_policy: Optional[str] = None,
         # Retained as a compatibility spelling for older configurations.
@@ -328,6 +329,11 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         network_buffer_size: int = 4,
     ) -> None:
         requires(coherence_protocol_required=CoherenceProtocol.CHI)
+        if (
+            type(cache_line_size) is not int
+            or cache_line_size not in (32, 64, 128)
+        ):
+            raise ValueError("cache_line_size must be an int: 32, 64, or 128.")
         super().__init__()
 
         model_profile = _PROFILE_ALIASES.get(model_profile, model_profile)
@@ -394,14 +400,15 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 "model profile."
             )
 
-        try:
-            hnf_size_bytes = toMemorySize(hnf_size)
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "hnf_size must be a valid memory size."
-            ) from error
-        if hnf_size_bytes <= 0:
-            raise ValueError("hnf_size must be positive.")
+        for name, size, assoc in (
+            ("l1i_size", l1i_size, l1i_assoc),
+            ("l1d_size", l1d_size, l1d_assoc),
+            ("l2_size", l2_size, l2_assoc),
+        ):
+            self._validate_cache_geometry(name, size, assoc, cache_line_size)
+        hnf_size_bytes = self._validate_cache_geometry(
+            "hnf_size", hnf_size, hnf_assoc, cache_line_size
+        )
 
         self._l1i_size = l1i_size
         self._l1i_assoc = l1i_assoc
@@ -427,7 +434,30 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         self._link_latency = link_latency
         self._router_latency = router_latency
         self._network_buffer_size = network_buffer_size
-        self._cache_line_size = 64
+        self._cache_line_size = cache_line_size
+
+    @staticmethod
+    def _validate_cache_geometry(
+        name: str, size: str, assoc: int, cache_line_size: int
+    ) -> int:
+        try:
+            size_bytes = toMemorySize(size)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name} must be a valid memory size.") from error
+        if size_bytes <= 0:
+            raise ValueError(f"{name} must be positive.")
+        way_bytes = assoc * cache_line_size
+        if size_bytes % way_bytes:
+            raise ValueError(
+                f"{name} must be divisible by assoc * {cache_line_size} bytes."
+            )
+        sets = size_bytes // way_bytes
+        if sets <= 1 or sets & (sets - 1):
+            raise ValueError(
+                f"{name} must provide a power-of-two number of cache sets "
+                "greater than one."
+            )
+        return size_bytes
 
     def get_model_profile(self) -> str:
         return self._model_profile
@@ -521,14 +551,21 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
 
     @overrides(AbstractCacheHierarchy)
     def incorporate_cache(self, board: AbstractBoard) -> None:
+        self.validate_architecture(board.get_processor().get_isa())
+        if int(board.get_cache_line_size()) != self._cache_line_size:
+            raise ValueError(
+                "Board cache line size must match cache_line_size "
+                f"({self._cache_line_size} bytes)."
+            )
         super().incorporate_cache(board)
         # Cache traces cannot reproduce CacheLens-specific placement,
         # exact cache level/way/replacement state.
         # Checkpoint writeback has already published authoritative data to
         # backing memory, so restore an empty hierarchy and reset telemetry.
-        self.ruby_system = RubySystem(cache_trace_warmup=False)
-        self.validate_architecture(board.get_processor().get_isa())
-        self._cache_line_size = board.get_cache_line_size()
+        self.ruby_system = RubySystem(
+            block_size_bytes=self._cache_line_size,
+            cache_trace_warmup=False,
+        )
         if self._core_clock is not None:
             self.core_clk_domain = SrcClockDomain(
                 clock=self._core_clock,
@@ -563,9 +600,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         hnf_ranges = self._create_hnf_ranges(board)
         self._hnf_ranges = hnf_ranges
         hnf_bits = int(math.log2(self._num_hnfs))
-        start_index_bit = (
-            int(math.log2(board.get_cache_line_size())) + hnf_bits
-        )
+        start_index_bit = int(math.log2(self._cache_line_size)) + hnf_bits
         self.hnfs = [
             _CachedHNF(
                 size=self._hnf_size,
@@ -579,7 +614,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 addr_ranges=hnf_ranges[index],
                 start_index_bit=start_index_bit,
                 network=self.ruby_system.network,
-                cache_line_size=board.get_cache_line_size(),
+                cache_line_size=self.ruby_system.block_size_bytes,
                 clk_domain=board.get_clock_domain(),
             )
             for index in range(self._num_hnfs)
@@ -651,7 +686,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         common = {
             "network": self.ruby_system.network,
             "core": core,
-            "cache_line_size": board.get_cache_line_size(),
+            "cache_line_size": self.ruby_system.block_size_bytes,
             "clk_domain": core_clk_domain,
         }
         cluster.l1i = _L1Cache(
@@ -670,7 +705,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             size=self._l2_size,
             assoc=self._l2_assoc,
             network=self.ruby_system.network,
-            cache_line_size=board.get_cache_line_size(),
+            cache_line_size=self.ruby_system.block_size_bytes,
             clk_domain=core_clk_domain,
         )
 
@@ -725,7 +760,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 ),
             )
 
-        block_bits = int(math.log2(board.get_cache_line_size()))
+        block_bits = int(math.log2(self._cache_line_size))
         hnf_bits = int(math.log2(self._num_hnfs))
         ranges = []
         for index in range(self._num_hnfs):
@@ -760,8 +795,13 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         for index, port in enumerate(board.get_dma_ports()):
             controller = DMARequestor(
                 self.ruby_system.network,
-                board.get_cache_line_size(),
+                self.ruby_system.block_size_bytes,
                 board.get_clock_domain(),
+            )
+            # This nonallocating dummy must still provide at least two sets.
+            controller.cache.size = f"{max(128, 2 * self._cache_line_size)}B"
+            controller.cache.start_index_bit = int(
+                math.log2(self._cache_line_size)
             )
             controller.ddio_eligible = any(port is p for p in ddio_ports)
             controller.sequencer = RubySequencer(
