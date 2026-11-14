@@ -683,3 +683,21 @@ gem5_verify_config(
     valid_hosts=constants.supported_hosts,
     length=constants.quick_tag,
 )
+
+
+for pci_host, isas in (
+    ("generic", (constants.x86_tag,)),
+    ("arm", (constants.all_compiled_tag,)),
+):
+    gem5_verify_config(
+        name=f"pvrdma-pci-shared-intx-{pci_host}",
+        fixtures=(),
+        verifiers=(verifier.MatchRegex(re.compile(
+            "PVRDMA_PCI_SHARED_INTX_PASSED"
+        )),),
+        config=joinpath(absdirpath(__file__), "configs", "pvrdma_pci.py"),
+        config_args=("--host", pci_host),
+        valid_isas=isas,
+        valid_hosts=constants.supported_hosts,
+        length=constants.quick_tag,
+    )

@@ -662,6 +662,8 @@ cachelens_arm_chi_profile_test("intel-ddio")
 for num_nics in range(4):
     cachelens_board_test(isa="arm", num_nics=num_nics)
 cachelens_board_test(isa="arm", num_nics=4, expect_reject=True)
+cachelens_board_test(isa="arm", num_nics=1, enable_pvrdma=True)
+cachelens_board_test(isa="arm", num_nics=0, enable_pvrdma=True, expect_reject=True)
 cachelens_board_test(isa="x86", num_nics=0)
 cachelens_board_test(isa="x86", num_nics=1)
 cachelens_board_test(isa="x86", num_nics=1, enable_pvrdma=True)

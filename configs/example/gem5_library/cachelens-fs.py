@@ -101,7 +101,7 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-pvrdma",
         action="store_true",
-        help="Attach one PVRDMA function beside the x86 E1000.",
+        help="Attach one native PVRDMA function beside the E1000 companion.",
     )
     parser.add_argument("--num-loadgens", type=int, default=1)
     parser.add_argument(
@@ -292,8 +292,6 @@ def _validate_args(parser, args) -> None:
     if args.model_profile == "x86-generic" and args.isa != "x86":
         parser.error("--model-profile x86-generic requires x86.")
     if args.enable_pvrdma:
-        if args.isa != "x86":
-            parser.error("--enable-pvrdma is only valid for x86.")
         if args.num_nics != 1:
             parser.error("--enable-pvrdma requires exactly one NIC.")
 

@@ -15,6 +15,7 @@
 #include "sim/byteswap.hh"
 #include "sim/core.hh"
 #include "sim/sim_exit.hh"
+#include "sim/serialize.hh"
 #include "sim/system.hh"
 
 namespace gem5
@@ -2019,6 +2020,180 @@ PvrdmaTester::testCheckpointObservationRestore()
              "Restored nonempty PVRDMA CQ destroy accounting failed");
     inform("PVRDMA nonempty queue observation checkpoint restored");
     exitSimLoop("PVRDMA observation checkpoint restored");
+}
+
+void
+PvrdmaTester::postPciInt(int line)
+{
+    panic_if(testMode.find("pci-shared-intx") != 0,
+             "Unexpected PCI interrupt in PVRDMA tester");
+    ++pciPosts;
+    pciAsserted.insert(line);
+}
+
+void
+PvrdmaTester::clearPciInt(int line)
+{
+    panic_if(testMode.find("pci-shared-intx") != 0,
+             "Unexpected PCI interrupt clear in PVRDMA tester");
+    ++pciClears;
+    pciAsserted.erase(line);
+}
+
+void
+PvrdmaTester::serialize(CheckpointOut &cp) const
+{
+    Platform::serialize(cp);
+    if (testMode.find("pci-shared-intx") != 0)
+        return;
+    SERIALIZE_SCALAR(pciPosts);
+    SERIALIZE_SCALAR(pciClears);
+    const bool asserted = pciAsserted.count(102);
+    SERIALIZE_SCALAR(asserted);
+}
+
+void
+PvrdmaTester::unserialize(CheckpointIn &cp)
+{
+    Platform::unserialize(cp);
+    if (testMode.find("pci-shared-intx") != 0)
+        return;
+    UNSERIALIZE_SCALAR(pciPosts);
+    UNSERIALIZE_SCALAR(pciClears);
+    bool asserted;
+    UNSERIALIZE_SCALAR(asserted);
+    if (asserted)
+        pciAsserted.insert(102);
+}
+
+void
+PvrdmaTester::runPciPair()
+{
+    // Match the VExpress ECAM/memory translation. Nonzero DMA base also
+    // proves that guest bus DMA addresses are translated exactly once.
+    constexpr Addr Config = 0x30000000 + (2 << 3) * 4096;
+    constexpr Addr RegBus = 0x10004000;
+    constexpr Addr Reg = 0x40000000 + RegBus;
+    constexpr Addr Nic = 0x40000000 + 0x12000000;
+    constexpr Addr Dma = 0x80000000;
+    const auto later = [this] {
+        schedule(testEvent, curTick() + microseconds(100));
+    };
+    const auto query = [this] {
+        pvrdma::CommandRequest request{};
+        request.header.command = htole(static_cast<uint32_t>(
+            pvrdma::Command::QueryPort));
+        request.queryPort.portNumber = 1;
+        write(Dma + CommandAddress, request);
+        write(Reg + pvrdma::RegRequest, uint32_t{0}, MmioFlags);
+    };
+    if (testMode == "pci-shared-intx-restore" && publicStage == 0)
+        publicStage = 2;
+    switch (publicStage++) {
+      case 0: {
+        panic_if(letoh(read<uint32_t>(Config, MmioFlags)) != 0x10758086 ||
+                     letoh(read<uint32_t>(Config + 4096, MmioFlags)) !=
+                         0x082015ad ||
+                     letoh(read<uint32_t>(Config + 8192, MmioFlags)) !=
+                         0xffffffff ||
+                     !(read<uint8_t>(Config + PCI_HEADER_TYPE, MmioFlags) &
+                       0x80),
+                 "PVRDMA multifunction ECAM decode mismatch");
+        // Probe all PVRDMA BAR masks, then assign non-overlapping bus BARs.
+        const std::array<uint32_t, 3> masks = {
+            0xffffc000, 0xffffff00, 0xffe00000};
+        const std::array<uint32_t, 3> bars = {
+            0x10000000, RegBus, 0x10200000};
+        for (unsigned i = 0; i < masks.size(); ++i) {
+            const Addr addr = Config + 4096 + PCI0_BASE_ADDR0 + i * 4;
+            write(addr, htole(uint32_t{0xffffffff}), MmioFlags);
+            panic_if(letoh(read<uint32_t>(addr, MmioFlags)) != masks[i],
+                     "PVRDMA BAR%u probe mismatch", i);
+            write(addr, htole(bars[i]), MmioFlags);
+        }
+        write(Config + PCI0_BASE_ADDR0, htole(uint32_t{0x12000000}),
+              MmioFlags);
+        const auto enable = htole(static_cast<uint16_t>(
+            PCI_CMD_MSE | PCI_CMD_BME));
+        write(Config + PCI_COMMAND, enable, MmioFlags);
+        write(Config + 4096 + PCI_COMMAND, enable, MmioFlags);
+        panic_if(letoh(read<uint32_t>(Reg + pvrdma::RegVersion,
+                                      MmioFlags)) != pvrdma::Version,
+                 "PVRDMA translated BAR access failed");
+        pvrdma::DeviceSharedRegion dsr{};
+        dsr.driverVersion = htole(pvrdma::Version);
+        dsr.commandSlotDma = htole(uint64_t{CommandAddress});
+        dsr.responseSlotDma = htole(uint64_t{ResponseAddress});
+        dsr.asyncRingPages.numPages = htole(pvrdma::NumRingPages);
+        dsr.asyncRingPages.pageDirectoryDma = htole(uint64_t{0x4000});
+        dsr.completionRingPages.numPages = htole(pvrdma::NumRingPages);
+        dsr.completionRingPages.pageDirectoryDma = htole(uint64_t{0x5000});
+        write(Dma + DsrAddress, dsr);
+        write(Reg + pvrdma::RegDsrLow,
+              htole(static_cast<uint32_t>(DsrAddress)), MmioFlags);
+        write(Reg + pvrdma::RegDsrHigh, uint32_t{0}, MmioFlags);
+        later();
+        return;
+      }
+      case 1: {
+        const auto caps = read<pvrdma::DeviceCaps>(
+            Dma + DsrAddress + offsetof(pvrdma::DeviceSharedRegion, caps));
+        panic_if(caps.mode != static_cast<uint8_t>(pvrdma::DeviceMode::Roce),
+                 "PVRDMA translated DSR DMA visibility failed");
+        write(Reg + pvrdma::RegControl, htole(static_cast<uint32_t>(
+            pvrdma::DeviceControl::Activate)), MmioFlags);
+        write(Reg + pvrdma::RegInterruptMask, uint32_t{0}, MmioFlags);
+        // E1000 function0 posts first; PVRDMA function1 follows via real DMA.
+        write(Nic + 0xd0, htole(uint32_t{1}), MmioFlags); // IMS: TXDW
+        write(Nic + 0xc8, htole(uint32_t{1}), MmioFlags); // ICS
+        panic_if(!pciAsserted.count(102), "E1000 INTx did not assert");
+        query();
+        later();
+        return;
+      }
+      case 2: {
+        const auto response = read<pvrdma::CommandResponse>(
+            Dma + ResponseAddress);
+        panic_if(response.header.error ||
+                     letoh(response.header.acknowledgement) !=
+                         pvrdma::responseCommand(pvrdma::Command::QueryPort),
+                 "PVRDMA translated response DMA failed");
+        if (testMode == "pci-shared-intx-save") {
+            exitSimLoop("PVRDMA PCI shared INTx checkpoint ready");
+            return;
+        }
+        // Clear the E1000 while PVRDMA still owns the same line.
+        read<uint32_t>(Nic + 0xc0, MmioFlags); // ICR read acknowledges E1000
+        panic_if(!pciAsserted.count(102) || pciClears,
+                 "E1000 cleared another function's shared INTx");
+        const auto cause = letoh(read<uint32_t>(
+            Reg + pvrdma::RegInterruptCause, MmioFlags));
+        panic_if(!(cause & pvrdma::InterruptCauseResponse) ||
+                     !pciAsserted.empty() || pciPosts != 1 || pciClears != 1,
+                 "PVRDMA final shared INTx clear mismatch");
+        query();
+        later();
+        return;
+      }
+      case 3:
+        panic_if(!pciAsserted.count(102), "PVRDMA INTx did not assert");
+        write(Nic + 0xc8, htole(uint32_t{1}), MmioFlags);
+        // IMS rechecks and reposts the SAME source; it must not refcount it.
+        write(Nic + 0xd0, htole(uint32_t{1}), MmioFlags);
+        read<uint32_t>(Reg + pvrdma::RegInterruptCause, MmioFlags);
+        panic_if(!pciAsserted.count(102) || pciClears != 1,
+                 "PVRDMA cleared another function's shared INTx");
+        read<uint32_t>(Nic + 0xc0, MmioFlags);
+        panic_if(!pciAsserted.empty() || pciPosts != 2 || pciClears != 2,
+                 "E1000 final shared INTx clear/repost mismatch");
+        inform("PVRDMA_PCI_SHARED_INTX_OK functions=0,1 ecam=1 "
+               "bar_translation=1 dma_translation=1 both_clear_orders=1 "
+               "repeated_source_post=1 guest_irq_delivery_proof=0");
+        exitSimLoop("PVRDMA PCI shared INTx test passed");
+        return;
+      default:
+        panic("Invalid PVRDMA PCI pair stage");
+    }
 }
 
 void
@@ -6336,6 +6511,10 @@ PvrdmaTester::runFaultLink()
 void
 PvrdmaTester::run()
 {
+    if (testMode.find("pci-shared-intx") == 0) {
+        runPciPair();
+        return;
+    }
     if (testMode == "public-pair" || testMode == "timing-public-pair") {
         runPublicPair();
         return;

@@ -60,6 +60,10 @@ class GenericPciHost(PciHost):
         8, "Number of bits used to as an offset a devices address space"
     )
 
+    aggregate_intx = Param.Bool(
+        False, "Aggregate shared INTx levels by source BDF/pin"
+    )
+
     pci_pio_base = Param.Addr(0, "Base address for PCI IO accesses")
     pci_mem_base = Param.Addr(0, "Base address for PCI memory accesses")
     pci_dma_base = Param.Addr(0, "Base address for DMA memory accesses")

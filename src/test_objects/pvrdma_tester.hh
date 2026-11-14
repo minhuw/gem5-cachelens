@@ -264,6 +264,10 @@ class PvrdmaTester : public Platform
                            Addr mr_page,
                            const pvrdma::rocev2::MacAddress &remote_mac,
                            uint32_t send_psn, uint32_t receive_psn);
+    void runPciPair();
+    std::set<int> pciAsserted;
+    uint32_t pciPosts = 0;
+    uint32_t pciClears = 0;
     void runPublicPair();
     void checkPublicPayloadAccess(Addr addr, size_t size) const;
     unsigned publicStage = 0;
@@ -318,6 +322,10 @@ class PvrdmaTester : public Platform
                   PortID idx = InvalidPortID) override;
     void regProbeListeners() override;
     void startup() override;
+    void postPciInt(int line) override;
+    void clearPciInt(int line) override;
+    void serialize(CheckpointOut &cp) const override;
+    void unserialize(CheckpointIn &cp) override;
     void postConsoleInt() override {}
     void clearConsoleInt() override {}
 };

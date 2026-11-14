@@ -285,6 +285,9 @@ class GenericPciHost : public PciHost
 
     AddrRangeList getAddrRanges() const override;
 
+    void serialize(CheckpointOut &cp) const override;
+    void unserialize(CheckpointIn &cp) override;
+
   protected: // PciHost
     Addr pioAddr(const PciBusAddr &bus_addr, Addr pci_addr) const override {
         return pciPioBase + pci_addr;
@@ -326,6 +329,11 @@ class GenericPciHost : public PciHost
     const Addr pciPioBase;
     const Addr pciMemBase;
     const Addr pciDmaBase;
+
+    const bool aggregateIntx;
+    // A source may post repeatedly; it contributes one level, not a count.
+    std::map<uint32_t, uint32_t> intxSources;
+    static uint32_t intxSource(const PciBusAddr &addr, PciIntPin pin);
 };
 
 } // namespace gem5

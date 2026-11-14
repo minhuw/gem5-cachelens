@@ -21,7 +21,7 @@ parser.add_argument("--enable-pvrdma", action="store_true")
 parser.add_argument("--expect-reject", action="store_true")
 parser.add_argument(
     "--hierarchy",
-    choices=("classic", "mesi-two-level"),
+    choices=("classic", "mesi-two-level", "chi"),
     default="classic",
 )
 parser.add_argument("--phase", choices=("save", "restore"))
@@ -47,12 +47,21 @@ if args.hierarchy == "mesi-two-level":
         hnf_assoc=4,
         model_profile="x86-generic",
     )
+elif args.hierarchy == "chi":
+    assert isa == ISA.ARM
+    from gem5.prebuilt.cachelens.cache_hierarchy import CacheLensCHIHierarchy
+
+    cache_hierarchy = CacheLensCHIHierarchy(
+        model_profile="arm-generic", num_hnfs=2,
+        l1i_size="16KiB", l1d_size="16KiB", l2_size="32KiB",
+        hnf_size="64KiB", hnf_assoc=4,
+    )
 else:
     cache_hierarchy = NoCache()
 processor = SimpleProcessor(
     cpu_type=(
         CPUTypes.TIMING
-        if args.hierarchy == "mesi-two-level"
+        if args.hierarchy in ("mesi-two-level", "chi")
         else CPUTypes.ATOMIC
     ),
     isa=isa,
@@ -89,8 +98,10 @@ except ValueError as error:
         raise
     message = str(error)
     if isa == ISA.ARM:
-        assert "at most three NICs" in message
-        assert "IDE controller's INTx route" in message
+        assert (
+            "at most three NICs" in message
+            or "requires exactly one CacheLens NIC" in message
+        )
     else:
         assert (
             "supports one NIC" in message
@@ -184,11 +195,54 @@ if isa == ISA.X86:
 
 if isa == ISA.ARM:
     pci_devices = [int(device.pci_dev) for device in board._pci_devices]
-    assert pci_devices == list(range(1, args.num_nics + 2))
-    int_count = int(board.realview.pci_host.int_count)
-    assert len({device % int_count for device in pci_devices}) == len(
-        pci_devices
+    expected_slots = list(range(1, args.num_nics + 2))
+    assert pci_devices == expected_slots + ([2] if args.enable_pvrdma else [])
+    host = board.realview.pci_host
+    assert bool(host.aggregate_intx) == args.enable_pvrdma
+    assert host._dma_coherent
+    assert int(host.conf_device_bits) == 12
+    assert int(host.pci_mem_base) == 0x40000000
+    assert int(host.pci_dma_base) == 0
+    int_count = int(host.int_count)
+    assert len({device % int_count for device in expected_slots}) == len(
+        expected_slots
     )
+    assert len(board.rdmas) == int(args.enable_pvrdma)
+    if args.enable_pvrdma:
+        nic, rdma = board.nics[0], board.rdmas[0]
+        assert board.get_rdma_bdfs() == ["0000:00:02.1"]
+        assert int(nic.HeaderType) & 0x80
+        assert rdma.host is host
+        assert int(rdma.pci_bus) == int(nic.pci_bus) == 0
+        assert int(rdma.pci_dev) == int(nic.pci_dev) == 2
+        assert int(rdma.pci_func) == 1 and int(nic.pci_func) == 0
+        assert int(rdma.InterruptPin) == 2
+        assert int(rdma.InterruptLine) == 102
+        assert rdma.pio.peer.simobj is board.iobus
+        assert rdma.companion_mac_word_swap
+        assert rdma.dma is not nic.dma
+        assert [int(rdma.BAR0.size), int(rdma.BAR1.size),
+                int(rdma.BAR2.size)] == [16384, 256, 2097152]
+        if args.hierarchy == "classic":
+            assert rdma.dma.peer.simobj is board.iobus
+    if args.hierarchy == "chi":
+        board._connect_things()
+        ports = board.get_dma_ports()
+        eligible = board.get_ddio_dma_ports()
+        assert board._pci_devices[0].dma in ports
+        assert board._pci_devices[0].dma not in eligible
+        assert eligible == [nic.dma for nic in board.nics] + [
+            rdma.dma for rdma in board.rdmas
+        ]
+        assert len(cache_hierarchy.dma_requestors) == len(ports)
+        for requestor, port in zip(cache_hierarchy.dma_requestors, ports):
+            assert requestor.sequencer.in_ports[0].peer is port
+            assert bool(requestor.ddio_eligible) == any(
+                port is network_port for network_port in eligible
+            )
+        assert not cache_hierarchy.get_configuration()["nic_read_no_allocate"]
+        assert cache_hierarchy.get_configuration()["ddio_way_part"] == -1
+        print("CACHELENS_ARM_PVRDMA_COHERENT_GRAPH_OK stashing=off")
 
 if args.phase:
     board.workload.object_file = args.kernel.as_posix()

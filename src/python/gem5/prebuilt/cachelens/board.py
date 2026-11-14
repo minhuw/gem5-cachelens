@@ -40,6 +40,7 @@ if buildEnv["USE_ARM_ISA"]:
         CowDiskImage,
         IdeController,
         IdeDisk,
+        Pvrdma,
         RawDiskImage,
         VExpress_GEM5_Base,
         VExpress_GEM5_V1,
@@ -62,6 +63,13 @@ if buildEnv["USE_ARM_ISA"]:
             release: ArmRelease = ArmDefaultRelease(),
         ) -> None:
             self._cachelens_network_options = network_options or {}
+            self._enable_pvrdma = self._cachelens_network_options.get(
+                "enable_pvrdma", False
+            )
+            if self._enable_pvrdma and self._cachelens_network_options.get(
+                "num_nics", 0
+            ) != 1:
+                raise ValueError("PVRDMA requires exactly one CacheLens NIC.")
             if self._cachelens_network_options.get("num_nics", 0) > 3:
                 raise ValueError(
                     "CacheLens ARM supports at most three NICs; a fourth "
@@ -93,9 +101,11 @@ if buildEnv["USE_ARM_ISA"]:
             self._attach_cachelens_network()
 
         def _attach_cachelens_network(self) -> None:
-            network = build_cachelens_network(
-                **self._cachelens_network_options
-            )
+            network_options = dict(self._cachelens_network_options)
+            network_options.pop("enable_pvrdma", None)
+            network = build_cachelens_network(**network_options)
+            if self._enable_pvrdma:
+                network.nics[0].HeaderType = int(network.nics[0].HeaderType) | 0x80
 
             # NICs are ultimately owned by ArmBoard.pci_devices. Keep the
             # public Python view without creating a second SimObject parent.
@@ -104,6 +114,33 @@ if buildEnv["USE_ARM_ISA"]:
             _own_vector(self, "links", network.links)
             for nic in network.nics:
                 self._add_pci_device(nic)
+
+            rdmas = []
+            if self._enable_pvrdma:
+                host = self.realview.pci_host
+                host.aggregate_intx = True
+                rdma = Pvrdma(
+                    host=host,
+                    pci_bus=0,
+                    pci_dev=int(network.nics[0].pci_dev),
+                    pci_func=1,
+                    InterruptPin=2,
+                    InterruptLine=int(host.int_base)
+                    + int(network.nics[0].pci_dev) % int(host.int_count),
+                    hardware_address=str(network.nics[0].hardware_address),
+                    companion_mac_word_swap=True,
+                )
+                # _add_pci_device allocates a fresh slot/function0. Keep its
+                # ownership convention but attach the companion's function1.
+                self._pci_devices.append(rdma)
+                rdma.pio = self.iobus.mem_side_ports
+                dma_ports = self.get_dma_ports()
+                if dma_ports is None:
+                    rdma.dma = self.iobus.cpu_side_ports
+                else:
+                    dma_ports.append(rdma.dma)
+                rdmas.append(rdma)
+            self.__dict__["rdmas"] = rdmas
 
             expected_bdfs = [
                 f"0000:00:{2 + index:02x}.0"
@@ -127,6 +164,13 @@ if buildEnv["USE_ARM_ISA"]:
                 f"0000:{int(nic.pci_bus):02x}:{int(nic.pci_dev):02x}."
                 f"{int(nic.pci_func)}"
                 for nic in self.nics
+            ]
+
+        def get_rdma_bdfs(self) -> List[str]:
+            return [
+                f"0000:{int(rdma.pci_bus):02x}:{int(rdma.pci_dev):02x}."
+                f"{int(rdma.pci_func)}"
+                for rdma in self.rdmas
             ]
 
         @overrides(KernelDiskWorkload)

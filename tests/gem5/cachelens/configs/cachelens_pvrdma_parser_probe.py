@@ -53,7 +53,9 @@ assert "enable_pvrdma" not in cachelens_fs._network_options(default)
 opt_in = parse("x86", 1, True)
 assert cachelens_fs._network_options(opt_in)["enable_pvrdma"]
 
-rejects("arm", 1)
+assert cachelens_fs._network_options(parse("arm", 1, True))["enable_pvrdma"]
+rejects("arm", 0)
+rejects("arm", 2)
 rejects("x86", 0)
 rejects("x86", 2)
 print("CACHELENS_PVRDMA_PARSER_OK")
