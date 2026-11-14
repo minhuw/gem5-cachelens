@@ -204,7 +204,26 @@ if isa == ISA.ARM:
     assert int(host.conf_device_bits) == 12
     assert int(host.pci_mem_base) == 0x40000000
     assert int(host.pci_dma_base) == 0
+    from m5.util.fdthelper import FdtState
+
+    pci_node = next(host.generateDeviceTree(
+        FdtState(addr_cells=2, size_cells=2, cpu_cells=1)
+    ))
+    properties = {prop.get_name(): prop for prop in pci_node}
+    assert "dma-coherent" in properties
+    interrupt_map = properties["interrupt-map"].words
     int_count = int(host.int_count)
+    assert len(interrupt_map) == int_count * 8
+    for slot in range(int_count):
+        entry = interrupt_map[slot * 8:(slot + 1) * 8]
+        assert entry[:3] == host.pciFdtAddr(device=slot)
+        assert entry[3] == 0
+        assert entry[5:] == [0, 100 - 32 + slot, 4 if args.enable_pvrdma else 1]
+    assert properties["interrupt-map-mask"].words == (
+        host.pciFdtAddr(device=int_count - 1) + [0]
+    )
+    print("CACHELENS_ARM_PCI_DT_OK coherent=1 shared_level="
+          + str(int(args.enable_pvrdma)))
     assert len({device % int_count for device in expected_slots}) == len(
         expected_slots
     )
@@ -241,6 +260,8 @@ if isa == ISA.ARM:
             assert bool(requestor.ddio_eligible) == any(
                 port is network_port for network_port in eligible
             )
+        assert cache_hierarchy.get_configuration()["cache_stashing"] == "off"
+        assert all(not bool(hnf.accept_write_stash) for hnf in cache_hierarchy.hnfs)
         assert not cache_hierarchy.get_configuration()["nic_read_no_allocate"]
         assert cache_hierarchy.get_configuration()["ddio_way_part"] == -1
         print("CACHELENS_ARM_PVRDMA_COHERENT_GRAPH_OK stashing=off")

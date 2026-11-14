@@ -226,7 +226,10 @@ class GenericArmPciHost(GenericPciHost):
 
             for i in range(int(self.int_count)):
                 parent_interrupt = gic.interruptCells(
-                    0, int(self.int_base) - 32 + i, 1
+                    0, int(self.int_base) - 32 + i,
+                    # Shared PCI INTx is a level held until every source
+                    # clears. Preserve the legacy edge setting otherwise.
+                    4 if self.aggregate_intx else 1,
                 )
 
                 interrupts += (

@@ -14,6 +14,9 @@ a new slot. Its BARs retain 16KiB/256B/2MiB sizes. The VExpress host retains
 ECAM function decoding (12 offset bits), PCI memory bus base0x40000000,
 DMA base0 and its existing ARM_PCI_INT_DEV routing. Thus both functions of
 slot2 map to SPI102, consistent with the existing DT interrupt-map mask.
+Aggregation-enabled hosts advertise level-high interrupts (DT flags4), matching
+held shared INTx levels; disabled hosts retain legacy edge flags1. Graph checks
+inspect the actual generated interrupt-map/mask and dma-coherent property.
 
 `--enable-pvrdma` is accepted by cachelens-fs.py for ARM and x86 and still
 requires exactly one E1000 companion. Native RDMA payload EtherInt peer
