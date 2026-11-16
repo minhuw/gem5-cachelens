@@ -53,9 +53,7 @@ no-allocation reads, sparse/zero masks, two-bank routing, and DDIO disabled
 (`--ddio-way-part=-1`). C++ byte/readback assertions remain enabled. Exact
 three-level expectations are shared with testlib in
 `tests/gem5/mesi_ddio/three_level_checks.py`; existing MESI_Two_Level tests are
-supplementary regressions, not the primary profile smoke. See
-[validation evidence](verification/no-tags/README.md#native-x86-three-level-primary-smoke)
-for the measured native run and persisted binary.
+supplementary regressions, not the primary profile smoke.
 
 ## DMA LLC tag-hit metric (`dma-llc-tag-v1`)
 

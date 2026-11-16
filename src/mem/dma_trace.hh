@@ -11,20 +11,17 @@
 namespace gem5
 {
 
-// Pure host-side observation. Never serialized or encoded in network sizes.
+// Per-device host-side JSONL observation; one object per line:
+// {"event":...,"tick":...,"nic":...,<event fields>}. Never serialized.
 class DmaTraceSink
 {
     FILE *file;
-    static std::weak_ptr<DmaTraceSink> current;
   public:
     const std::string nic;
-    const std::string epoch;
-    DmaTraceSink(const std::string &path, const std::string &nic,
-                 const std::string &epoch);
+    DmaTraceSink(const std::string &path, const std::string &nic);
     ~DmaTraceSink();
-    static void activate(const std::shared_ptr<DmaTraceSink> &sink);
-    static std::shared_ptr<DmaTraceSink> active() { return current.lock(); }
     void emit(const std::string &event, const std::string &fields);
+    void flush();
 };
 
 struct DmaTraceOperation

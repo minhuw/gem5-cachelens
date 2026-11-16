@@ -67,9 +67,8 @@ class SimBricksPci(PciDevice):
     cxx_class = "gem5::simbricks::pci::Device"
     cxx_header = "simbricks/pci.hh"
 
-    dma_observe_file = Param.String("", "Optional exclusive-created DMA observation JSONL (timing only)")
-    dma_observe_nic = Param.String("", "Explicit producer endpoint identity; required when observing")
-    dma_observe_epoch = Param.String("", "Explicit fresh producer/native lifecycle epoch; required when observing")
+    dma_observe_file = Param.String("", "Optional DMA observation JSONL output (timing mode only)")
+    dma_observe_nic = Param.String("", "NIC label in DMA observation records (default: SimObject name)")
 
     initialized_checkpoint = Param.Bool(False, "Opt-in post-probe, pre-data-queue checkpoint")
     checkpoint_ethernet = Param.SimBricksEthernet(NULL, "Ethernet endpoint of the same NIC")

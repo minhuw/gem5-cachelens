@@ -19,8 +19,6 @@ partial-write merging and existing-line updates remain active in either mode.
   port eligibility, DMA tag-hit counters and line-state distributions.
 - [Explicit CHI write stashing](CACHELENS_STASHING.md): optional acceptance of
   explicit stash opcodes, separate from ordinary NIC DMA.
-- [Untagged DMA validation](verification/no-tags/README.md): retained native
-  MESI, ARM/CHI and TLM evidence, with workload and coverage boundaries.
 
 `dmaRead*` and `dmaWrite*` counters measure accepted eligible cache-line
 lookups. A hit means an LLC CacheMemory tag was present before the request's

@@ -36,9 +36,6 @@ if env['CONF']['USE_TEST_OBJECTS']:
     ])
     Source('stat_tester.cc')
 
-    SimObject('I40eObserveHost.py', sim_objects=['I40eObserveHost'])
-    Source('i40e_observe_host.cc')
-
     SimObject('DmaObserveTester.py', sim_objects=['DmaObserveTester'])
     Source('dma_observe_tester.cc')
 

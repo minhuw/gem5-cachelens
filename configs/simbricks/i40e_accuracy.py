@@ -20,7 +20,7 @@ from gem5.resources.resource import DiskImageResource, KernelResource
 
 GIB = 1 << 30
 # Pilot manifest selects Xeon geometry; its measure/config.ini records 500ps
-# core and 1000ps board periods (NOT 3GHz). See verification/accuracy/README.md.
+# core and 1000ps board periods (NOT 3GHz).
 XEON_PILOT_CORE_CLOCK = "2GHz"
 XEON_PILOT_BOARD_CLOCK = "1GHz"
 GEOMETRY = dict(

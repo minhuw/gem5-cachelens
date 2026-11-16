@@ -7,7 +7,6 @@ python3 verification/rxonly/test_rss_pcap.py
 python3 verification/rxonly/make_rss_pcap.py /tmp/rss.pcap
 bash verification/rxonly/build.sh > verification/rxonly/build.log 2>&1
 python3 verification/rxonly/run_native_tests.py --gem5 build/X86_CHI_RSS/gem5.fast
-python3 verification/rxonly/run_ethernet_test.py --gem5 build/X86_CHI_RSS/gem5.fast
 ```
 
 The build copies the existing `build_opts/X86_CHI` into `X86_CHI_RSS`, uses
@@ -59,11 +58,10 @@ counts/ticks belong to the current stats epoch, not a cross-checkpoint ledger.
 
 Stats under `i40e_network.Ethernet`:
 `incomingPackets`, `incomingBytes`, `acceptedPackets`, `acceptedBytes`,
-`droppedPackets`, `droppedBytes`, `outgoingPackets`, `outgoingBytes`.
-Incoming = external NIC -> gem5, and incoming = accepted + dropped (packets
-and bytes). Outgoing = gem5 -> external NIC. The incoming busy-peer path is
-an explicit counted drop, not an unbounded queue. Outgoing retains existing
-SimBricks publication semantics.
+`outgoingPackets`, `outgoingBytes`, `pendingHighWatermark`.
+Incoming = external NIC -> gem5. While gem5's peer is busy, incoming frames wait
+in a FIFO of `rx_buffer_packets` (default 1024); overflowing it is fatal.
+Outgoing = gem5 -> external NIC.
 
 `rxonly-link.pcap` in gem5's output directory captures full frames in both
 directions at **serialization completion**, before 200us propagation.

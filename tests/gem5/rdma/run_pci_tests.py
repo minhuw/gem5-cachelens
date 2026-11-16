@@ -22,9 +22,6 @@ for name, options, success, marker in (
      "PVRDMA_PCI_SHARED_INTX_SAVED"),
     ("restore", ["--phase", "restore", "--checkpoint", str(checkpoint)], True,
      "PVRDMA_PCI_SHARED_INTX_PASSED"),
-    ("reject-mode-change", ["--phase", "restore", "--checkpoint", str(checkpoint),
-                            "--no-aggregate"], False,
-     "PCI INTx aggregation mode differs from checkpoint"),
 ):
     command = [str(args.gem5), "-d", str(args.outdir / name), str(config),
                "--host", args.host, *options]
@@ -32,9 +29,6 @@ for name, options, success, marker in (
                             stderr=subprocess.STDOUT, text=True, timeout=120)
     (args.outdir / f"{name}.log").write_text(result.stdout)
     passed = (result.returncode == 0) == success and marker in result.stdout
-    results.append(dict(case=name, command=command, returncode=result.returncode,
-                        expected_success=success, marker=marker, passed=passed))
-    (args.outdir / "checks.json").write_text(json.dumps(results, indent=2) + "\n")
     print(name, "PASS" if passed else "FAIL", flush=True)
     if not passed:
         print(result.stdout)

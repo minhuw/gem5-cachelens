@@ -242,8 +242,7 @@ DMASequencer::issueRequestFragment(const Addr &request_address)
                     ",\"ruby_line\":" + std::to_string(candidate.lineAddress) +
                     ",\"ruby_size\":" + std::to_string(candidate.len) +
                     ",\"ruby_request_offset\":" +
-                    std::to_string(candidate.requestOffset) +
-                    ",\"population\":\"enabled_ruby_dma_sequencer_fragments\"");
+                    std::to_string(candidate.requestOffset));
             }
 
             DPRINTF(RubyDma,

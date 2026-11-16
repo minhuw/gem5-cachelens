@@ -39,8 +39,6 @@ namespace gem5 {
 namespace simbricks {
 namespace pci {
 
-unsigned Device::deviceCount = 0;
-
 constexpr uint16_t PciCommandIntxDisable = 1U << 10;
 
 extern "C" {
@@ -57,11 +55,11 @@ Device::Device(const Params &p)
     sync(p.sync),
     writesPosted(true)
 {
-    ++deviceCount;
     if (!p.dma_observe_file.empty()) {
         dmaTrace = std::make_shared<DmaTraceSink>(p.dma_observe_file,
-            p.dma_observe_nic, p.dma_observe_epoch);
-        DmaTraceSink::activate(dmaTrace);
+            p.dma_observe_nic.empty() ? name() : p.dma_observe_nic);
+        // SimObjects are not destroyed at exit; flush buffered records then.
+        registerExitCallback([this]() { dmaTrace->flush(); });
         fatal_if(p.initialized_checkpoint,
                  "DMA observation does not support checkpoint mode");
     }
@@ -79,7 +77,6 @@ Device::Device(const Params &p)
 
 Device::~Device()
 {
-    --deviceCount;
 }
 
 size_t
@@ -201,8 +198,6 @@ Device::init()
 {
     fatal_if(dmaTrace && !sys->isTimingMode(),
              "DMA observation requires timing mode");
-    fatal_if(DmaTraceSink::active() && deviceCount != 1,
-             "DMA observation supports exactly one SimBricks PCI endpoint");
     /* not calling parent init on purpose, as that will cause problems because
      * PIO port is not connected */
     if (!overridePort.isConnected())
@@ -437,9 +432,7 @@ Device::traceWireAccept(uint64_t id, Addr address, Addr target,
     auto trace = std::make_shared<const DmaTraceOperation>(DmaTraceOperation{
         dmaTrace, id, ++observedInstance, address, target, length, read});
     traceActive.emplace(id, trace);
-    dmaTrace->emit("wire_accept", trace->fields() +
-        ",\"population\":\"all_accepted_simbricks_pci_dma_requests\","
-        "\"translation_stage\":\"pciToDma_host_bridge_before_downstream_translation\"");
+    dmaTrace->emit("wire_accept", trace->fields());
     return trace;
 }
 
@@ -469,8 +462,7 @@ Device::dmaDone(DMACompl &comp)
         panic("simbricks-pci: invalid completion");
     }
     if (comp.trace) {
-        comp.trace->sink->emit("wire_completion_publish", comp.trace->fields() +
-            ",\"population\":\"all_accepted_simbricks_pci_dma_requests\"");
+        comp.trace->sink->emit("wire_completion_publish", comp.trace->fields());
         panic_if(traceActive.erase(comp.id) != 1, "Missing DMA trace lifecycle");
     }
 }

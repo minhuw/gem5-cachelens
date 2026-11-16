@@ -61,10 +61,8 @@ protected:
         EthernetStats(statistics::Group *parent);
         statistics::Scalar incomingPackets, incomingBytes;
         statistics::Scalar acceptedPackets, acceptedBytes;
-        statistics::Scalar droppedPackets, droppedBytes;
         statistics::Scalar outgoingPackets, outgoingBytes;
-        statistics::Scalar pendingPackets, pendingHighWatermark;
-        statistics::Scalar retryAttempts, overflowPackets;
+        statistics::Scalar pendingHighWatermark;
     } ethernetStats;
 
     virtual size_t introOutPrepare(void *data, size_t maxlen) override;

@@ -257,28 +257,11 @@ GenericPciHost::intxSource(const PciBusAddr &addr, PciIntPin pin)
 }
 
 void
-GenericPciHost::startup()
-{
-    PciHost::startup();
-    // Device config (including guest-written InterruptLine) is restored
-    // independently. Validate routes only after every object was restored.
-    for (const auto &entry : intxSources) {
-        const auto source = entry.first;
-        const PciBusAddr addr((source >> 16) & 0xff,
-                             (source >> 8) & 0x1f, (source >> 3) & 7);
-        fatal_if(mapPciInterrupt(addr, static_cast<PciIntPin>(source & 7)) !=
-                     entry.second,
-                 "PCI INTx checkpoint route differs from restored device");
-    }
-}
-
-void
 GenericPciHost::serialize(CheckpointOut &cp) const
 {
     PciHost::serialize(cp);
     if (!aggregateIntx)
         return;
-    paramOut(cp, "aggregate_intx", aggregateIntx);
     std::vector<uint32_t> sources, lines;
     for (const auto &entry : intxSources) {
         sources.push_back(entry.first);
@@ -292,27 +275,14 @@ void
 GenericPciHost::unserialize(CheckpointIn &cp)
 {
     PciHost::unserialize(cp);
-    bool checkpoint_aggregate = false;
-    optParamIn(cp, "aggregate_intx", checkpoint_aggregate, false);
-    fatal_if(checkpoint_aggregate != aggregateIntx,
-             "PCI INTx aggregation mode differs from checkpoint");
     if (!aggregateIntx)
         return;
     std::vector<uint32_t> sources, lines;
     arrayParamIn(cp, "intx_sources", sources);
     arrayParamIn(cp, "intx_lines", lines);
-    fatal_if(sources.size() != lines.size(), "Invalid PCI INTx checkpoint");
     intxSources.clear();
-    for (size_t i = 0; i < sources.size(); ++i) {
-        const auto source = sources[i];
-        const auto pin = static_cast<PciIntPin>(source & 7);
-        const PciBusAddr addr((source >> 16) & 0xff,
-                             (source >> 8) & 0x1f, (source >> 3) & 7);
-        fatal_if(!getDevice(addr) || pin == PciIntPin::NO_INT ||
-                     (source & 7) > 4 || intxSource(addr, pin) != source ||
-                     !intxSources.emplace(source, lines[i]).second,
-                 "Invalid PCI INTx checkpoint source");
-    }
+    for (size_t i = 0; i < sources.size(); ++i)
+        intxSources.emplace(sources[i], lines[i]);
     // The platform's interrupt controller restores its own input state.
 }
 

@@ -165,7 +165,6 @@ private:
     void checkInitializedCheckpoint() const;
     std::string checkpointBody;
     uint64_t dmaOutstanding = 0;
-    static unsigned deviceCount;
     std::shared_ptr<DmaTraceSink> dmaTrace;
     uint64_t observedInstance = 0;
     std::unordered_map<uint64_t, DmaTraceOperationPtr> traceActive;

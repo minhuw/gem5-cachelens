@@ -16,9 +16,7 @@ parser.add_argument('--socket', required=True)
 parser.add_argument('--protocol', choices=('mesi', 'chi'), required=True)
 parser.add_argument('--trace', default='')
 parser.add_argument('--nic', default='directed-pci-0')
-parser.add_argument('--epoch', default='directed-fresh-1')
 parser.add_argument('--atomic', action='store_true')
-parser.add_argument('--two-nics', action='store_true')
 parser.add_argument('--checkpoint-mode', action='store_true')
 args = parser.parse_args()
 
@@ -41,16 +39,9 @@ system.dev = SimBricksPci(
     uxsocket_path=args.socket, sync=True,
     sync_tx_interval='1ns', link_latency='1ns',
     dma_observe_file=args.trace, dma_observe_nic=args.nic,
-    dma_observe_epoch=args.epoch, initialized_checkpoint=args.checkpoint_mode,
+    initialized_checkpoint=args.checkpoint_mode,
 )
 system.dev.pio = system.iobus.mem_side_ports
-if args.two_nics:
-    # Guard rejection happens in init, before transport establishment.
-    system.dev2 = SimBricksPci(
-        host=system.host, pci_bus=0, pci_dev=2, pci_func=0,
-        uxsocket_path=args.socket + '.other',
-    )
-    system.dev2.pio = system.iobus.mem_side_ports
 
 
 # Avoid CPU/guest resource imports in the intentionally ISA-free directed build.
@@ -64,8 +55,6 @@ ruby.number_of_virtual_networks = 3 if args.protocol == 'mesi' else 4
 ruby.network = SimpleCrossbar(ruby, buffer_size=4)
 ruby.network.number_of_virtual_networks = ruby.number_of_virtual_networks
 ports = [system.dev.dma, system.untagged.dma]
-if args.two_nics:
-    ports.append(system.dev2.dma)
 
 if args.protocol == 'mesi':
     from gem5.components.cachehierarchies.ruby.caches.mesi_three_level.l3_cache import L3Cache

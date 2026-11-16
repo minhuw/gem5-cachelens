@@ -42,14 +42,9 @@ Adapter::EthernetStats::EthernetStats(statistics::Group *parent)
       ADD_STAT(incomingBytes, statistics::units::Byte::get(), "NIC to gem5 bytes"),
       ADD_STAT(acceptedPackets, statistics::units::Count::get(), "NIC packets accepted by gem5"),
       ADD_STAT(acceptedBytes, statistics::units::Byte::get(), "NIC bytes accepted by gem5"),
-      ADD_STAT(droppedPackets, statistics::units::Count::get(), "NIC packets dropped on gem5 backpressure"),
-      ADD_STAT(droppedBytes, statistics::units::Byte::get(), "NIC bytes dropped on gem5 backpressure"),
       ADD_STAT(outgoingPackets, statistics::units::Count::get(), "gem5 to NIC packets"),
       ADD_STAT(outgoingBytes, statistics::units::Byte::get(), "gem5 to NIC bytes"),
-      ADD_STAT(pendingPackets, statistics::units::Count::get(), "Owned NIC packets awaiting gem5 acceptance"),
-      ADD_STAT(pendingHighWatermark, statistics::units::Count::get(), "Maximum pending NIC packets"),
-      ADD_STAT(retryAttempts, statistics::units::Count::get(), "Completion-driven NIC packet retry attempts"),
-      ADD_STAT(overflowPackets, statistics::units::Count::get(), "Fatal NIC receive FIFO overflows")
+      ADD_STAT(pendingHighWatermark, statistics::units::Count::get(), "Maximum pending NIC packets")
 {}
 
 Adapter::Adapter(const Params &p)
@@ -141,7 +136,6 @@ Adapter::handleInMsg(volatile union SimbricksProtoNetMsg *msg)
     ethernetStats.incomingPackets++;
     ethernetStats.incomingBytes += len;
     if (rxPending.size() == rxBufferPackets) {
-        ethernetStats.overflowPackets++;
         fatal("SimBricks Ethernet receive FIFO full: %u pending packets, "
               "rx_buffer_packets=%u; cannot suspend SimBricks input",
               static_cast<unsigned>(rxPending.size()), rxBufferPackets);
@@ -153,7 +147,6 @@ Adapter::handleInMsg(volatile union SimbricksProtoNetMsg *msg)
     memcpy(packet->data, (const void *) pkt->data, len);
     // Never retain ring storage: enqueue the deep copy before releasing it.
     rxPending.push_back(packet);
-    ethernetStats.pendingPackets = rxPending.size();
     if (rxPending.size() > ethernetStats.pendingHighWatermark.value())
         ethernetStats.pendingHighWatermark = rxPending.size();
     adapter.inDone(msg);
@@ -176,7 +169,6 @@ Adapter::pumpRx()
             break;
         }
         rxPending.pop_front();
-        ethernetStats.pendingPackets = rxPending.size();
         ethernetStats.acceptedPackets++;
         ethernetStats.acceptedBytes += packet->length;
     }
@@ -193,8 +185,6 @@ Adapter::sendDone()
     rxBlocked = false;
     if (rxPumping)
         return;
-    if (!rxPending.empty())
-        ethernetStats.retryAttempts++;
     pumpRx();
 }
 
