@@ -87,6 +87,12 @@ class I82094AA : public BasicPioDevice
 
     void signalInterrupt(TriggerIntMessage message);
 
+    // PCI MSI/MSI-X: a device's DMA write to the x86 MSI window becomes an
+    // interrupt message; this is the only MSI decoder in the system.
+    static const Addr MsiBase = 0xFEE00000;
+    static const Addr MsiSize = 0x100000;
+    void writeMsi(Addr addr, uint32_t data);
+
   public:
     using Params = I82094AAParams;
 
@@ -96,6 +102,7 @@ class I82094AA : public BasicPioDevice
 
     Tick read(PacketPtr pkt) override;
     Tick write(PacketPtr pkt) override;
+    AddrRangeList getAddrRanges() const override;
 
     void writeReg(uint8_t offset, uint32_t value);
     uint32_t readReg(uint8_t offset);

@@ -89,10 +89,33 @@ X86ISA::I82094AA::getPort(const std::string &if_name, PortID idx)
         return BasicPioDevice::getPort(if_name, idx);
 }
 
+AddrRangeList
+X86ISA::I82094AA::getAddrRanges() const
+{
+    return {RangeSize(pioAddr, pioSize), RangeSize(MsiBase, MsiSize)};
+}
+
+void
+X86ISA::I82094AA::writeMsi(Addr addr, uint32_t data)
+{
+    // Intel SDM 3A 11.11: address[19:12] destination, [2] destination mode;
+    // data[7:0] vector, [10:8] delivery mode, [14] level, [15] trigger mode.
+    TriggerIntMessage message = 0;
+    message.destination = bits(addr, 19, 12);
+    message.destMode = bits(addr, 2);
+    message.vector = bits(data, 7, 0);
+    message.deliveryMode = bits(data, 10, 8);
+    message.level = bits(data, 14);
+    message.trigger = bits(data, 15);
+    signalInterrupt(message);
+}
+
 Tick
 X86ISA::I82094AA::read(PacketPtr pkt)
 {
     assert(pkt->getSize() == 4);
+    panic_if(pkt->getAddr() >= MsiBase && pkt->getAddr() < MsiBase + MsiSize,
+             "Read from the x86 MSI window.");
     Addr offset = pkt->getAddr() - pioAddr;
     switch(offset) {
       case 0:
@@ -112,6 +135,11 @@ Tick
 X86ISA::I82094AA::write(PacketPtr pkt)
 {
     assert(pkt->getSize() == 4);
+    if (pkt->getAddr() >= MsiBase && pkt->getAddr() < MsiBase + MsiSize) {
+        writeMsi(pkt->getAddr(), pkt->getLE<uint32_t>());
+        pkt->makeAtomicResponse();
+        return pioDelay;
+    }
     Addr offset = pkt->getAddr() - pioAddr;
     switch(offset) {
       case 0:

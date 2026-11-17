@@ -208,6 +208,21 @@ class Gicv2m(PioDevice):
     gic = Param.BaseGic(Parent.any, "Gic on which to trigger interrupts")
     frames = VectorParam.Gicv2mFrame([], "Power of two number of frames")
 
+    def generateDeviceTree(self, state):
+        # Linux gicv2m_of_init() finds frames after the GIC node; PCI hosts
+        # name the first frame as their msi-parent.
+        for frame in self.frames:
+            node = FdtNode(f"v2m@{int(frame.addr):x}")
+            node.appendCompatible(["arm,gic-v2m-frame"])
+            node.append(FdtProperty("msi-controller"))
+            node.append(
+                FdtPropertyWords(
+                    "reg", state.addrCells(frame.addr) + state.sizeCells(0x1000)
+                )
+            )
+            node.appendPhandle(frame)
+            yield node
+
 
 class VGic(PioDevice):
     type = "VGic"

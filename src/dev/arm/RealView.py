@@ -257,6 +257,12 @@ class GenericArmPciHost(GenericPciHost):
         if self._dma_coherent:
             node.append(FdtProperty("dma-coherent"))
 
+        gicv2m = getattr(self._parent.unproxy(self), "gicv2m", None)
+        if gicv2m is not None and len(gicv2m.frames):
+            node.append(
+                FdtPropertyWords("msi-parent", state.phandle(gicv2m.frames[0]))
+            )
+
         yield node
 
 
