@@ -1433,6 +1433,18 @@ Pvrdma::recvTransportPacket(EthPacketPtr packet)
     };
     if (transport.active() && transport.kind == pvrdma::QueueKind::Rq &&
         transport.stage == TransportState::Stage::WaitReceiveData) {
+        // A continuation starts payload DMA on the shared port. While the
+        // port is busy (e.g. the previous message's CQE write) or a frame is
+        // queued ahead, queue this one; runTransport() continues it in order
+        // once the port is idle.
+        if (pendingRxPacket || dmaPending() || transportDmaBusy() ||
+            queueDma.active() || completionBusy()) {
+            if (!queueReceivePacket(std::move(packet)))
+                return false;
+            record_data();
+            scheduleTransport();
+            return true;
+        }
         record_data();
         return handleInboundContinuation(frame);
     }
