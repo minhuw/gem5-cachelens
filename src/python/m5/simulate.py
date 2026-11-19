@@ -366,8 +366,8 @@ def _verify_initialized_checkpoint(directory):
 
 
 def _initialized_checkpoint(directory, nics):
-    if len(nics) != 1 or need_startup or not _drain_manager.isDrained():
-        fatal("Initialized NIC checkpoint requires one started, globally drained NIC")
+    if not nics or need_startup or not _drain_manager.isDrained():
+        fatal("Initialized NIC checkpoint requires started, globally drained NICs")
     for obj in objects.Root.getInstance().descendants():
         if (isinstance(obj, getattr(objects, "BaseCPU", ()))
                 and not obj.switchedOut()
@@ -377,13 +377,15 @@ def _initialized_checkpoint(directory, nics):
                 and not bool(obj.deferred_start)):
             fatal("Initialized NIC checkpoints require deferred PCAP replay")
     _drain_manager.verifyDrained()
+    # One fence token per checkpoint; every NIC peer acknowledges it.
     token = uuid.uuid4().int
-    nics[0].initializedCheckpointBegin(token >> 64, token & ((1 << 64) - 1))
+    for nic in nics:
+        nic.initializedCheckpointBegin(token >> 64, token & ((1 << 64) - 1))
     wall_deadline = time.monotonic() + 30
     old_limit = getMaxTick()
     deadline = min(curTick() + 1_000_000_000, old_limit)
     try:
-        while not nics[0].initializedCheckpointReady():
+        while not all(nic.initializedCheckpointReady() for nic in nics):
             if curTick() >= deadline or time.monotonic() >= wall_deadline:
                 fatal("Initialized NIC checkpoint barrier deadline exceeded")
             # Do NOT call public simulate(): it resumes drained CPUs/devices.
@@ -398,7 +400,8 @@ def _initialized_checkpoint(directory, nics):
     memWriteback(objects.Root.getInstance())
     _drain_manager.verifyDrained()
     # No events run between these checks, final epoch capture and serialization.
-    nics[0].initializedCheckpointFinish()
+    for nic in nics:
+        nic.initializedCheckpointFinish()
     directory = os.path.abspath(os.fspath(directory).replace("%d", str(curTick())))
     if os.path.exists(directory):
         fatal("Initialized NIC checkpoints require a new destination directory")
@@ -407,7 +410,7 @@ def _initialized_checkpoint(directory, nics):
     stage = tempfile.mkdtemp(prefix=".initialized-nic-", dir=parent)
     try:
         _m5.core.serializeAll(stage)
-        names = ["m5.cpt", nics[0].path() + ".nic-state"]
+        names = ["m5.cpt"] + [nic.path() + ".nic-state" for nic in nics]
         manifest = {"version": 1, "files": {
             name: _checkpoint_digest(os.path.join(stage, name)) for name in names}}
         with open(os.path.join(stage, "initialized-nic.json"), "x") as output:
