@@ -76,7 +76,9 @@ class MESIThreeLevelCacheHierarchy(
         num_l3_banks: int,
         ddio_way_part: int = -1,
         l3_addr_hash: bool = False,
+        l3_replacement_policy=None,
     ):
+        """l3_replacement_policy, if given, returns a fresh policy per bank."""
         AbstractRubyCacheHierarchy.__init__(self=self)
         AbstractThreeLevelCacheHierarchy.__init__(
             self,
@@ -102,6 +104,7 @@ class MESIThreeLevelCacheHierarchy(
         self._num_l3_banks = num_l3_banks
         self._ddio_way_part = ddio_way_part
         self._l3_addr_hash = l3_addr_hash
+        self._l3_replacement_policy = l3_replacement_policy
         self._l3_select_num_bits = int(math.log2(num_l3_banks))
 
     @overrides(AbstractCacheHierarchy)
@@ -200,6 +203,11 @@ class MESIThreeLevelCacheHierarchy(
                 cache_line_size=cache_line_size,
                 ddio_way_part=self._ddio_way_part,
                 addr_hash=self._l3_addr_hash,
+                replacement_policy=(
+                    self._l3_replacement_policy()
+                    if self._l3_replacement_policy is not None
+                    else None
+                ),
                 cluster_id=0,  # cluster_id is ignored in point-to-point topology
             )
             l3_cache.ruby_system = self.ruby_system

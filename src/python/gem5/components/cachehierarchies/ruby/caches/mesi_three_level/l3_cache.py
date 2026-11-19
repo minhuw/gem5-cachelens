@@ -55,6 +55,7 @@ class L3Cache(MESI_Three_Level_L2Cache_Controller):
         cluster_id,
         ddio_way_part=-1,
         addr_hash=False,
+        replacement_policy=None,
     ):
         super().__init__()
 
@@ -73,7 +74,9 @@ class L3Cache(MESI_Three_Level_L2Cache_Controller):
             ddio_way_part=ddio_way_part,
             addr_hash=addr_hash,
             replacement_policy=(
-                LRURP() if ddio_way_part > 0 else TreePLRURP()
+                replacement_policy
+                if replacement_policy is not None
+                else LRURP() if ddio_way_part > 0 else TreePLRURP()
             ),
         )
 

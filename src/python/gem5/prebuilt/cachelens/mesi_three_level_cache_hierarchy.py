@@ -36,6 +36,8 @@ from gem5.utils.requires import requires
 from ._model import (
     MODEL_PROFILES,
     PROFILE_ALIASES,
+    LLC_REPLACEMENT_POLICIES,
+    llc_replacement_policy,
 )
 
 
@@ -58,6 +60,7 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
         ddio_way_part: Optional[int] = None,
         indexing_policy: str = "linear",
         model_profile: str = "abstract",
+        hnf_replacement: Optional[str] = None,
         core_clock: Optional[str] = None,
         link_latency: int = 1,
         router_latency: int = 1,
@@ -83,6 +86,12 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
             )
         if num_hnfs <= 0 or num_hnfs & (num_hnfs - 1):
             raise ValueError("num_hnfs must be a positive power of two.")
+        if hnf_replacement not in (None, *LLC_REPLACEMENT_POLICIES):
+            raise ValueError(
+                "hnf_replacement must be one of "
+                + ", ".join(LLC_REPLACEMENT_POLICIES)
+                + "."
+            )
         for name, assoc in (
             ("l1i_assoc", l1i_assoc),
             ("l1d_assoc", l1d_assoc),
@@ -148,7 +157,13 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
             num_l3_banks=num_hnfs,
             ddio_way_part=ddio_way_part,
             l3_addr_hash=indexing_policy == "splitmix64",
+            l3_replacement_policy=(
+                None
+                if hnf_replacement is None
+                else lambda: llc_replacement_policy(hnf_replacement)
+            ),
         )
+        self._hnf_replacement = hnf_replacement
 
         self._cachelens_l1i_size = l1i_size
         self._cachelens_l1i_assoc = l1i_assoc
@@ -314,7 +329,8 @@ class CacheLensMESIThreeLevelHierarchy(MESIThreeLevelCacheHierarchy):
             "total_hnf_capacity_bytes": self.get_total_hnf_capacity_bytes(),
             "hnf_assoc": self._hnf_assoc,
             "llc_replacement_policy": (
-                "LRU" if self._ddio_way_part > 0 else "TreePLRU"
+                self._hnf_replacement
+                or ("LRU" if self._ddio_way_part > 0 else "TreePLRU")
             ),
             "cache_line_size": self._cache_line_size,
             "bank_select_low_bit": int(math.log2(self._cache_line_size)),

@@ -52,7 +52,10 @@
 #include "debug/RubyCacheTrace.hh"
 #include "debug/RubyResourceStalls.hh"
 #include "debug/RubyStats.hh"
+#include "mem/cache/replacement_policies/brrip_rp.hh"
 #include "mem/cache/replacement_policies/lru_rp.hh"
+#include "mem/cache/replacement_policies/random_rp.hh"
+#include "mem/cache/replacement_policies/tree_plru_rp.hh"
 #include "mem/cache/replacement_policies/weighted_lru_rp.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -92,11 +95,23 @@ CacheMemory::CacheMemory(const Params &p)
              (m_ddio_way_part < 1 || m_ddio_way_part > m_cache_assoc),
              "DDIO way partition must be -1 or in [1, %d], got %d",
              m_cache_assoc, m_ddio_way_part);
-    fatal_if(m_ddio_way_part > 0 &&
-             !dynamic_cast<replacement_policy::LRU*>(
-                 m_replacementPolicy_ptr),
-             "DDIO way partition requires the subset-safe LRU replacement "
-             "policy");
+    // DDIO victims come from getVictim() over ways [0, ddio_way_part).
+    // LRU, BRRIP and Random rank each candidate by its own replacement
+    // data, so any way subset is valid (BRRIP ages only the subset).
+    // TreePLRU walks one per-set tree and indexes the candidates by leaf,
+    // so it is valid only when the subset is the whole set.
+    auto *policy = m_replacementPolicy_ptr;
+    const bool subset_safe_policy =
+        dynamic_cast<replacement_policy::LRU*>(policy) ||
+        dynamic_cast<replacement_policy::BRRIP*>(policy) ||
+        dynamic_cast<replacement_policy::Random*>(policy);
+    const bool whole_set_tree =
+        dynamic_cast<replacement_policy::TreePLRU*>(policy) &&
+        m_ddio_way_part == m_cache_assoc;
+    fatal_if(m_ddio_way_part > 0 && !subset_safe_policy && !whole_set_tree,
+             "DDIO way partition [0, %d) of a %d-way cache requires LRU, "
+             "BRRIP or Random replacement, or TreePLRU over every way",
+             m_ddio_way_part, m_cache_assoc);
     m_addr_hash = p.addr_hash;
 }
 

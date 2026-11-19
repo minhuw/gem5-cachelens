@@ -58,6 +58,10 @@ from gem5.isas import ISA
 from gem5.utils.override import overrides
 from gem5.utils.requires import requires
 
+from ._model import (
+    LLC_REPLACEMENT_POLICIES,
+    llc_replacement_policy,
+)
 from .topology import SimpleCrossbar
 
 _PROFILE_ALIASES = {
@@ -196,6 +200,7 @@ class _CachedHNF(AbstractNode):
         size: str,
         assoc: int,
         ddio_way_part: int,
+        replacement_policy,
         nic_read_no_allocate: bool,
         accept_write_stash: bool,
         addr_hash: bool,
@@ -217,7 +222,9 @@ class _CachedHNF(AbstractNode):
             "ddio_way_part": ddio_way_part,
             "addr_hash": addr_hash,
         }
-        if ddio_way_part > 0:
+        if replacement_policy is not None:
+            cache_args["replacement_policy"] = replacement_policy
+        elif ddio_way_part > 0:
             cache_args["replacement_policy"] = LRURP()
         self.cache = RubyCache(**cache_args)
         self.addr_ranges = addr_ranges
@@ -323,6 +330,7 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         hnf_inclusion: str = "noninclusive",
         model_profile: str = "abstract",
         cache_stashing: str = "off",
+        hnf_replacement: Optional[str] = None,
         core_clock: Optional[str] = None,
         link_latency: int = 1,
         router_latency: int = 1,
@@ -422,6 +430,13 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
         self._num_hnfs = num_hnfs
         self._ddio_way_part = ddio_way_part
         self._cache_stashing = cache_stashing
+        if hnf_replacement not in (None, *LLC_REPLACEMENT_POLICIES):
+            raise ValueError(
+                "hnf_replacement must be one of "
+                + ", ".join(LLC_REPLACEMENT_POLICIES)
+                + "."
+            )
+        self._hnf_replacement = hnf_replacement
         self._nic_read_no_allocate = _MODEL_PROFILES[model_profile][
             "nic_read_no_allocate"
         ]
@@ -535,7 +550,8 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
             "total_hnf_capacity_bytes": self.get_total_hnf_capacity_bytes(),
             "hnf_assoc": self._hnf_assoc,
             "llc_replacement_policy": (
-                "LRU" if self._ddio_way_part > 0 else "protocol-default"
+                self._hnf_replacement
+                or ("LRU" if self._ddio_way_part > 0 else "protocol-default")
             ),
             "cache_line_size": self._cache_line_size,
             "link_latency": self._link_latency,
@@ -606,6 +622,11 @@ class CacheLensCHIHierarchy(AbstractRubyCacheHierarchy):
                 size=self._hnf_size,
                 assoc=self._hnf_assoc,
                 ddio_way_part=self._ddio_way_part,
+                replacement_policy=(
+                    llc_replacement_policy(self._hnf_replacement)
+                    if self._hnf_replacement is not None
+                    else None
+                ),
                 nic_read_no_allocate=self._nic_read_no_allocate,
                 accept_write_stash=self._cache_stashing == "hnf",
                 addr_hash=self._addr_hash,

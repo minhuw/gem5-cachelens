@@ -36,3 +36,27 @@ MODEL_PROFILES = {
         "nic_read_no_allocate": True,
     },
 }
+
+LLC_REPLACEMENT_POLICIES = ("LRURP", "TreePLRURP", "BRRIPRP", "RandomRP")
+
+
+def llc_replacement_policy(name):
+    """Return a fresh native replacement policy of type name for one LLC bank."""
+    from m5.objects import (
+        BRRIPRP,
+        LRURP,
+        RandomRP,
+        TreePLRURP,
+    )
+
+    if name not in LLC_REPLACEMENT_POLICIES:
+        choices = ", ".join(LLC_REPLACEMENT_POLICIES)
+        raise ValueError(f"hnf_replacement must be one of {choices}.")
+    if name == "BRRIPRP":
+        # Bimodal RRIP (Jaleel et al., ISCA 2010): 2-bit RRPVs, a miss
+        # inserts at distant RRPV except with 3% (~1/32) probability at
+        # long RRPV, and a hit resets the RRPV to 0 (hit priority).
+        return BRRIPRP(num_bits=2, btp=3, hit_priority=True)
+    return {"LRURP": LRURP, "TreePLRURP": TreePLRURP, "RandomRP": RandomRP}[
+        name
+    ]()
