@@ -376,6 +376,9 @@ def _initialized_checkpoint(directory, nics):
         if (isinstance(obj, getattr(objects, "LoadGeneratorPcap", ()))
                 and not bool(obj.deferred_start)):
             fatal("Initialized NIC checkpoints require deferred PCAP replay")
+    # Ruby's writeback simulates a flush of every dirty line; do it before the
+    # NIC fence starts its wall budget. The post-fence writeback is then clean.
+    memWriteback(objects.Root.getInstance())
     _drain_manager.verifyDrained()
     # One fence token per checkpoint; every NIC peer acknowledges it.
     token = uuid.uuid4().int
