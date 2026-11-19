@@ -376,8 +376,11 @@ def _initialized_checkpoint(directory, nics):
         if (isinstance(obj, getattr(objects, "LoadGeneratorPcap", ()))
                 and not bool(obj.deferred_start)):
             fatal("Initialized NIC checkpoints require deferred PCAP replay")
-    # Ruby's writeback simulates a flush of every dirty line; do it before the
-    # NIC fence starts its wall budget. The post-fence writeback is then clean.
+    # Ruby's writeback functionally publishes every valid line and keeps them
+    # resident, so it costs the same each call; with two 16 GiB Systems it
+    # outlasts the NIC's 30 s freeze budget. Do it once, before the fence. The
+    # drained barrier changes no cache state, and its recorder survives until
+    # drainResume, so serializeAll writes this trace.
     memWriteback(objects.Root.getInstance())
     _drain_manager.verifyDrained()
     # One fence token per checkpoint; every NIC peer acknowledges it.
@@ -400,7 +403,6 @@ def _initialized_checkpoint(directory, nics):
         _drain_manager.verifyDrained()
     finally:
         _m5.event.setMaxTick(old_limit)
-    memWriteback(objects.Root.getInstance())
     _drain_manager.verifyDrained()
     # No events run between these checks, final epoch capture and serialization.
     for nic in nics:
