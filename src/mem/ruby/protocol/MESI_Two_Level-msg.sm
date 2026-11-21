@@ -78,8 +78,9 @@ structure(RequestMsg, desc="...", interface="Message") {
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
 
   bool functionalRead(Packet *pkt) {
-    // Only PUTX messages contains the data block
-    if (Type == CoherenceRequestType:PUTX) {
+    // Only dirty PUTX messages contain the data block: a clean PUTX
+    // (Writeback_Control) carries an empty one, and the L2 copy is current.
+    if (Type == CoherenceRequestType:PUTX && Dirty) {
         return testAndRead(addr, DataBlk, pkt);
     }
 
